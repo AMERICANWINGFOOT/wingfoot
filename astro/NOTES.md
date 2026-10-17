@@ -38,6 +38,27 @@ the next chat at this file: `astro/NOTES.md` in the wingfoot repo).
    about 1.8"/px, field about 22' x 17', bubble about 100 px across.
    3-5 min subs, a few hours total, guided by QBGuide.
 5. Later: dithering in QBGuide, make QBGuide public, post on the QB64 forum.
+6. **Mount over USB, as a menu option** - the USB code is already in QBCap
+   (`qbcap.c`) and PMQBauto (`pmmount.c`); today you switch by editing
+   `QBCap_mount.txt` / `PoleMasterQB.ini` to `/dev/ttyUSB0`. Add a WiFi/USB
+   choice on the mount panel that finds the port itself (ttyUSB0 / ttyACM0),
+   remembers it, and warns about the dialout group. Hand controller goes in
+   PC Direct Mode. Also the backup if the SynScan WiFi ever quits.
+   Test once on a cloudy night.
+7. **Mount hub app** - one QB64 app that owns the USB port (only one program
+   can have it open). Hand-paddle buttons, GoTo, park/home, tracking rates,
+   no-go zone for the tripod legs, low-altitude limit. Works on USB or WiFi.
+8. **"CAN bus" between the apps** - Linux SocketCAN virtual bus (`vcan0`) with a
+   small C shim (libqbcan.so). Every app hears every frame; low ID = high
+   priority: 0x001 STOP/ABORT, 0x010 guide pulse, 0x100 GoTo, 0x200+ status.
+   CAN FD gives 64 bytes per frame. Gives the QBGuide-QBCap link for autopilot
+   (guiding pauses during GoTo, dither/settle). Fallback: UDP broadcast on
+   127.0.0.1 with the same IDs. Needs a boot-time service to bring up vcan0.
+9. **Pulse guiding through the mount (no ST-4 cable)** - QBGuide option
+   "Guide via: Camera ST-4 / Mount". RA: run at e.g. 1.5x or 0.5x sidereal for
+   the pulse length, then back to sidereal. Dec: guide rate for the pulse, then
+   stop. Sent as 0x010 frames to the mount hub. Best over USB (WiFi timing
+   jitter). Check the Atlas Pro firmware takes rate changes while moving.
 
 ### THE BIG ONE - QBCap sequencer (next QBCap job)
 
@@ -162,3 +183,8 @@ QBCap folder and read files back - no network, no extra software):
 4. Dithering for QBGuide (needed for amp glow / hot pixels on long G3 runs).
 5. Optional: QBGuide.sh launcher, QHY5 as polar camera in PMQBauto,
    public QBGuide repo (scrub first).
+6. Mount stack (Plan items 6-9): reuse the serial/UDP code already in
+   `qbcap.c` and `pmmount.c` as one shared library; mount hub owns the port;
+   SocketCAN `vcan0` bus via libqbcan.so (non-blocking can_open/can_send/
+   can_recv, RA/Dec packed as two Longs with MKL$/CVL); then mount pulse guiding
+   in QBGuide. Untested sketch of the shim was written Oct 17 (not in repo).
