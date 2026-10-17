@@ -60,6 +60,7 @@ source and build scripts.
 | Z64 | Z64 archiving pipeline (picker, chunker, pack, unpack, unchunker, z64go) |
 | Z64Pak, Z64Compress, Z64Png | Z64 GUI front ends |
 | SERTools | SER video player, stacker and diagnostics |
+| GPUZip | Multi-GPU folder compressor (QB64-PE front end, CUDA `gpuzip.cu` helper) |
 
 ## lib/
 
