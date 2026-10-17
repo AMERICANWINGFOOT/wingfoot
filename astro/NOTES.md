@@ -48,12 +48,16 @@ the next chat at this file: `astro/NOTES.md` in the wingfoot repo).
 7. **Mount hub app** - one QB64 app that owns the USB port (only one program
    can have it open). Hand-paddle buttons, GoTo, park/home, tracking rates,
    no-go zone for the tripod legs, low-altitude limit. Works on USB or WiFi.
-8. **"CAN bus" between the apps** - Linux SocketCAN virtual bus (`vcan0`) with a
-   small C shim (libqbcan.so). Every app hears every frame; low ID = high
-   priority: 0x001 STOP/ABORT, 0x010 guide pulse, 0x100 GoTo, 0x200+ status.
-   CAN FD gives 64 bytes per frame. Gives the QBGuide-QBCap link for autopilot
-   (guiding pauses during GoTo, dither/settle). Fallback: UDP broadcast on
-   127.0.0.1 with the same IDs. Needs a boot-time service to bring up vcan0.
+8. **"CAN bus" between the apps - plain QB64 TCP (chosen Oct 17)** - the mount hub
+   opens `_OPENHOST("TCP/IP:11881")`; each app joins with
+   `_OPENCLIENT("TCP/IP:11881:localhost")` and uses PUT/GET. The hub relays every
+   message to every app, so everyone hears everything, like CAN. Keep CAN-style
+   IDs, low = high priority: 0x001 STOP/ABORT (relayed first), 0x010 guide pulse,
+   0x100 GoTo, 0x200+ status. No C shim, no kernel module, works on Linux and
+   Windows. Gives the QBGuide-QBCap link for autopilot (guiding pauses during
+   GoTo, dither/settle). Linux-only alternative kept on file: SocketCAN `vcan0`
+   with a libqbcan.so shim. Clipboard ruled out (one slot, no priority, clashes
+   with copy/paste).
 9. **Pulse guiding through the mount (no ST-4 cable)** - QBGuide option
    "Guide via: Camera ST-4 / Mount". RA: run at e.g. 1.5x or 0.5x sidereal for
    the pulse length, then back to sidereal. Dec: guide rate for the pulse, then
@@ -185,6 +189,7 @@ QBCap folder and read files back - no network, no extra software):
    public QBGuide repo (scrub first).
 6. Mount stack (Plan items 6-9): reuse the serial/UDP code already in
    `qbcap.c` and `pmmount.c` as one shared library; mount hub owns the port;
-   SocketCAN `vcan0` bus via libqbcan.so (non-blocking can_open/can_send/
-   can_recv, RA/Dec packed as two Longs with MKL$/CVL); then mount pulse guiding
-   in QBGuide. Untested sketch of the shim was written Oct 17 (not in repo).
+   app bus is QB64-native TCP (_OPENHOST/_OPENCLIENT on localhost:11881, hub
+   relays to all clients, STOP first); fixed-size binary messages (ID + payload,
+   RA/Dec as Longs via MKL$/CVL); poll with GET each loop like PollMouse. Then
+   mount pulse guiding in QBGuide. vcan0/libqbcan.so is the Linux-only fallback.
