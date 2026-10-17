@@ -1,0 +1,5 @@
+# QHY PoleMaster for PoleMasterQB
+# When the PoleMaster appears as 1618:0940 (no firmware yet), load its firmware
+# (it then comes back as 1618:0941), and let normal users open QHY cameras.
+ATTRS{idVendor}=="1618", ATTRS{idProduct}=="0940", RUN+="/sbin/fxload -t fx2lp -I /lib/firmware/qhy/POLEMASTER.HEX -D $env{DEVNAME}"
+ATTRS{idVendor}=="1618", MODE="0666"

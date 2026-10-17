@@ -1,0 +1,298 @@
+'=======================================================================
+' DateTimeHelpers.bm  -  QB64Starter Date & Time Helper Library
+'
+' A companion to the Text Helpers module. Add an Include metacommand
+' for DateTimeHelpers.bm at the BOTTOM of your program. (Spelled out
+' as words on purpose -- the real metacommand is comment-formatted,
+' so writing it literally here would make QB64 act on it.)
+'
+' Everything works off QB64-PE's native Date$ ("MM-DD-YYYY") and
+' Time$ ("HH:MM:SS", 24-hour) so there are no external dependencies.
+'
+' FUNCTION INDEX
+'
+'   NOW / STAMPS
+'     StampSortable$   ()                  -> "2026-07-17 14:30:05"
+'     StampFile$       ()                  -> "2026-07-17_14-30-05"  (filename-safe)
+'     StampLog$        ()                  -> "[2026-07-17 14:30:05] "
+'
+'   FORMAT TIME
+'     Time12$          (t24$)              -> "2:30:05 PM"
+'     Time12HM$        (t24$)              -> "2:30 PM"        (drops seconds)
+'
+'   FORMAT DATE
+'     DateISO$         (d$)                -> "2026-07-17"     (sortable)
+'     DateLong$        (d$)                -> "July 17, 2026"
+'     DateShort$       (d$)                -> "Jul 17, 2026"
+'     WeekdayName$     (d$)                -> "Friday"
+'     WeekdayShort$    (d$)                -> "Fri"
+'     MonthName$       (mm)               -> "July"
+'     MonthShort$      (mm)               -> "Jul"
+'
+'   CALENDAR MATH
+'     IsLeapYear%      (yy)               -> -1 / 0
+'     DaysInMonth%     (mm, yy)           -> 28..31
+'     DayOfWeekNum%    (d$)               -> 0=Sun .. 6=Sat
+'     DayOfYear%       (d$)               -> 1..366
+'     DaySerial&       (mm, dd, yy)       -> days since 1970-01-01
+'     SerialToDate$    (serial&)          -> "MM-DD-YYYY"
+'     DaysBetween&     (dA$, dB$)         -> dB - dA in whole days
+'     AddDays$         (d$, n&)           -> new "MM-DD-YYYY"
+'
+'   DURATION / ELAPSED
+'     Elapsed!         (startMark!)       -> seconds since a Timer mark
+'     FormatDuration$  (secs&)            -> "1h 23m 45s"
+'     FormatClock$     (secs&)            -> "01:23:45"
+'=======================================================================
+
+
+'--- NOW / STAMPS ------------------------------------------------------
+
+Function StampSortable$
+    StampSortable$ = DateISO$(Date$) + " " + Time$
+End Function
+
+Function StampFile$
+    ' Colons and slashes are illegal in filenames; swap for dashes.
+    Dim sSafe As String
+    sSafe = DateISO$(Date$) + "_" + Time$
+    Dim i As Integer, ch As String
+    For i = 1 To Len(sSafe)
+        ch = Mid$(sSafe, i, 1)
+        If ch = ":" Then Mid$(sSafe, i, 1) = "-"
+    Next i
+    StampFile$ = sSafe
+End Function
+
+Function StampLog$
+    StampLog$ = "[" + StampSortable$ + "] "
+End Function
+
+
+'--- FORMAT TIME -------------------------------------------------------
+
+Function Time12$ (t24 As String)
+    Dim hh As Integer, ampm As String
+    hh = Val(Left$(t24, 2))
+    ampm = " AM"
+    If hh >= 12 Then ampm = " PM"
+    If hh = 0 Then hh = 12
+    If hh > 12 Then hh = hh - 12
+    Time12$ = _Trim$(Str$(hh)) + Mid$(t24, 3) + ampm
+End Function
+
+Function Time12HM$ (t24 As String)
+    Dim hh As Integer, ampm As String
+    hh = Val(Left$(t24, 2))
+    ampm = " AM"
+    If hh >= 12 Then ampm = " PM"
+    If hh = 0 Then hh = 12
+    If hh > 12 Then hh = hh - 12
+    Time12HM$ = _Trim$(Str$(hh)) + Mid$(t24, 3, 3) + ampm
+End Function
+
+
+'--- FORMAT DATE -------------------------------------------------------
+
+Function DateISO$ (d As String)
+    Dim mm As Integer, dd As Integer, yy As Integer
+    SplitDate d, mm, dd, yy
+    DateISO$ = Pad4$(yy) + "-" + Pad2$(mm) + "-" + Pad2$(dd)
+End Function
+
+Function DateLong$ (d As String)
+    Dim mm As Integer, dd As Integer, yy As Integer
+    SplitDate d, mm, dd, yy
+    DateLong$ = MonthName$(mm) + Str$(dd) + ", " + _Trim$(Str$(yy))
+End Function
+
+Function DateShort$ (d As String)
+    Dim mm As Integer, dd As Integer, yy As Integer
+    SplitDate d, mm, dd, yy
+    DateShort$ = MonthShort$(mm) + Str$(dd) + ", " + _Trim$(Str$(yy))
+End Function
+
+Function WeekdayName$ (d As String)
+    Dim names As String
+    names = "Sunday   Monday   Tuesday  WednesdayThursday Friday   Saturday "
+    ' Fixed-width 9-char cells:
+    Dim w As Integer
+    w = DayOfWeekNum%(d)
+    WeekdayName$ = _Trim$(Mid$(names, w * 9 + 1, 9))
+End Function
+
+Function WeekdayShort$ (d As String)
+    Dim names As String
+    names = "SunMonTueWedThuFriSat"
+    Dim w As Integer
+    w = DayOfWeekNum%(d)
+    WeekdayShort$ = Mid$(names, w * 3 + 1, 3)
+End Function
+
+Function MonthName$ (mm As Integer)
+    Dim names As String
+    names = "January  February March    April    May      June     July     August   SeptemberOctober  November December "
+    ' Cells are 9 chars wide (September is exactly 9).
+    If mm < 1 Or mm > 12 Then MonthName$ = "": Exit Function
+    MonthName$ = _Trim$(Mid$(names, (mm - 1) * 9 + 1, 9))
+End Function
+
+Function MonthShort$ (mm As Integer)
+    Dim names As String
+    names = "JanFebMarAprMayJunJulAugSepOctNovDec"
+    If mm < 1 Or mm > 12 Then MonthShort$ = "": Exit Function
+    MonthShort$ = Mid$(names, (mm - 1) * 3 + 1, 3)
+End Function
+
+
+'--- CALENDAR MATH -----------------------------------------------------
+
+Function IsLeapYear% (yy As Integer)
+    If (yy Mod 4 = 0 And yy Mod 100 <> 0) Or (yy Mod 400 = 0) Then
+        IsLeapYear% = -1
+    Else
+        IsLeapYear% = 0
+    End If
+End Function
+
+Function DaysInMonth% (mm As Integer, yy As Integer)
+    Select Case mm
+        Case 1, 3, 5, 7, 8, 10, 12: DaysInMonth% = 31
+        Case 4, 6, 9, 11: DaysInMonth% = 30
+        Case 2
+            If IsLeapYear%(yy) Then DaysInMonth% = 29 Else DaysInMonth% = 28
+        Case Else: DaysInMonth% = 0
+    End Select
+End Function
+
+Function DayOfWeekNum% (d As String)
+    Dim mm As Integer, dd As Integer, yy As Integer
+    SplitDate d, mm, dd, yy
+    Dim serial As Long, w As Long
+    serial = DaySerial&(mm, dd, yy)
+    ' 1970-01-01 (serial 0) is a Thursday; +4 shifts to 0=Sunday.
+    w = ((serial Mod 7) + 4) Mod 7
+    If w < 0 Then w = w + 7
+    DayOfWeekNum% = w
+End Function
+
+Function DayOfYear% (d As String)
+    Dim mm As Integer, dd As Integer, yy As Integer
+    SplitDate d, mm, dd, yy
+    DayOfYear% = DaySerial&(mm, dd, yy) - DaySerial&(1, 1, yy) + 1
+End Function
+
+Function DaySerial& (mm As Integer, dd As Integer, yy As Integer)
+    ' Days since 1970-01-01, proleptic Gregorian (Howard Hinnant's method).
+    Dim y As Long, m As Long, dOfYear As Long
+    Dim era As Long, yoe As Long, doe As Long
+    y = yy
+    m = mm
+    If m <= 2 Then y = y - 1
+    If y >= 0 Then era = y \ 400 Else era = (y - 399) \ 400
+    yoe = y - era * 400
+    If m > 2 Then
+        dOfYear = (153 * (m - 3) + 2) \ 5 + dd - 1
+    Else
+        dOfYear = (153 * (m + 9) + 2) \ 5 + dd - 1
+    End If
+    doe = yoe * 365 + yoe \ 4 - yoe \ 100 + dOfYear
+    DaySerial& = era * 146097 + doe - 719468
+End Function
+
+Function SerialToDate$ (serialIn As Long)
+    Dim z As Long, era As Long, doe As Long, yoe As Long
+    Dim y As Long, dOfYear As Long, mp As Long, d As Long, m As Long
+    z = serialIn + 719468
+    If z >= 0 Then era = z \ 146097 Else era = (z - 146096) \ 146097
+    doe = z - era * 146097
+    yoe = (doe - doe \ 1460 + doe \ 36524 - doe \ 146096) \ 365
+    y = yoe + era * 400
+    dOfYear = doe - (365 * yoe + yoe \ 4 - yoe \ 100)
+    mp = (5 * dOfYear + 2) \ 153
+    d = dOfYear - (153 * mp + 2) \ 5 + 1
+    If mp < 10 Then m = mp + 3 Else m = mp - 9
+    If m <= 2 Then y = y + 1
+    SerialToDate$ = Pad2$(m) + "-" + Pad2$(d) + "-" + Pad4$(y)
+End Function
+
+Function DaysBetween& (dA As String, dB As String)
+    Dim mA As Integer, dA2 As Integer, yA As Integer
+    Dim mB As Integer, dB2 As Integer, yB As Integer
+    SplitDate dA, mA, dA2, yA
+    SplitDate dB, mB, dB2, yB
+    DaysBetween& = DaySerial&(mB, dB2, yB) - DaySerial&(mA, dA2, yA)
+End Function
+
+Function AddDays$ (d As String, n As Long)
+    Dim mm As Integer, dd As Integer, yy As Integer
+    SplitDate d, mm, dd, yy
+    AddDays$ = SerialToDate$(DaySerial&(mm, dd, yy) + n)
+End Function
+
+
+'--- DURATION / ELAPSED ------------------------------------------------
+
+Function Elapsed! (startMark As Single)
+    ' Seconds since a Timer mark, correcting for the midnight wraparound.
+    Dim e As Single
+    e = Timer - startMark
+    If e < 0 Then e = e + 86400
+    Elapsed! = e
+End Function
+
+Function FormatDuration$ (secsIn As Long)
+    Dim h As Long, m As Long, s As Long, r As Long, ftext As String
+    r = secsIn
+    h = r \ 3600: r = r - h * 3600
+    m = r \ 60: s = r - m * 60
+    ftext = ""
+    If h > 0 Then ftext = ftext + _Trim$(Str$(h)) + "h "
+    If h > 0 Or m > 0 Then ftext = ftext + _Trim$(Str$(m)) + "m "
+    ftext = ftext + _Trim$(Str$(s)) + "s"
+    FormatDuration$ = ftext
+End Function
+
+Function FormatClock$ (secsIn As Long)
+    Dim h As Long, m As Long, s As Long, r As Long
+    r = secsIn
+    h = r \ 3600: r = r - h * 3600
+    m = r \ 60: s = r - m * 60
+    FormatClock$ = Pad2$(h) + ":" + Pad2$(m) + ":" + Pad2$(s)
+End Function
+
+
+'--- INTERNAL HELPERS --------------------------------------------------
+
+Sub SplitDate (d As String, mm As Integer, dd As Integer, yy As Integer)
+    ' Accepts "MM-DD-YYYY" (QB64 Date$) or "MM/DD/YYYY".
+    Dim s As String, i As Integer, ch As String
+    s = _Trim$(d)
+    ' Normalize any slashes to dashes so one parser handles both.
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch = "/" Then Mid$(s, i, 1) = "-"
+    Next i
+    Dim p1 As Integer, p2 As Integer
+    p1 = InStr(s, "-")
+    p2 = InStr(p1 + 1, s, "-")
+    mm = Val(Left$(s, p1 - 1))
+    dd = Val(Mid$(s, p1 + 1, p2 - p1 - 1))
+    yy = Val(Mid$(s, p2 + 1))
+End Sub
+
+Function Pad2$ (n As Long)
+    Dim s As String
+    s = _Trim$(Str$(n))
+    If Len(s) < 2 Then s = "0" + s
+    Pad2$ = s
+End Function
+
+Function Pad4$ (n As Long)
+    Dim s As String
+    s = _Trim$(Str$(n))
+    Do While Len(s) < 4
+        s = "0" + s
+    Loop
+    Pad4$ = s
+End Function

@@ -1,0 +1,392 @@
+' Z64Picker.bm -- implementation for the Z64Picker library.
+' See Z64Picker.bi for API and usage notes.
+
+
+'=======================================================================
+'   Public entry points
+'=======================================================================
+
+Sub Z64PickFiles (picked$(), count As Long)
+    Dim startPath$
+    startPath$ = Z64PickerDrive$
+    If Len(startPath$) = 0 Then
+        ReDim picked$(0)
+        count = -1
+        Exit Sub
+    End If
+    Z64PickFilesFrom startPath$, picked$(), count
+End Sub
+
+
+Sub Z64PickFilesFrom (startPath$, picked$(), count As Long)
+    '--- Save the caller's screen state so we can restore it. ---
+    Dim savedScreen As Long: savedScreen = _Dest
+    Dim savedWidth As Long: savedWidth = _Width
+    Dim savedHeight As Long: savedHeight = _Height
+
+    '--- Cross-folder picked list, grows as the user checks boxes. ---
+    Dim pathList$(0)
+    Dim pathCount As Long: pathCount = -1
+
+    '--- Current-directory listing. ---
+    Dim curPath$: curPath$ = startPath$
+    Dim curNames$(0)
+    Dim curIsDir(0) As Integer
+    Dim curSelected(0) As Integer ' selection flag per current-dir entry
+    Dim curCount As Long: curCount = -1
+
+    Dim cursor As Long: cursor = 0
+    Dim topRow As Long: topRow = 0
+    Dim pageRows As Long
+    Dim k$
+    Dim i As Long
+    Dim done As Integer: done = 0
+    Dim cancelled As Integer: cancelled = 0
+    Dim needReload As Integer: needReload = -1
+    Dim fullPath$
+
+    '--- Switch to our own text screen. Width covers most console UIs. ---
+    Screen 0
+    Width 100, 40
+    pageRows = 30 ' file rows we can show per page
+    Color 7, 0
+    Cls
+
+    Do
+        If needReload Then
+            Z64PickerLoadDir curPath$, curNames$(), curIsDir(), curCount
+            '--- Re-hydrate per-entry selection flags from pathList$. ---
+            ReDim curSelected(curCount + 1) As Integer
+            For i = 0 To curCount
+                fullPath$ = Z64PickerJoin$(curPath$, curNames$(i))
+                If Z64PickerInList%(fullPath$, pathList$(), pathCount) Then
+                    curSelected(i) = -1
+                End If
+            Next i
+            cursor = 0
+            topRow = 0
+            needReload = 0
+        End If
+
+        '--- Redraw. ---
+        Cls
+        Print "Path: "; curPath$;
+        Locate 1, 65: Print "Picked so far:"; pathCount + 1
+        Print String$(100, "-")
+        Print "Up/Dn PgUp/PgDn move   SPC toggle   ENTER open   BACKSPACE up   A/N all/none   TAB done   ESC cancel"
+        Print String$(100, "-")
+
+        Dim rowIdx As Long
+        For i = 0 To pageRows - 1
+            rowIdx = topRow + i
+            If rowIdx > curCount Then Exit For
+            If rowIdx = cursor Then Print "> "; Else Print "  ";
+            If curIsDir(rowIdx) Then
+                Print "     "; ' no checkbox on dirs
+                Print "[DIR]  "; curNames$(rowIdx)
+            Else
+                If curSelected(rowIdx) Then Print "[X] "; Else Print "[ ] ";
+                Print " "; curNames$(rowIdx)
+            End If
+        Next i
+
+        _Display
+        _Limit 60
+
+        k$ = InKey$
+        If Len(k$) = 0 Then _Continue
+
+        Select Case k$
+            Case Chr$(0) + Chr$(72) ' Up
+                If cursor > 0 Then cursor = cursor - 1
+                If cursor < topRow Then topRow = cursor
+
+            Case Chr$(0) + Chr$(80) ' Down
+                If cursor < curCount Then cursor = cursor + 1
+                If cursor >= topRow + pageRows Then topRow = cursor - pageRows + 1
+
+            Case Chr$(0) + Chr$(73) ' PageUp
+                cursor = cursor - pageRows
+                If cursor < 0 Then cursor = 0
+                topRow = cursor
+
+            Case Chr$(0) + Chr$(81) ' PageDn
+                cursor = cursor + pageRows
+                If cursor > curCount Then cursor = curCount
+                topRow = cursor - pageRows + 1
+                If topRow < 0 Then topRow = 0
+
+            Case " " ' Toggle file selection
+                If curCount >= 0 Then
+                    If Not curIsDir(cursor) Then
+                        fullPath$ = Z64PickerJoin$(curPath$, curNames$(cursor))
+                        If curSelected(cursor) Then
+                            Z64PickerListRemove fullPath$, pathList$(), pathCount
+                            curSelected(cursor) = 0
+                        Else
+                            Z64PickerListAdd fullPath$, pathList$(), pathCount
+                            curSelected(cursor) = -1
+                        End If
+                    End If
+                End If
+
+            Case Chr$(13) ' Enter -- descend on dir, toggle on file
+                If curCount >= 0 Then
+                    If curIsDir(cursor) Then
+                        If curNames$(cursor) = ".." Then
+                            curPath$ = Z64PickerParent$(curPath$)
+                        Else
+                            curPath$ = Z64PickerJoin$(curPath$, curNames$(cursor))
+                            If Right$(curPath$, 1) <> "\" Then curPath$ = curPath$ + "\"
+                        End If
+                        needReload = -1
+                    Else
+                        fullPath$ = Z64PickerJoin$(curPath$, curNames$(cursor))
+                        If curSelected(cursor) Then
+                            Z64PickerListRemove fullPath$, pathList$(), pathCount
+                            curSelected(cursor) = 0
+                        Else
+                            Z64PickerListAdd fullPath$, pathList$(), pathCount
+                            curSelected(cursor) = -1
+                        End If
+                    End If
+                End If
+
+            Case Chr$(8) ' Backspace -- parent dir
+                curPath$ = Z64PickerParent$(curPath$)
+                needReload = -1
+
+            Case "a", "A" ' Select all files in this dir
+                For i = 0 To curCount
+                    If Not curIsDir(i) Then
+                        If Not curSelected(i) Then
+                            fullPath$ = Z64PickerJoin$(curPath$, curNames$(i))
+                            Z64PickerListAdd fullPath$, pathList$(), pathCount
+                            curSelected(i) = -1
+                        End If
+                    End If
+                Next i
+
+            Case "n", "N" ' Deselect all files in this dir
+                For i = 0 To curCount
+                    If curSelected(i) Then
+                        fullPath$ = Z64PickerJoin$(curPath$, curNames$(i))
+                        Z64PickerListRemove fullPath$, pathList$(), pathCount
+                        curSelected(i) = 0
+                    End If
+                Next i
+
+            Case Chr$(9) ' TAB -- done, return picked list
+                done = -1
+
+            Case Chr$(27) ' ESC -- cancel
+                cancelled = -1
+                done = -1
+        End Select
+    Loop Until done
+
+    '--- Fill the caller's array. ---
+    If cancelled Or pathCount < 0 Then
+        ReDim picked$(0)
+        count = -1
+    Else
+        ReDim picked$(pathCount)
+        For i = 0 To pathCount
+            picked$(i) = pathList$(i)
+        Next i
+        count = pathCount
+    End If
+
+    '--- Restore the caller's screen. ---
+    If savedScreen <> 0 Then
+        Screen savedScreen
+    End If
+End Sub
+
+
+'=======================================================================
+'   Drive picker
+'=======================================================================
+
+Function Z64PickerDrive$ ()
+    Dim drives$(25)
+    Dim driveCount As Long: driveCount = -1
+    Dim d As Long
+    Dim cursor As Long: cursor = 0
+    Dim k$
+    Dim i As Long
+
+    Screen 0
+    Width 100, 40
+    Color 7, 0
+
+    For d = Asc("A") To Asc("Z")
+        If _DirExists(Chr$(d) + ":\") Then
+            driveCount = driveCount + 1
+            drives$(driveCount) = Chr$(d) + ":\"
+        End If
+    Next d
+
+    If driveCount < 0 Then
+        Z64PickerDrive$ = ""
+        Exit Function
+    End If
+
+    Do
+        Cls
+        Print "Select a drive to browse:"
+        Print String$(40, "-")
+        For i = 0 To driveCount
+            If i = cursor Then Print "> "; Else Print "  ";
+            Print drives$(i)
+        Next i
+        Print String$(40, "-")
+        Print "Up/Dn move   ENTER pick   ESC cancel"
+        _Display
+        _Limit 60
+
+        k$ = InKey$
+        If Len(k$) = 0 Then _Continue
+
+        Select Case k$
+            Case Chr$(0) + Chr$(72)
+                If cursor > 0 Then cursor = cursor - 1
+            Case Chr$(0) + Chr$(80)
+                If cursor < driveCount Then cursor = cursor + 1
+            Case Chr$(13)
+                Z64PickerDrive$ = drives$(cursor)
+                Exit Function
+            Case Chr$(27)
+                Z64PickerDrive$ = ""
+                Exit Function
+        End Select
+    Loop
+End Function
+
+
+'=======================================================================
+'   Directory loading (with system-folder filter)
+'=======================================================================
+
+Sub Z64PickerLoadDir (absPath$, names$(), isDir() As Integer, count As Long)
+    Dim savedCwd$: savedCwd$ = _CWD$
+    Dim entry$
+    Dim entryIsDir As Integer
+
+    count = -1
+    ReDim names$(0)
+    ReDim isDir(0) As Integer
+
+    If Not _DirExists(absPath$) Then Exit Sub
+
+    '--- Add ".." at the top if we're not at a drive root. ---
+    If Len(absPath$) > 3 Then
+        count = count + 1
+        ReDim _Preserve names$(count), isDir(count) As Integer
+        names$(count) = ".."
+        isDir(count) = -1
+    End If
+
+    ChDir absPath$
+
+    entry$ = _Files$("*.*")
+    Do While Len(entry$) > 0
+        If entry$ <> "." And entry$ <> ".." Then
+            entryIsDir = 0
+            If _DirExists(entry$) Then entryIsDir = -1
+            '--- Filter Windows system dirs we shouldn't enter. ---
+            If Not (entryIsDir And Z64PickerBlocked%(entry$)) Then
+                count = count + 1
+                ReDim _Preserve names$(count), isDir(count) As Integer
+                names$(count) = entry$
+                isDir(count) = entryIsDir
+            End If
+        End If
+        entry$ = _Files$
+    Loop
+
+    ChDir savedCwd$
+End Sub
+
+
+'=======================================================================
+'   Internal helpers
+'=======================================================================
+
+Function Z64PickerJoin$ (baseDir$, nname$)
+    '--- Join with exactly one backslash. ---
+    If Len(baseDir$) = 0 Then Z64PickerJoin$ = nname$: Exit Function
+    If Right$(baseDir$, 1) = "\" Or Right$(baseDir$, 1) = "/" Then
+        Z64PickerJoin$ = baseDir$ + nname$
+    Else
+        Z64PickerJoin$ = baseDir$ + "\" + nname$
+    End If
+End Function
+
+
+Function Z64PickerParent$ (path$)
+    '--- Return parent of path$ with trailing slash. Root stays root. ---
+    Dim p$: p$ = path$
+    Dim i As Long, ch$
+    If Right$(p$, 1) = "\" Or Right$(p$, 1) = "/" Then p$ = Left$(p$, Len(p$) - 1)
+    For i = Len(p$) To 1 Step -1
+        ch$ = Mid$(p$, i, 1)
+        If ch$ = "\" Or ch$ = "/" Then
+            If i = 3 And Mid$(p$, 2, 1) = ":" Then
+                Z64PickerParent$ = Left$(p$, 3): Exit Function
+            End If
+            Z64PickerParent$ = Left$(p$, i - 1) + "\": Exit Function
+        End If
+        If ch$ = ":" And i = 2 Then
+            Z64PickerParent$ = Left$(p$, 2) + "\": Exit Function
+        End If
+    Next i
+    If Right$(p$, 1) = "\" Then Z64PickerParent$ = p$ Else Z64PickerParent$ = p$ + "\"
+End Function
+
+
+Function Z64PickerBlocked% (nname$)
+    Dim ln$: ln$ = LCase$(nname$)
+    If ln$ = "$recycle.bin" Then Z64PickerBlocked% = -1: Exit Function
+    If ln$ = "recycler" Then Z64PickerBlocked% = -1: Exit Function
+    If ln$ = "system volume information" Then Z64PickerBlocked% = -1: Exit Function
+End Function
+
+
+Function Z64PickerInList% (fullPath$, pathList$(), pathCount As Long)
+    Dim i As Long
+    Dim target$: target$ = LCase$(fullPath$)
+    For i = 0 To pathCount
+        If LCase$(pathList$(i)) = target$ Then
+            Z64PickerInList% = -1
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+Sub Z64PickerListAdd (fullPath$, pathList$(), pathCount As Long)
+    pathCount = pathCount + 1
+    ReDim _Preserve pathList$(pathCount)
+    pathList$(pathCount) = fullPath$
+End Sub
+
+
+Sub Z64PickerListRemove (fullPath$, pathList$(), pathCount As Long)
+    Dim i As Long, j As Long
+    Dim target$: target$ = LCase$(fullPath$)
+    For i = 0 To pathCount
+        If LCase$(pathList$(i)) = target$ Then
+            For j = i To pathCount - 1
+                pathList$(j) = pathList$(j + 1)
+            Next j
+            pathCount = pathCount - 1
+            If pathCount >= 0 Then
+                ReDim _Preserve pathList$(pathCount)
+            Else
+                ReDim pathList$(0)
+            End If
+            Exit Sub
+        End If
+    Next i
+End Sub

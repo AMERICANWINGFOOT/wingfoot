@@ -1,0 +1,694 @@
+'==============================================================
+' OBJ3.bm -- implementation
+'==============================================================
+
+Sub OBJ3Init ()
+    obj3VCount = 0
+    obj3TCount = 0
+    obj3FCount = 0
+    obj3MatCount = 0
+    Dim i As Long
+    For i = 1 To OBJ3_MAXMODEL
+        obj3Model(i).used = 0
+    Next i
+    obj3CamX = 0: obj3CamY = 0: obj3CamZ = 0
+    obj3Near = 0.05
+    obj3Cull = OBJ3_CULLBACK
+    obj3WireColor = _RGB32(200, 200, 200)
+    obj3Ambient = 0.25
+    obj3LX = -0.4: obj3LY = 0.7: obj3LZ = -0.6
+    obj3LastError = ""
+    OBJ3SetView 60, _Width / 2, _Height / 2
+    obj3Ready = -1
+End Sub
+
+Sub OBJ3SetView (fovDeg As Single, cx As Single, cy As Single)
+    Dim f As Single
+    f = fovDeg
+    If f < 5 Then f = 5
+    If f > 170 Then f = 170
+    ' half-width of the view plane at z = 1
+    obj3Fov = (_Width / 2) / Tan(f * 0.5 * 3.14159265 / 180)
+    obj3CX = cx
+    obj3CY = cy
+End Sub
+
+Sub OBJ3SetCamera (x As Single, y As Single, z As Single)
+    obj3CamX = x: obj3CamY = y: obj3CamZ = z
+End Sub
+
+Sub OBJ3SetLight (x As Single, y As Single, z As Single, ambient As Single)
+    Dim d As Single
+    d = Sqr(x * x + y * y + z * z)
+    If d = 0 Then d = 1
+    obj3LX = x / d: obj3LY = y / d: obj3LZ = z / d
+    obj3Ambient = ambient
+End Sub
+
+Sub OBJ3SetCull (kmode As Integer)
+    obj3Cull = kmode
+End Sub
+
+Sub OBJ3SetPos (h As Long, x As Single, y As Single, z As Single)
+    If h < 1 Or h > OBJ3_MAXMODEL Then Exit Sub
+    obj3Model(h).px = x: obj3Model(h).py = y: obj3Model(h).pz = z
+End Sub
+
+Sub OBJ3SetRot (h As Long, x As Single, y As Single, z As Single)
+    If h < 1 Or h > OBJ3_MAXMODEL Then Exit Sub
+    obj3Model(h).rx = x: obj3Model(h).ry = y: obj3Model(h).rz = z
+End Sub
+
+Sub OBJ3SetScale (h As Long, s As Single)
+    If h < 1 Or h > OBJ3_MAXMODEL Then Exit Sub
+    obj3Model(h).scl = s
+End Sub
+
+Function OBJ3Error$ ()
+    OBJ3Error$ = obj3LastError
+End Function
+
+Function OBJ3TriCount& (h As Long)
+    If h < 1 Or h > OBJ3_MAXMODEL Then OBJ3TriCount& = 0: Exit Function
+    OBJ3TriCount& = obj3Model(h).fNum
+End Function
+
+Function OBJ3VertCount& (h As Long)
+    If h < 1 Or h > OBJ3_MAXMODEL Then OBJ3VertCount& = 0: Exit Function
+    OBJ3VertCount& = obj3Model(h).vNum
+End Function
+
+'--------------------------------------------------------------
+' pool growth -- ReDim _Preserve in 50% steps so loading a big
+' model is not O(n^2)
+'--------------------------------------------------------------
+Sub OBJ3GrowVerts (n As Long)
+    If n <= UBound(obj3VX) Then Exit Sub
+    Dim nu As Long
+    nu = UBound(obj3VX) * 3 \ 2
+    If nu < n Then nu = n
+    ReDim _Preserve obj3VX(1 To nu) As Single
+    ReDim _Preserve obj3VY(1 To nu) As Single
+    ReDim _Preserve obj3VZ(1 To nu) As Single
+End Sub
+
+Sub OBJ3GrowTexs (n As Long)
+    If n <= UBound(obj3TU) Then Exit Sub
+    Dim nu As Long
+    nu = UBound(obj3TU) * 3 \ 2
+    If nu < n Then nu = n
+    ReDim _Preserve obj3TU(1 To nu) As Single
+    ReDim _Preserve obj3TV(1 To nu) As Single
+End Sub
+
+Sub OBJ3GrowFaces (n As Long)
+    If n <= UBound(obj3FA) Then Exit Sub
+    Dim nu As Long
+    nu = UBound(obj3FA) * 3 \ 2
+    If nu < n Then nu = n
+    ReDim _Preserve obj3FA(1 To nu) As Long
+    ReDim _Preserve obj3FB(1 To nu) As Long
+    ReDim _Preserve obj3FC(1 To nu) As Long
+    ReDim _Preserve obj3FTA(1 To nu) As Long
+    ReDim _Preserve obj3FTB(1 To nu) As Long
+    ReDim _Preserve obj3FTC(1 To nu) As Long
+    ReDim _Preserve obj3FM(1 To nu) As Long
+End Sub
+
+Sub OBJ3GrowScratch (n As Long)
+    If n > UBound(obj3SX) Then
+        ReDim obj3SX(1 To n) As Single
+        ReDim obj3SY(1 To n) As Single
+        ReDim obj3WX(1 To n) As Single
+        ReDim obj3WY(1 To n) As Single
+        ReDim obj3WZ(1 To n) As Single
+    End If
+End Sub
+
+'--------------------------------------------------------------
+' whitespace tokenizer -- collapses runs of spaces and tabs,
+' which real .obj files are full of
+'--------------------------------------------------------------
+Function OBJ3TokCount% (s As String)
+    Dim i As Long, inTok As Integer, n As Integer, ch As String * 1
+    inTok = 0: n = 0
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch = " " Or ch = Chr$(9) Then
+            inTok = 0
+        Else
+            If inTok = 0 Then n = n + 1
+            inTok = -1
+        End If
+    Next i
+    OBJ3TokCount% = n
+End Function
+
+Function OBJ3Tok$ (s As String, n As Integer)
+    Dim i As Long, inTok As Integer, k As Integer, st As Long, ch As String * 1
+    inTok = 0: k = 0: st = 0
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If ch = " " Or ch = Chr$(9) Then
+            If inTok Then
+                If k = n Then OBJ3Tok$ = Mid$(s, st, i - st): Exit Function
+            End If
+            inTok = 0
+        Else
+            If inTok = 0 Then
+                k = k + 1
+                st = i
+            End If
+            inTok = -1
+        End If
+    Next i
+    If inTok And k = n Then OBJ3Tok$ = Mid$(s, st) Else OBJ3Tok$ = ""
+End Function
+
+'--------------------------------------------------------------
+' parse one face reference: "12", "12/7", "12//9", "12/7/9"
+' part 1 = vertex, 2 = texcoord, 3 = normal
+' negative indices are relative to cnt (elements seen so far)
+'--------------------------------------------------------------
+Function OBJ3RefIdx& (tok As String, part As Integer, cnt As Long)
+    Dim i As Long, k As Integer, st As Long, fld As String, v As Long
+    st = 1: k = 1: fld = ""
+    For i = 1 To Len(tok) + 1
+        If i > Len(tok) Or Mid$(tok, i, 1) = "/" Then
+            If k = part Then fld = Mid$(tok, st, i - st): Exit For
+            k = k + 1
+            st = i + 1
+        End If
+    Next i
+    If Len(fld) = 0 Then OBJ3RefIdx& = 0: Exit Function
+    v = Val(fld)
+    If v < 0 Then v = cnt + 1 + v
+    If v < 1 Then v = 0
+    OBJ3RefIdx& = v
+End Function
+
+Function OBJ3DirOf$ (filePath As String)
+    Dim i As Long
+    For i = Len(filePath) To 1 Step -1
+        If Mid$(filePath, i, 1) = "\" Or Mid$(filePath, i, 1) = "/" Then
+            OBJ3DirOf$ = Left$(filePath, i)
+            Exit Function
+        End If
+    Next i
+    OBJ3DirOf$ = ""
+End Function
+
+Function OBJ3MatFind& (nm As String)
+    Dim i As Long, t As String
+    t = _Trim$(nm)
+    For i = 1 To obj3MatCount
+        If _Trim$(obj3Mat(i).nam) = t Then OBJ3MatFind& = i: Exit Function
+    Next i
+    OBJ3MatFind& = 0
+End Function
+
+'--------------------------------------------------------------
+' MTL loader.  Adds to the shared material table; models refer
+' to materials by absolute index so several models can share.
+'--------------------------------------------------------------
+Sub OBJ3LoadMTL (filePath As String)
+    If _FileExists(filePath) = 0 Then
+        obj3LastError = "MTL not found: " + filePath
+        Exit Sub
+    End If
+
+    Dim ff As Integer, ln As String, tag As String, cur As Long, dirp As String
+    Dim r As Single, g As Single, b As Single, tp As String
+
+    dirp = OBJ3DirOf$(filePath)
+    ff = FreeFile
+    Open filePath For Input As #ff
+    cur = 0
+    Do While Not EOF(ff)
+        Line Input #ff, ln
+        ln = _Trim$(ln)
+        If Len(ln) > 0 And Left$(ln, 1) <> "#" Then
+            tag = LCase$(OBJ3Tok$(ln, 1))
+            If tag = "newmtl" Then
+                If obj3MatCount < OBJ3_MAXMAT Then
+                    obj3MatCount = obj3MatCount + 1
+                    cur = obj3MatCount
+                    obj3Mat(cur).nam = _Trim$(Mid$(ln, Len(OBJ3Tok$(ln, 1)) + 1))
+                    obj3Mat(cur).kr = 0.8
+                    obj3Mat(cur).kg = 0.8
+                    obj3Mat(cur).kb = 0.8
+                    obj3Mat(cur).tex = 0
+                    obj3Mat(cur).hasTex = 0
+                Else
+                    cur = 0
+                End If
+            ElseIf tag = "kd" And cur > 0 Then
+                r = Val(OBJ3Tok$(ln, 2))
+                g = Val(OBJ3Tok$(ln, 3))
+                b = Val(OBJ3Tok$(ln, 4))
+                If r > 1 Or g > 1 Or b > 1 Then r = r / 255: g = g / 255: b = b / 255
+                obj3Mat(cur).kr = r
+                obj3Mat(cur).kg = g
+                obj3Mat(cur).kb = b
+            ElseIf tag = "map_kd" And cur > 0 Then
+                tp = _Trim$(Mid$(ln, Len(OBJ3Tok$(ln, 1)) + 1))
+                If _FileExists(tp) = 0 Then tp = dirp + tp
+                If _FileExists(tp) Then
+                    Dim th As Long
+                    th = _LoadImage(tp, 32)
+                    ' a QB64 software image handle is < -1; -1 means failure
+                    If th < -1 Then
+                        obj3Mat(cur).tex = th
+                        obj3Mat(cur).hasTex = -1
+                    Else
+                        obj3LastError = "texture load failed: " + tp
+                    End If
+                Else
+                    obj3LastError = "texture missing: " + tp
+                End If
+            End If
+        End If
+    Loop
+    Close #ff
+End Sub
+
+'--------------------------------------------------------------
+' OBJ loader.  Returns a model handle (1..OBJ3_MAXMODEL) or 0.
+' Handles n-gons (fan triangulated), v/vt/vn refs, negative
+' indices, mtllib/usemtl, and blank/comment lines.
+'--------------------------------------------------------------
+Function OBJ3Load& (filePath As String)
+    If obj3Ready = 0 Then OBJ3Init
+
+    If _FileExists(filePath) = 0 Then
+        obj3LastError = "OBJ not found: " + filePath
+        OBJ3Load& = 0
+        Exit Function
+    End If
+
+    Dim h As Long, i As Long
+    h = 0
+    For i = 1 To OBJ3_MAXMODEL
+        If obj3Model(i).used = 0 Then h = i: Exit For
+    Next i
+    If h = 0 Then
+        obj3LastError = "no free model slots"
+        OBJ3Load& = 0
+        Exit Function
+    End If
+
+    Dim ff As Integer, ln As String, tag As String
+    Dim curMat As Long, dirp As String
+    Dim nTok As Integer, k As Integer
+    Dim ia As Long, ib As Long, ic As Long
+    Dim ta As Long, tb As Long, tc As Long
+    Dim locV As Long, locT As Long
+
+    dirp = OBJ3DirOf$(filePath)
+
+    obj3Model(h).used = -1
+    obj3Model(h).nam = filePath
+    obj3Model(h).vFirst = obj3VCount + 1
+    obj3Model(h).tFirst = obj3TCount + 1
+    obj3Model(h).fFirst = obj3FCount + 1
+    obj3Model(h).vNum = 0
+    obj3Model(h).tNum = 0
+    obj3Model(h).fNum = 0
+    obj3Model(h).scl = 1
+    obj3Model(h).px = 0: obj3Model(h).py = 0: obj3Model(h).pz = 0
+    obj3Model(h).rx = 0: obj3Model(h).ry = 0: obj3Model(h).rz = 0
+
+    locV = 0: locT = 0: curMat = 0
+
+    ff = FreeFile
+    Open filePath For Input As #ff
+    Do While Not EOF(ff)
+        Line Input #ff, ln
+        ln = _Trim$(ln)
+        If Len(ln) > 0 And Left$(ln, 1) <> "#" Then
+            tag = LCase$(OBJ3Tok$(ln, 1))
+
+            If tag = "v" Then
+                locV = locV + 1
+                OBJ3GrowVerts obj3VCount + 1
+                obj3VCount = obj3VCount + 1
+                obj3VX(obj3VCount) = Val(OBJ3Tok$(ln, 2))
+                obj3VY(obj3VCount) = Val(OBJ3Tok$(ln, 3))
+                obj3VZ(obj3VCount) = Val(OBJ3Tok$(ln, 4))
+
+            ElseIf tag = "vt" Then
+                locT = locT + 1
+                OBJ3GrowTexs obj3TCount + 1
+                obj3TCount = obj3TCount + 1
+                obj3TU(obj3TCount) = Val(OBJ3Tok$(ln, 2))
+                obj3TV(obj3TCount) = Val(OBJ3Tok$(ln, 3))
+
+            ElseIf tag = "mtllib" Then
+                Dim mp As String
+                mp = _Trim$(Mid$(ln, Len(OBJ3Tok$(ln, 1)) + 1))
+                If _FileExists(mp) = 0 Then mp = dirp + mp
+                OBJ3LoadMTL mp
+
+            ElseIf tag = "usemtl" Then
+                curMat = OBJ3MatFind&(_Trim$(Mid$(ln, Len(OBJ3Tok$(ln, 1)) + 1)))
+
+            ElseIf tag = "f" Then
+                nTok = OBJ3TokCount%(ln)
+                If nTok >= 4 Then
+                    ' fan triangulation: (1,2,3) (1,3,4) (1,4,5) ...
+                    ia = OBJ3RefIdx&(OBJ3Tok$(ln, 2), 1, locV)
+                    ta = OBJ3RefIdx&(OBJ3Tok$(ln, 2), 2, locT)
+                    For k = 3 To nTok - 1
+                        ib = OBJ3RefIdx&(OBJ3Tok$(ln, k), 1, locV)
+                        tb = OBJ3RefIdx&(OBJ3Tok$(ln, k), 2, locT)
+                        ic = OBJ3RefIdx&(OBJ3Tok$(ln, k + 1), 1, locV)
+                        tc = OBJ3RefIdx&(OBJ3Tok$(ln, k + 1), 2, locT)
+                        If ia > 0 And ib > 0 And ic > 0 Then
+                            OBJ3GrowFaces obj3FCount + 1
+                            obj3FCount = obj3FCount + 1
+                            obj3FA(obj3FCount) = obj3Model(h).vFirst + ia - 1
+                            obj3FB(obj3FCount) = obj3Model(h).vFirst + ib - 1
+                            obj3FC(obj3FCount) = obj3Model(h).vFirst + ic - 1
+                            If ta > 0 Then obj3FTA(obj3FCount) = obj3Model(h).tFirst + ta - 1 Else obj3FTA(obj3FCount) = 0
+                            If tb > 0 Then obj3FTB(obj3FCount) = obj3Model(h).tFirst + tb - 1 Else obj3FTB(obj3FCount) = 0
+                            If tc > 0 Then obj3FTC(obj3FCount) = obj3Model(h).tFirst + tc - 1 Else obj3FTC(obj3FCount) = 0
+                            obj3FM(obj3FCount) = curMat
+                            obj3Model(h).fNum = obj3Model(h).fNum + 1
+                        End If
+                    Next k
+                End If
+            End If
+        End If
+    Loop
+    Close #ff
+
+    obj3Model(h).vNum = locV
+    obj3Model(h).tNum = locT
+
+    If obj3Model(h).vNum = 0 Or obj3Model(h).fNum = 0 Then
+        obj3LastError = "no geometry in " + filePath
+        obj3Model(h).used = 0
+        OBJ3Load& = 0
+        Exit Function
+    End If
+
+    OBJ3GrowScratch obj3Model(h).vNum
+    If obj3Model(h).fNum > UBound(obj3Ord) Then
+        ReDim obj3Ord(1 To obj3Model(h).fNum) As Long
+        ReDim obj3Dep(1 To obj3Model(h).fNum) As Single
+    End If
+
+    OBJ3Normalize h
+    OBJ3Load& = h
+End Function
+
+'--------------------------------------------------------------
+' Re-centre the model on its bounding-box centre and scale it so
+' its bounding radius is 1.0.  Removes all guesswork about the
+' magic scale factor a given .obj happens to need.
+'--------------------------------------------------------------
+Sub OBJ3Normalize (h As Long)
+    If h < 1 Or h > OBJ3_MAXMODEL Then Exit Sub
+    If obj3Model(h).used = 0 Then Exit Sub
+
+    Dim i As Long, f As Long, l As Long
+    Dim lox As Single, loy As Single, loz As Single
+    Dim hix As Single, hiy As Single, hiz As Single
+    Dim cx As Single, cy As Single, cz As Single, d As Single, mx As Single
+
+    f = obj3Model(h).vFirst
+    l = f + obj3Model(h).vNum - 1
+    lox = obj3VX(f): hix = lox
+    loy = obj3VY(f): hiy = loy
+    loz = obj3VZ(f): hiz = loz
+    For i = f To l
+        If obj3VX(i) < lox Then lox = obj3VX(i)
+        If obj3VX(i) > hix Then hix = obj3VX(i)
+        If obj3VY(i) < loy Then loy = obj3VY(i)
+        If obj3VY(i) > hiy Then hiy = obj3VY(i)
+        If obj3VZ(i) < loz Then loz = obj3VZ(i)
+        If obj3VZ(i) > hiz Then hiz = obj3VZ(i)
+    Next i
+
+    cx = (lox + hix) / 2: cy = (loy + hiy) / 2: cz = (loz + hiz) / 2
+    mx = 0
+    For i = f To l
+        obj3VX(i) = obj3VX(i) - cx
+        obj3VY(i) = obj3VY(i) - cy
+        obj3VZ(i) = obj3VZ(i) - cz
+        d = Sqr(obj3VX(i) * obj3VX(i) + obj3VY(i) * obj3VY(i) + obj3VZ(i) * obj3VZ(i))
+        If d > mx Then mx = d
+    Next i
+    If mx > 0 Then
+        For i = f To l
+            obj3VX(i) = obj3VX(i) / mx
+            obj3VY(i) = obj3VY(i) / mx
+            obj3VZ(i) = obj3VZ(i) / mx
+        Next i
+    End If
+    obj3Model(h).radius = 1
+End Sub
+
+'--------------------------------------------------------------
+' scanline solid triangle -- QB64-PE has no filled-triangle
+' primitive, and horizontal LINE is the fastest software fill
+'--------------------------------------------------------------
+Sub OBJ3FillTri (x1 As Single, y1 As Single, x2 As Single, y2 As Single, x3 As Single, y3 As Single, c As _Unsigned Long)
+    Dim ax As Single, ay As Single, bx As Single, by As Single
+    Dim cx As Single, cy As Single
+    Dim yy As Long, xa As Single, xb As Single
+    Dim hgt As Long, wid As Long, ys As Long, ye As Long
+    Dim t As Single
+
+    ax = x1: ay = y1: bx = x2: by = y2: cx = x3: cy = y3
+    If ay > by Then Swap ax, bx: Swap ay, by
+    If ay > cy Then Swap ax, cx: Swap ay, cy
+    If by > cy Then Swap bx, cx: Swap by, cy
+
+    hgt = _Height
+    wid = _Width
+    If cy < 0 Or ay > hgt - 1 Then Exit Sub
+
+    ' degenerate / edge-on triangle: one span, no interpolation
+    If cy - ay < 0.5 Then
+        yy = Int((ay + cy) * 0.5)
+        If yy >= 0 And yy < hgt Then
+            xa = ax: xb = ax
+            If bx < xa Then xa = bx
+            If cx < xa Then xa = cx
+            If bx > xb Then xb = bx
+            If cx > xb Then xb = cx
+            If xa < 0 Then xa = 0
+            If xb > wid - 1 Then xb = wid - 1
+            If xa <= xb Then Line (xa, yy)-(xb, yy), c
+        End If
+        Exit Sub
+    End If
+
+    ys = Int(ay): If ys < 0 Then ys = 0
+    ye = Int(cy): If ye > hgt - 1 Then ye = hgt - 1
+
+    For yy = ys To ye
+        ' long edge a -> c
+        t = (yy - ay) / (cy - ay)
+        If t < 0 Then t = 0
+        If t > 1 Then t = 1
+        xa = ax + (cx - ax) * t
+
+        ' short edge a -> b, then b -> c
+        If yy < by Then
+            If by - ay < 0.0001 Then
+                xb = bx
+            Else
+                t = (yy - ay) / (by - ay)
+                If t < 0 Then t = 0
+                If t > 1 Then t = 1
+                xb = ax + (bx - ax) * t
+            End If
+        Else
+            If cy - by < 0.0001 Then
+                xb = cx
+            Else
+                t = (yy - by) / (cy - by)
+                If t < 0 Then t = 0
+                If t > 1 Then t = 1
+                xb = bx + (cx - bx) * t
+            End If
+        End If
+
+        If xa > xb Then Swap xa, xb
+        If xb >= 0 And xa <= wid - 1 Then
+            If xa < 0 Then xa = 0
+            If xb > wid - 1 Then xb = wid - 1
+            Line (xa, yy)-(xb, yy), c
+        End If
+    Next yy
+End Sub
+
+'--------------------------------------------------------------
+' Draw one model.
+'   dmode = OBJ3_WIRE / OBJ3_FLAT / OBJ3_TEX
+' Transform -> project -> cull -> depth sort (far to near) -> fill
+'--------------------------------------------------------------
+Sub OBJ3Draw (h As Long, dmode As Integer)
+    If h < 1 Or h > OBJ3_MAXMODEL Then Exit Sub
+    If obj3Model(h).used = 0 Then Exit Sub
+
+    Dim i As Long, n As Long, vi As Long, bases As Long
+    Dim sx As Single, sy As Single, sz As Single
+    Dim cxr As Single, sxr As Single, cyr As Single, syr As Single, czr As Single, szr As Single
+    Dim x As Single, y As Single, z As Single, tx As Single, ty As Single
+    Dim s As Single
+
+    s = obj3Model(h).scl
+    cxr = Cos(obj3Model(h).rx): sxr = Sin(obj3Model(h).rx)
+    cyr = Cos(obj3Model(h).ry): syr = Sin(obj3Model(h).ry)
+    czr = Cos(obj3Model(h).rz): szr = Sin(obj3Model(h).rz)
+
+    bases = obj3Model(h).vFirst
+    n = obj3Model(h).vNum
+    OBJ3GrowScratch n
+
+    ' ---- transform + project every vertex once ----
+    For i = 1 To n
+        vi = bases + i - 1
+        x = obj3VX(vi) * s: y = obj3VY(vi) * s: z = obj3VZ(vi) * s
+
+        ' rotate X
+        ty = y * cxr - z * sxr
+        z = y * sxr + z * cxr
+        y = ty
+        ' rotate Y
+        tx = x * cyr + z * syr
+        z = -x * syr + z * cyr
+        x = tx
+        ' rotate Z
+        tx = x * czr - y * szr
+        ty = x * szr + y * czr
+        x = tx: y = ty
+
+        ' world -> view (camera looks down +Z)
+        sx = x + obj3Model(h).px - obj3CamX
+        sy = y + obj3Model(h).py - obj3CamY
+        sz = z + obj3Model(h).pz - obj3CamZ
+
+        obj3WX(i) = sx: obj3WY(i) = sy: obj3WZ(i) = sz
+        If sz > obj3Near Then
+            obj3SX(i) = obj3CX + sx * obj3Fov / sz
+            obj3SY(i) = obj3CY - sy * obj3Fov / sz
+        Else
+            obj3SX(i) = -100000
+            obj3SY(i) = -100000
+        End If
+    Next i
+
+    ' ---- build the visible triangle list ----
+    Dim f As Long, fa As Long, fb As Long, fc As Long
+    Dim la As Long, lb As Long, lc As Long
+    Dim cnt As Long, cross As Single
+    Dim ax As Single, ay As Single, bx As Single, by As Single
+
+    If obj3Model(h).fNum > UBound(obj3Ord) Then
+        ReDim obj3Ord(1 To obj3Model(h).fNum) As Long
+        ReDim obj3Dep(1 To obj3Model(h).fNum) As Single
+    End If
+
+    cnt = 0
+    For f = obj3Model(h).fFirst To obj3Model(h).fFirst + obj3Model(h).fNum - 1
+        la = obj3FA(f) - bases + 1
+        lb = obj3FB(f) - bases + 1
+        lc = obj3FC(f) - bases + 1
+        If la >= 1 And la <= n And lb >= 1 And lb <= n And lc >= 1 And lc <= n Then
+            If obj3WZ(la) > obj3Near And obj3WZ(lb) > obj3Near And obj3WZ(lc) > obj3Near Then
+                ax = obj3SX(lb) - obj3SX(la): ay = obj3SY(lb) - obj3SY(la)
+                bx = obj3SX(lc) - obj3SX(la): by = obj3SY(lc) - obj3SY(la)
+                cross = ax * by - ay * bx
+                Dim keep As Integer
+                keep = -1
+                If obj3Cull = OBJ3_CULLBACK And cross >= 0 Then keep = 0
+                If obj3Cull = OBJ3_CULLFRONT And cross <= 0 Then keep = 0
+                If keep Then
+                    cnt = cnt + 1
+                    obj3Ord(cnt) = f
+                    obj3Dep(cnt) = (obj3WZ(la) + obj3WZ(lb) + obj3WZ(lc)) / 3
+                End If
+            End If
+        End If
+    Next f
+    If cnt = 0 Then Exit Sub
+
+    ' ---- shell sort, far to near (painter's algorithm) ----
+    Dim gap As Long, j As Long, kd As Single, ko As Long
+    gap = cnt \ 2
+    Do While gap > 0
+        For i = gap + 1 To cnt
+            kd = obj3Dep(i): ko = obj3Ord(i)
+            j = i
+            Do While j > gap
+                If obj3Dep(j - gap) < kd Then Exit Do
+                obj3Dep(j) = obj3Dep(j - gap): obj3Ord(j) = obj3Ord(j - gap)
+                j = j - gap
+            Loop
+            obj3Dep(j) = kd: obj3Ord(j) = ko
+        Next i
+        gap = gap \ 2
+    Loop
+
+    ' ---- rasterize ----
+    Dim m As Long, sh As Single, nx As Single, ny As Single, nz As Single, nl As Single
+    Dim ux As Single, uy As Single, uz As Single, vx As Single, vy As Single, vz As Single
+    Dim rr As Integer, gg As Integer, bb As Integer
+    Dim tw As Long, thh As Long
+
+    For i = 1 To cnt
+        f = obj3Ord(i)
+        la = obj3FA(f) - bases + 1
+        lb = obj3FB(f) - bases + 1
+        lc = obj3FC(f) - bases + 1
+        m = obj3FM(f)
+
+        If dmode = OBJ3_WIRE Then
+            Line (obj3SX(la), obj3SY(la))-(obj3SX(lb), obj3SY(lb)), obj3WireColor
+            Line (obj3SX(lb), obj3SY(lb))-(obj3SX(lc), obj3SY(lc)), obj3WireColor
+            Line (obj3SX(lc), obj3SY(lc))-(obj3SX(la), obj3SY(la)), obj3WireColor
+        Else
+            If dmode = OBJ3_TEX And m > 0 Then
+                If obj3Mat(m).hasTex And obj3FTA(f) > 0 And obj3FTB(f) > 0 And obj3FTC(f) > 0 Then
+                    tw = _Width(obj3Mat(m).tex) - 1
+                    thh = _Height(obj3Mat(m).tex) - 1
+                    _MapTriangle (obj3TU(obj3FTA(f)) * tw, (1 - obj3TV(obj3FTA(f))) * thh)-(obj3TU(obj3FTB(f)) * tw, (1 - obj3TV(obj3FTB(f))) * thh)-(obj3TU(obj3FTC(f)) * tw, (1 - obj3TV(obj3FTC(f))) * thh), obj3Mat(m).tex To(obj3SX(la), obj3SY(la))-(obj3SX(lb), obj3SY(lb))-(obj3SX(lc), obj3SY(lc))
+                    _Continue
+                End If
+            End If
+
+            ' flat shade from the view-space face normal
+            ux = obj3WX(lb) - obj3WX(la): uy = obj3WY(lb) - obj3WY(la): uz = obj3WZ(lb) - obj3WZ(la)
+            vx = obj3WX(lc) - obj3WX(la): vy = obj3WY(lc) - obj3WY(la): vz = obj3WZ(lc) - obj3WZ(la)
+            nx = uy * vz - uz * vy
+            ny = uz * vx - ux * vz
+            nz = ux * vy - uy * vx
+            nl = Sqr(nx * nx + ny * ny + nz * nz)
+            If nl = 0 Then nl = 1
+            sh = (nx * obj3LX + ny * obj3LY + nz * obj3LZ) / nl
+            If sh < 0 Then sh = -sh
+            sh = obj3Ambient + (1 - obj3Ambient) * sh
+            If sh > 1 Then sh = 1
+
+            If m > 0 Then
+                rr = obj3Mat(m).kr * sh * 255
+                gg = obj3Mat(m).kg * sh * 255
+                bb = obj3Mat(m).kb * sh * 255
+            Else
+                rr = 200 * sh: gg = 200 * sh: bb = 200 * sh
+            End If
+            OBJ3FillTri obj3SX(la), obj3SY(la), obj3SX(lb), obj3SY(lb), obj3SX(lc), obj3SY(lc), _RGB32(rr, gg, bb)
+        End If
+    Next i
+End Sub
+
+Sub OBJ3Free (h As Long)
+    If h < 1 Or h > OBJ3_MAXMODEL Then Exit Sub
+    obj3Model(h).used = 0
+    obj3Model(h).fNum = 0
+    obj3Model(h).vNum = 0
+End Sub

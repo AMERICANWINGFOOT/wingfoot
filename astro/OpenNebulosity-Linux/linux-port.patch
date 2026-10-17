@@ -1,0 +1,976 @@
+diff --git a/CImg.h b/CImg.h
+index 491fcb4..5d8b854 100644
+--- a/CImg.h
++++ b/CImg.h
+@@ -180,7 +180,7 @@
+ #if cimg_OS==0
+ #define cimg_display 0
+ #elif cimg_OS==1
+-#if defined(__MACOSX__) || defined(__APPLE__)
++#if defined(__MACOSX__) || (defined (__APPLE__) || defined (__LINUX__))
+ #define cimg_display 1
+ #else
+ #define cimg_display 1
+diff --git a/CanonDSLR.cpp b/CanonDSLR.cpp
+index cb67b19..a7aa0f7 100644
+--- a/CanonDSLR.cpp
++++ b/CanonDSLR.cpp
+@@ -49,6 +49,9 @@
+ #include <wx/numdlg.h>
+ #include <wx/filename.h>
+ #include "FreeImage.h"
++#ifdef __LINUX__
++#undef _WINDOWS_  // FreeImage.h defines it on Linux, which confuses wx headers
++#endif
+ #include "preferences.h"
+ 
+ #if defined (__WINDOWS__)
+diff --git a/CanonDSLR.h b/CanonDSLR.h
+index 5a00fd8..c34df1a 100644
+--- a/CanonDSLR.h
++++ b/CanonDSLR.h
+@@ -36,7 +36,7 @@
+  *
+  */
+ 
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ #ifndef __MACOS__
+ #define __MACOS__
+ #endif
+diff --git a/DSUSB.cpp b/DSUSB.cpp
+index 657463a..c518eff 100644
+--- a/DSUSB.cpp
++++ b/DSUSB.cpp
+@@ -39,7 +39,7 @@
+ #include "DSUSB.h"
+ 
+ 
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ #ifndef _HID_Utilities_External_h_
+ #include "/Users/stark/dev/HID64/HID_Utilities_External.h"
+ #define HIDUTILINC
+diff --git a/DSUSB.h b/DSUSB.h
+index 9ec4f14..1c64372 100644
+--- a/DSUSB.h
++++ b/DSUSB.h
+@@ -35,7 +35,7 @@
+  *
+  */
+ 
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ extern bool DSUSB_Open();
+ extern bool DSUSB_Close();
+ extern bool DSUSB_ShutterOpen();
+diff --git a/INDI.cpp b/INDI.cpp
+index 7084891..7c9860e 100644
+--- a/INDI.cpp
++++ b/INDI.cpp
+@@ -16,7 +16,7 @@
+ 
+ #ifdef INDISUPPORT
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ #include "cameras/indi/baseclient.h"
+ #define MYCCD "CCD Simulator"
+ 
+diff --git a/INDI.h b/INDI.h
+index cd6ca52..ffc068a 100644
+--- a/INDI.h
++++ b/INDI.h
+@@ -15,7 +15,7 @@
+ 
+ //#include "cameras/ASICamera2.h"
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ #include "cameras/indi/indiapi.h"
+ #include "cameras/indi/indidevapi.h"
+ #include "cameras/indi/indibase.h"
+diff --git a/MeadeDSI.h b/MeadeDSI.h
+index 11707b3..5698259 100644
+--- a/MeadeDSI.h
++++ b/MeadeDSI.h
+@@ -33,7 +33,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+ 
+ #include "cam_class.h"
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ //#include <IOKit/IOCFBundle.h>
+ #include <IOKit/usb/IOUSBLib.h>
+ //#include <IOKit/IOCFPlugIn.h>
+diff --git a/Nebulosity.cpp b/Nebulosity.cpp
+index 7d2ac4d..eb5ab8f 100644
+--- a/Nebulosity.cpp
++++ b/Nebulosity.cpp
+@@ -55,6 +55,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include <wx/fs_zip.h>
+ #include <wx/event.h>
+ #include <wx/stdpaths.h>
++#include <wx/filename.h>
+ #include <wx/filefn.h>
+ #include <wx/choicdlg.h> 
+ #include <wx/intl.h>
+@@ -62,7 +63,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include <wx/xlocale.h>
+ #endif
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__)
+ #include <sys/sysctl.h>
+ #endif
+ #include "Nebulosity.h"
+@@ -75,6 +76,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include "CamToolDialogs.h"
+ #include "macro.h"
+ #include "FreeImage.h"
++#ifdef __LINUX__
++#undef _WINDOWS_  // FreeImage.h defines it on Linux, which confuses wx headers
++#endif
+ #include "focus.h"
+ #include "focuser.h"
+ #include "ext_filterwheel.h"
+@@ -185,7 +189,7 @@ bool MyApp::OnInit(void) {
+ #endif
+ 
+     
+-#ifdef __APPLE__
++#if defined (__APPLE__)  // macOS 10.9 App Nap workaround
+     int osver = wxPlatformInfo::Get().GetOSMinorVersion();
+     if (osver == 9) { // Mavericks -- deal with App Nap
+         wxArrayString foo_out, foo_err;
+@@ -257,7 +261,7 @@ bool MyApp::OnInit(void) {
+ 		if (DEBUGSTART) wxMessageBox("3");
+ 
+ 	// Create main window
+-#if defined(__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 	frame = new MyFrame((wxFrame *) NULL, ProgName + wxString::Format(" v%s%s",VERSION,NEBSUBVER), wxPoint(-1,-1), 
+ 						wxSize(640, 670) );
+ #else
+@@ -322,7 +326,7 @@ bool MyApp::OnInit(void) {
+ 	wxFileSystem::AddHandler(new wxInternetFSHandler);
+ 		
+ 	
+-#if defined (__APPLE__) 
++#if (defined (__APPLE__) || defined (__LINUX__)) 
+ 	FreeImage_Initialise();
+ #endif
+ 	FreeImage_SetOutputMessage(FreeImageErrorHandler);
+@@ -348,7 +352,7 @@ bool MyApp::OnInit(void) {
+ 		MultiThread = wxThread::GetCPUCount();
+ 	else
+ 		MultiThread = 0;
+-#ifdef __APPLE__
++#if defined (__APPLE__)
+ 	int     count ;
+ 	size_t  size=sizeof(count) ;
+ 	if (wxThread::GetCPUCount() == -1) {
+@@ -415,7 +419,7 @@ wxFrame(frame, wxID_ANY, title, pos, size,wxDEFAULT_FRAME_STYLE | wxFULL_REPAINT
+ 	canvas = (MyCanvas *) NULL;
+ 	int ctrl_xsize = 182; 
+ 	//int ctrl_ysize = 650;
+-#if defined(__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 	int canvas_xsize = 600;
+ 	int canvas_ysize = 410;
+ #else
+@@ -428,7 +432,15 @@ wxFrame(frame, wxID_ANY, title, pos, size,wxDEFAULT_FRAME_STYLE | wxFULL_REPAINT
+ #endif
+ 	Pushed_evt = NULL;
+ 	Camera_ChoiceBox = NULL;
++#if defined (__LINUX__)
++	{	// Linux: no resource icons; use nebulosity.png next to the program or in ../share/nebulosity
++		wxFileName exe(wxStandardPaths::Get().GetExecutablePath());
++		wxString cands[2] = { exe.GetPath() + _T("/nebulosity.png"), exe.GetPath() + _T("/../share/nebulosity/nebulosity.png") };
++		for (int ci=0; ci<2; ci++) if (wxFileExists(cands[ci])) { wxIcon ic; ic.LoadFile(cands[ci], wxBITMAP_TYPE_PNG); if (ic.IsOk()) { SetIcon(ic); break; } }
++	}
++#else
+ 	SetIcon(wxIcon(_T("progicon")));
++#endif
+ 
+ 	
+ 	aui_mgr.SetManagedWindow(this);
+@@ -732,7 +744,7 @@ wxFrame(frame, wxID_ANY, title, pos, size,wxDEFAULT_FRAME_STYLE | wxFULL_REPAINT
+ 
+ 	
+ 	// Setup the Canvas area
+-#if defined (__APPLE__)  // need to do this because don't have the scroll bars by default on Mac
++#if (defined (__APPLE__) || defined (__LINUX__))  // need to do this because don't have the scroll bars by default on Mac
+ 	canvas = new MyCanvas(this, wxPoint(0, 0), wxSize(canvas_xsize,canvas_ysize));
+ 	canvas->SetMinSize(wxSize(300,300));
+ #else
+@@ -768,7 +780,7 @@ wxFrame(frame, wxID_ANY, title, pos, size,wxDEFAULT_FRAME_STYLE | wxFULL_REPAINT
+ 	DispBoxSizer4->Add(Disp_WVal,wxSizerFlags(0).Right().Border(wxALL,5));
+ 	DispBoxSizer1->Add(DispBoxSizer4,wxSizerFlags().Center());
+ 	int ismac = 0;
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	ismac = 1;
+ #endif
+ 
+@@ -788,7 +800,7 @@ wxFrame(frame, wxID_ANY, title, pos, size,wxDEFAULT_FRAME_STYLE | wxFULL_REPAINT
+ 		wxSizerFlags(0).Border(wxLEFT,3));
+ 	DispBoxSizer2->Add(Disp_WSlider,wxSizerFlags(1).Expand());
+ 	DispBoxSizer1->Add(DispBoxSizer2,wxSizerFlags().Center());
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	wxPanel* histpanel = new wxPanel(dispbox,wxID_ANY,wxPoint(-1,-1),wxSize(150,55));
+ 	Histogram_Window = new Dialog_Hist_Window(histpanel, wxPoint(1,1),wxSize(140,45), wxBORDER_SUNKEN);
+ 	DispBoxSizer1->Add(histpanel,wxSizerFlags(0).Center().Border(wxLEFT,20));
+@@ -839,7 +851,7 @@ wxFrame(frame, wxID_ANY, title, pos, size,wxDEFAULT_FRAME_STYLE | wxFULL_REPAINT
+ #endif
+     
+ #ifdef INDISUPPORT
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+     this->CameraChoices.Add("INDI");
+ #endif
+ #endif
+@@ -883,7 +895,7 @@ wxFrame(frame, wxID_ANY, title, pos, size,wxDEFAULT_FRAME_STYLE | wxFULL_REPAINT
+ 	this->CameraChoices.Add("SAC7/SC webcam LXUSB"); 
+ 	this->CameraChoices.Add("SAC7/SC webcam Parallel");
+ #endif
+-#if defined (NEB2IL) && defined (__APPLE__)
++#if defined (NEB2IL) && (defined (__APPLE__) || defined (__LINUX__))
+ 	this->CameraChoices.Add("QSI 500/600");
+ #endif
+ 	this->CameraChoices.Add("SBIG");
+@@ -898,11 +910,19 @@ wxFrame(frame, wxID_ANY, title, pos, size,wxDEFAULT_FRAME_STYLE | wxFULL_REPAINT
+ #endif
+     this->CameraChoices.Add("ZWO ASI");
+ 
+-#if defined (NEB2IL) && defined (__APPLE__)
++#if defined (NEB2IL) && (defined (__APPLE__) || defined (__LINUX__))
+ #ifndef N64MAC
+ 	this->CameraChoices.Add("CCD Labs Q8");
+ #endif
+ #endif	
++#if defined (__LINUX__)
++	// Linux build: only list cameras that have a working Linux driver.
++	// (Others are compiled as stand-ins - see linux_camstubs.h.)
++	this->CameraChoices.Clear();
++	this->CameraChoices.Add(_("No camera"));
++	this->CameraChoices.Add(_("Simulator"));
++	this->CameraChoices.Add("ZWO ASI");
++#endif
+ 	Camera_ChoiceBox = new wxChoice(ctrlpanel,CTRL_CAMERACHOICE,wxDefaultPosition,wxDefaultSize, this->CameraChoices );
+ 	Camera_ChoiceBox->SetSelection(0);
+ 	CurrentCamera = &NoneCamera;	
+@@ -1033,7 +1053,7 @@ wxFrame(frame, wxID_ANY, title, pos, size,wxDEFAULT_FRAME_STYLE | wxFULL_REPAINT
+ 	Timer.SetOwner(this);
+ 	Timer.Start(1000);
+ 	
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ //    file_menu->Enable(MENU_SAVE_JPGFILE,false);
+ #endif
+ 	Camera_FineFocusButton->Enable(false);
+@@ -1423,7 +1443,7 @@ void MyFrame::OnClose(wxCloseEvent &event) {
+ 	if (wxFileExists(fname)) wxRemoveFile(fname);
+ 	
+ 	//delete [] Undo;
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 	FreeImage_DeInitialise();
+ #else
+ 	if (CameraServer)
+@@ -1475,7 +1495,7 @@ void MyFrame::OnAbout(wxCommandEvent& WXUNUSED(event)) {
+ void MyFrame::OnLaunchNew(wxCommandEvent& WXUNUSED(evt)) {
+ 	wxStandardPathsBase& StdPaths = wxStandardPaths::Get();
+ 	//wxMessageBox(StdPaths.GetExecutablePath());
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	//wxExecute(_T("open -n ") + StdPaths.GetExecutablePath());
+ 	wxString tmp = StdPaths.GetExecutablePath();
+ 	tmp.Replace(" ","\\ ");
+@@ -1771,7 +1791,7 @@ void MyFrame::OnZoomButton(wxCommandEvent &event) {
+ //	canvas->Scroll(scroll_x, scroll_y);
+ //	canvas->Scroll(scroll_x, scroll_y);
+ 
+-#if defined (__APPLE__) || defined (__WINDOWS__)
++#if (defined (__APPLE__) || defined (__LINUX__)) || defined (__WINDOWS__)
+ 	wxSize bmpsz;
+ //	canvas->GetVirtualSize( &x, &y);
+ //	wxMessageBox(wxString::Format("%d %d",x,y));
+diff --git a/Nebulosity.h b/Nebulosity.h
+index df1e8c6..246d343 100644
+--- a/Nebulosity.h
++++ b/Nebulosity.h
+@@ -34,7 +34,7 @@
+ // The main header file for Craig Stark's "Nebulosity"
+ #define VERSION "1.0.0"
+ 
+-#if defined( __GNUG__) && !defined(__APPLE__)
++#if defined( __GNUG__) && !(defined (__APPLE__) || defined (__LINUX__))
+ #pragma interface
+ #endif
+ 
+@@ -136,7 +136,7 @@ enum {
+ #endif
+ 
+ 
+-#if defined (__APPLE__)
++#if defined (__APPLE__) || defined (__LINUX__)
+ #include "dummy.h"
+ #include "osxfuncs.h"
+ #define PATHSEPCH '/'
+diff --git a/Q8HR.cpp b/Q8HR.cpp
+index 5f94515..ab714df 100644
+--- a/Q8HR.cpp
++++ b/Q8HR.cpp
+@@ -62,7 +62,7 @@ Q8_OPENCAMERA Q8_OpenCamera;
+ #endif // Windows
+ 
+ 
+-#if defined (__APPLE__) && defined (MAC32BIT)
++#if (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ #include "cameras/qhy8.h"
+ #endif
+ 
+@@ -95,7 +95,7 @@ Cam_Q8HRClass::Cam_Q8HRClass() {
+ 	Cap_LowBit = false;
+ 	Cap_ExtraOption = false;
+ 	Cap_FineFocus = true;
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 	//Cap_FineFocus = false;
+ #endif
+ 	Cap_BalanceLines = false;
+@@ -112,7 +112,7 @@ void Cam_Q8HRClass::Disconnect() {
+ #if defined (__WINDOWS__)
+ 	Q8_CloseCamera();
+ 	FreeLibrary(CameraDLL);
+-#elif defined (__APPLE__) && defined (MAC32BIT)
++#elif (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 	Q8_closedevice();
+ #endif
+ 	if (RawData) delete [] RawData;
+@@ -189,7 +189,7 @@ bool Cam_Q8HRClass::Connect() {
+ 		FreeLibrary(CameraDLL);
+ 		return true;
+ 	}
+-#elif defined (__APPLE__) && defined (MAC32BIT)
++#elif (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 	if (!Q8_opendevice()) {
+ 		wxMessageBox("Cannot find Q8");
+ 		return true;
+@@ -249,7 +249,7 @@ int Cam_Q8HRClass::Capture () {
+ 		err = Q8_StartExposure(exp_dur / 10, 28,8, Size[0],Size[1], 1,1, HighSpeed, Exp_Gain, Exp_Offset, 1 - (int) AmpCtrl);
+ #endif
+ 	}
+-#if defined (__APPLE__) && defined (MAC32BIT)
++#if (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 	Q8_setgain (Exp_Gain);
+ 	Q8_setoffset(Exp_Offset);
+ 	Q8_setspeed((int) HighSpeed);
+@@ -267,13 +267,13 @@ int Cam_Q8HRClass::Capture () {
+ #if defined (__WINDOWS__)
+ 	if (exp_dur <= 3000) { // T-gate, short exp mode
+ 		Q8_TransferImage(done, progress);  // Q8_TransferImage  actually starts and ends the exposure
+-#elif defined (__APPLE__) && defined (MAC32BIT)
++#elif (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 	if (exp_dur <= 2000) { // short exp mode
+ 		Q8_exposure(exp_dur);
+ #endif
+ 	}
+ 	else {
+-#if defined (__APPLE__) && defined (NEB2IL)
++#if (defined (__APPLE__) || defined (__LINUX__)) && defined (NEB2IL)
+ 		Q8_StartExposure(exp_dur);
+ #endif
+ 		swatch.Start();
+@@ -294,7 +294,7 @@ int Cam_Q8HRClass::Capture () {
+ 			frame->SetStatusText(_T("CAPTURE ABORTING"));
+ 			Capture_Abort = false;
+ 			rval = 2;
+-#if defined (__APPLE__) && defined (MAC32BIT)
++#if (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 			Q8_cancelexposure();	
+ #endif
+ 		}
+@@ -307,7 +307,7 @@ int Cam_Q8HRClass::Capture () {
+ 		wxTheApp->Yield(true);
+ #if defined (__WINDOWS__)
+ 		Q8_TransferImage(done, progress);
+-#elif defined (__APPLE__) && defined (MAC32BIT)
++#elif (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 		Q8_TransferImage();
+ #endif
+ 	}
+@@ -332,7 +332,7 @@ int Cam_Q8HRClass::Capture () {
+ 	for (i=0; i<CurrImage.Npixels; i++, rawptr++, dataptr++) {
+ 		*dataptr = (float) *rawptr;
+ 	}
+-#elif defined (__APPLE__) && defined (MAC32BIT)
++#elif (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 	unsigned short *imgptr = Q8_getdatabuffer();
+ 	int raw_x = Q8_gethsize();
+ //	unsigned int raw_y = Q8_getvsize();
+@@ -405,7 +405,7 @@ void Cam_Q8HRClass::CaptureFineFocus(int click_x, int click_y) {
+ 	}	
+ 	
+ 	// On the Mac, no ROI mode yet so fake it by doing a high-speed bin and manually cropping that out
+-#if defined (__APPLE__) && defined (MAC32BIT)
++#if (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 	Q8_setgain (Exp_Gain);
+ 	Q8_setoffset(Exp_Offset);
+ 	Q8_setspeed(1);
+@@ -423,7 +423,7 @@ void Cam_Q8HRClass::CaptureFineFocus(int click_x, int click_y) {
+ 		if (exp_dur > 3000) { // T-gate, short exp mode
+ 			wxMilliSleep(exp_dur);
+ 		}
+-#elif defined (__APPLE__) && defined (MAC32BIT)
++#elif (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 		if (exp_dur <= 000) // short exp mode
+ 			err = Q8_exposure(exp_dur);
+ 		else {
+@@ -438,7 +438,7 @@ void Cam_Q8HRClass::CaptureFineFocus(int click_x, int click_y) {
+ 		}
+ #if defined (__WINDOWS__) 
+ 		Q8_TransferImage(done, progress);
+-#elif defined (__APPLE__) && defined (MAC32BIT)
++#elif (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 		Q8_TransferImage();
+ #endif
+ 		SleepEx(100,true);
+@@ -472,7 +472,7 @@ void Cam_Q8HRClass::CaptureFineFocus(int click_x, int click_y) {
+ 				dataptr++;
+ 				rawptr++;
+ 			}
+-#elif defined (__APPLE__) && defined (MAC32BIT)
++#elif (defined (__APPLE__) || defined (__LINUX__)) && defined (MAC32BIT)
+ 			unsigned short *imgptr = Q8_getdatabuffer();
+ 			int raw_x = Q8_gethsize();
+ 			int raw_y = Q8_getvsize();
+diff --git a/SBIG.cpp b/SBIG.cpp
+index 0c94f23..38747bb 100644
+--- a/SBIG.cpp
++++ b/SBIG.cpp
+@@ -44,7 +44,7 @@
+ #include <wx/stopwatch.h>
+ #include "preferences.h"
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ #include <SBIGUDrv/sbigudrv.h>
+ #endif
+ 
+diff --git a/SBIG.h b/SBIG.h
+index e9bbed3..5b396ec 100644
+--- a/SBIG.h
++++ b/SBIG.h
+@@ -41,7 +41,7 @@
+ #ifndef SBIGCLASS
+ #define SBIGCLASS
+ 
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ #include <SBIGUDrv/sbigudrv.h>
+ #else
+ #include "cameras/sbigudrv.h"
+diff --git a/SXV.cpp b/SXV.cpp
+index ed4a40d..8acfcd8 100644
+--- a/SXV.cpp
++++ b/SXV.cpp
+@@ -98,7 +98,7 @@ void Cam_SXVClass::Disconnect() {
+ //	frame->Exp_OffsetCtrl->Enable(true);
+ 	WaitForCamera(2);
+ 	sxReset(hCam);
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 	sx2Close(hCam);
+ #else
+ 	sxClose(hCam);
+@@ -106,7 +106,7 @@ void Cam_SXVClass::Disconnect() {
+ 	hCam = NULL;
+ }
+ 
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 
+ int SXCamAttached (void *cam) {
+ 	// This should return 1 if the cam passed in here is considered opened, 0 otherwise
+@@ -458,7 +458,7 @@ bool Cam_SXVClass::Connect() {
+ 			ReadTime, ScaleConstant,FWVersion)+Name);
+ 	}
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	if (0) { //SubType == 26) {
+ 		wxStopWatch swatch;
+ 		sxClearPixels(hCam,0,0);
+@@ -700,7 +700,7 @@ int Cam_SXVClass::Capture () {
+ 		}
+ 	}
+ */
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	wxTheApp->Yield(); wxMilliSleep(100);  // Def needed on the H18 and possibly on others. -- upped from 100
+ #endif
+ 	
+diff --git a/Starfish.cpp b/Starfish.cpp
+index ce3fa84..eef4676 100644
+--- a/Starfish.cpp
++++ b/Starfish.cpp
+@@ -309,7 +309,7 @@ void Cam_StarfishClass::CaptureFineFocus(int click_x, int click_y) {
+ 	
+ 	// Set camera into ROI mode
+ 	fcUsb_cmd_setRoi(CamNum,(unsigned short) click_x, (unsigned short) click_y, (unsigned short) click_x + 100 - 1, (unsigned short) click_y + 100 - 1);
+-#if defined (__APPLE__)  // Can only do DMA on the Mac
++#if (defined (__APPLE__) || defined (__LINUX__))  // Can only do DMA on the Mac
+ 	fcUsb_cmd_setReadMode(CamNum, fc_DMAwFBDataXfr, fc_16b_data); 
+ #endif
+ 	
+@@ -342,7 +342,7 @@ void Cam_StarfishClass::CaptureFineFocus(int click_x, int click_y) {
+ 		
+ 		if (still_going) { // No abort - put up on screen
+ 			rawptr = RawData;
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 			fcUsb_cmd_readRawFrame(CamNum,100,100,rawptr);
+ #else
+ 			if (exp_dur > 200) {
+@@ -389,7 +389,7 @@ void Cam_StarfishClass::CaptureFineFocus(int click_x, int click_y) {
+ 	
+ 	// Set camera back to full-frame mode
+ 	fcUsb_cmd_setRoi(CamNum,0,0,(unsigned short) (Size[0]-1),(unsigned short) (Size[1]-1));
+-#if defined (__APPLE__)  // always in classic mode on PC
++#if (defined (__APPLE__) || defined (__LINUX__))  // always in classic mode on PC
+ 	fcUsb_cmd_setReadMode(CamNum,  fc_classicDataXfr, fc_16b_data); 
+ #endif	
+ 
+diff --git a/ZWO_ASI.h b/ZWO_ASI.h
+index 17750c7..5c11f59 100644
+--- a/ZWO_ASI.h
++++ b/ZWO_ASI.h
+@@ -35,7 +35,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #ifndef ZWOASICLASS
+ #define ZWOASICLASS
+ 
++#if defined (__LINUX__)
++#include "linux/zwo/ASICamera2.h"  // ZWO Linux SDK 1.19.1, matches linux/zwo/libASICamera2.a
++#else
+ #include "cameras/ASICamera2.h"
++#endif
+ 
+ 
+ class Cam_ZWOASIClass : public CameraType {
+diff --git a/alignment.cpp b/alignment.cpp
+index c1fea19..615709e 100644
+--- a/alignment.cpp
++++ b/alignment.cpp
+@@ -572,7 +572,7 @@ void HandleAlignLClick(wxMouseEvent &mevent, int click_x, int click_y) {
+ 		frame->canvas->targ_y[0] = ROUND(AlignInfo.y1[AlignInfo.current])+0;
+ 		GenericLoadFile (AlignInfo.fname[AlignInfo.current]);
+ 		AlignInfo.last_x = AlignInfo.last_y = 0.0;
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 		frame->SetStatusText(_T("2nd star: Click on the same non-saturated star (Shift-click to skip)"));
+ #else
+ 		frame->SetStatusText(_T("2nd star: Click on the same non-saturated star (Shift-click to skip)"));
+diff --git a/artemis.cpp b/artemis.cpp
+index 36d5400..f93baa2 100644
+--- a/artemis.cpp
++++ b/artemis.cpp
+@@ -94,7 +94,7 @@ bool Cam_ArtemisClass::Connect() {
+ 	}
+ 	bool rval;
+     
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+     //rval = ArtemisLoadDLL((char*) "libArtemisHsc.dylib");
+     rval = true;
+ #else
+diff --git a/atik_OSX.cpp b/atik_OSX.cpp
+index debed43..c198565 100644
+--- a/atik_OSX.cpp
++++ b/atik_OSX.cpp
+@@ -54,7 +54,7 @@ Cam_AtikOSXClass::Cam_AtikOSXClass() {
+ 	LegacyModel = false;
+ 	HasShutter = false;
+     DriverStarted = false;
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+     p_ATIKDriver = NULL;
+     p_ATIKLegacyDriver = NULL;
+     p_ATIKImager = NULL;
+@@ -64,7 +64,7 @@ Cam_AtikOSXClass::Cam_AtikOSXClass() {
+ }
+ 
+ void Cam_AtikOSXClass::StartDriver() {
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ //    Logger::important("Starting the driver");
+     p_ATIKDriver=new ATIKLinuxDrivers();
+     p_ATIKDriver->setSynchronousConnectOnly();
+@@ -82,7 +82,7 @@ void Cam_AtikOSXClass::StartDriver() {
+ }
+ 
+ bool Cam_AtikOSXClass::Connect() {
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+     //wxArrayString usbATIKDevices;
+     
+ //    Logger::globalLogger("ATIKUniversalDrivers");
+diff --git a/atik_OSX.h b/atik_OSX.h
+index a4c19b7..bf63389 100644
+--- a/atik_OSX.h
++++ b/atik_OSX.h
+@@ -9,7 +9,7 @@
+ #ifndef ATIKOSXCLASS
+ #define ATIKOSXCLASS
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ #include "ATIKLinuxDrivers.h"
+ #include "ATIKLinuxLegacyDrivers.h"
+ #include "Imager100.h"
+@@ -44,7 +44,7 @@ private:
+ 	bool HasShutter;
+     bool DriverStarted;
+     unsigned short BusID;
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+     ATIKLinuxDrivers *p_ATIKDriver;
+     ATIKLinuxLegacyDrivers *p_ATIKLegacyDriver;
+     Imager100 *p_ATIKImager;
+diff --git a/autoalign.cpp b/autoalign.cpp
+index 6d70529..e5d334d 100644
+--- a/autoalign.cpp
++++ b/autoalign.cpp
+@@ -45,6 +45,9 @@
+ #include "wx/textfile.h"
+ #include "setup_tools.h"
+ #include "FreeImage.h"
++#ifdef __LINUX__
++#undef _WINDOWS_  // FreeImage.h defines it on Linux, which confuses wx headers
++#endif
+ #include <wx/filedlg.h>
+ #include <wx/dir.h>
+ #include <wx/progdlg.h>
+@@ -54,7 +57,7 @@
+ #ifdef USE_CIMG
+ #define cimg_display 0  // set to 0 for release
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ #define cimg_OS 1
+ #else
+ #define cimg_OS 2
+diff --git a/camels.cpp b/camels.cpp
+index 8be8477..ff776b7 100644
+--- a/camels.cpp
++++ b/camels.cpp
+@@ -353,7 +353,7 @@ void MyFrame::OnCamelImageSave(wxCommandEvent& WXUNUSED(evt)) {
+ 	wxImage tmpimg = DisplayedBitmap->ConvertToImage();
+ 	//int qual = wxGetNumberFromUser(_T("JPEG Quality?"),_T("JPEG Compression Quality"),_T("0-100"),90,0,100);
+ 	int qual = CamelCompression;
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	FIBITMAP *image;
+ 	image = FreeImage_Allocate(CurrImage.Size[0],CurrImage.Size[1],24);
+ 	unsigned char *ImagePtr;
+diff --git a/camera.cpp b/camera.cpp
+index 61b066c..0862a43 100644
+--- a/camera.cpp
++++ b/camera.cpp
+@@ -213,7 +213,7 @@ bool CaptureSeries() {
+ 
+             CaptureThread = NULL;
+             if (Pref.ThreadedCaptures) {
+-    #ifdef __APPLE__
++    #if defined (__APPLE__) || defined (__LINUX__)
+                 if (CurrentCamera->ConnectedModel == CAMERA_CANONDSLR) {
+                     CaptureThread = NULL;
+                     frame->AppendGlobalDebug("  - Manually ensuring no-threaded capture");
+@@ -351,7 +351,7 @@ bool CaptureSeries() {
+ 			}
+             full_fname += extra_suffix + ".fit";
+ 			if ((Pref.CaptureChime == 2) && (i != (Exp_Nexp-1))) {// chime after each
+-#ifdef __APPLE__
++#if defined (__APPLE__)
+ 				system("say Image captured &");
+ #else
+ 				wxBell();
+@@ -444,6 +444,9 @@ Display:
+ //		AlertSoundPlay();
+         frame->AppendGlobalDebug("- Playing Mac sound");
+ 		system("say Series complete &");
++#elif defined (__LINUX__)
++	if (Pref.CaptureChime)
++		wxBell();
+ #endif
+     frame->AppendGlobalDebug("Leaving CaptureSeries");
+ 
+@@ -782,7 +785,7 @@ void MyFrame::OnPreviewButton(wxCommandEvent &evt) {
+ //		retval = CurrentCamera->Capture();
+         
+         CaptureThread = NULL;
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+         if (CurrentCamera->ConnectedModel == CAMERA_CANONDSLR)
+             CaptureThread = NULL;
+         else
+diff --git a/camera.h b/camera.h
+index 292292a..7a837b6 100644
+--- a/camera.h
++++ b/camera.h
+@@ -36,6 +36,13 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include "cameras/SAC10_DLL.h"
+ #include <wx/vidcap/vcapwin.h>
+ #endif
++#if defined (__LINUX__)
++// Linux: only drivers with a Linux SDK are built for real; the rest are
++// stand-ins (see linux_camstubs.h).
++#include "simulator.h"
++#include "ZWO_ASI.h"
++#include "linux_camstubs.h"
++#else
+ #include "SACStarShoot.h"
+ #include "SAC78.h"
+ #include "SAC10.h"
+@@ -76,6 +83,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #endif
+ #include "Apogee.h"
+ #include "FLI.h"
++#endif
+ #include <wx/splitter.h>
+ 
+ //#define INDISUPPORT
+diff --git a/debayer.cpp b/debayer.cpp
+index 9a09da1..d97193a 100644
+--- a/debayer.cpp
++++ b/debayer.cpp
+@@ -812,7 +812,7 @@ bool VNG_Interpolate(int array_type, int xoff, int yoff, int trim) {
+ }
+ 
+ 
+-#if !defined (__APPLE__)
++#if !(defined (__APPLE__) || defined (__LINUX__))
+ bool TomSAC10DeBayer() {
+ 	float *ptr1, *ptr2, *ptr3;
+ 	unsigned int i;
+diff --git a/drizzle.cpp b/drizzle.cpp
+index ffc09b3..f51ebb4 100644
+--- a/drizzle.cpp
++++ b/drizzle.cpp
+@@ -63,7 +63,7 @@ public:
+ // ----------------------------  Drizzle stuff ---------------------------
+ // Define a constructor 
+ DrizzleDialog::DrizzleDialog(wxWindow *parent):
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+  wxDialog(parent, wxID_ANY, _("Drizzle Parameters"), wxPoint(-1,-1), wxSize(350,170), wxCAPTION)
+ #else
+  wxDialog(parent, wxID_ANY, _("Drizzle Parameters"), wxPoint(-1,-1), wxSize(330,170), wxCAPTION)
+diff --git a/dummy.cpp b/dummy.cpp
+index 379cccd..4771278 100644
+--- a/dummy.cpp
++++ b/dummy.cpp
+@@ -30,6 +30,7 @@ CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
++#include "precomp.h"
+ #include "nebulosity.h"
+ 
+ void DisconnectOCP() { ; }
+diff --git a/ext_filterwheel.cpp b/ext_filterwheel.cpp
+index 1989154..d3104c8 100644
+--- a/ext_filterwheel.cpp
++++ b/ext_filterwheel.cpp
+@@ -289,7 +289,7 @@ void ExtFWDialog::OnConnect(wxCommandEvent& WXUNUSED(evt)) {
+ }
+ 
+ 
+-#if defined (__APPLE__) && defined (EFW_SX)
++#if (defined (__APPLE__) || defined (__LINUX__)) && defined (EFW_SX)
+ //#include "HID_Utilities_External.h"
+ #include <unistd.h>
+ void ExtFW_SXClass::ReadStatus (pRecDevice pCurrentHIDDevice, int *pos, int *nfilts) {
+@@ -384,7 +384,7 @@ void ExtFW_SXClass::SetFilter(int position) {
+ 
+ #endif  // Mac SX Filter wheel
+ 
+-#if defined (__APPLE__) && defined (EFW_ZWO)
++#if (defined (__APPLE__) || defined (__LINUX__)) && defined (EFW_ZWO)
+ bool ExtFW_ZWOClass::Connect() {
+     int ndevices;
+     EFW_INFO info;
+diff --git a/ext_filterwheel.h b/ext_filterwheel.h
+index 38e9ae2..08dfb10 100644
+--- a/ext_filterwheel.h
++++ b/ext_filterwheel.h
+@@ -68,6 +68,8 @@ public:
+ #ifdef __WINDOWS__
+  #define EFW_ASCOM
+  #define EFW_FLI
++#elif defined (__LINUX__)
++ // Linux: external filter wheels not wired up yet (ZWO EFW is the first candidate)
+ #else
+  #define EFW_SX
+  #define EFW_ZWO
+diff --git a/file_tools.cpp b/file_tools.cpp
+index bf57f34..4c54bbf 100644
+--- a/file_tools.cpp
++++ b/file_tools.cpp
+@@ -646,7 +646,7 @@ void MyFrame::OnSaveColorComponents(wxCommandEvent& evt) {
+ 	}
+ 	if (fname.IsEmpty()) return;  // Check for canceled dialog
+ 								  // On Mac, wildcard not added
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 	if (!fname.EndsWith(_T(".fit")))
+ 		fname.Append(_T(".fit"));
+ #endif
+diff --git a/focuser.h b/focuser.h
+index 9f84e0a..22c1253 100644
+--- a/focuser.h
++++ b/focuser.h
+@@ -166,7 +166,7 @@ protected:
+ 
+ 
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__)  // macOS: IOKit serial (MicroTouch)
+ #define FOC_MICROTOUCH
+ //#define FOC_USBNSTEP
+ 
+diff --git a/image_io.cpp b/image_io.cpp
+index 6789715..7eaafe3 100644
+--- a/image_io.cpp
++++ b/image_io.cpp
+@@ -35,6 +35,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include "image_math.h"
+ #include "file_tools.h"
+ #include "FreeImage.h"
++#ifdef __LINUX__
++#undef _WINDOWS_  // FreeImage.h defines it on Linux, which confuses wx headers
++#endif
+ #include "wx/image.h"
+ #include <wx/numdlg.h>
+ #include <wx/filedlg.h>
+@@ -210,7 +213,7 @@ void MyFrame::OnSaveBMPFile(wxCommandEvent &event) {
+ 			qual = wxGetNumberFromUser(_("JPEG Quality?"),_("JPEG Compression Quality"),_T("0-100"),90,0,100);
+ 	//	wxMessageBox(fname + wxString::Format(" %d %d",tmpimg.GetHeight(),tmpimg.GetWidth()),_T("arg"));
+ 		wxBeginBusyCursor();
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 		FIBITMAP *image;
+ 		image = FreeImage_Allocate(CurrImage.Size[0],CurrImage.Size[1],24);
+ 		unsigned char *ImagePtr;
+diff --git a/image_manip.cpp b/image_manip.cpp
+index 3b3bbdb..ed5c0b8 100644
+--- a/image_manip.cpp
++++ b/image_manip.cpp
+@@ -2721,7 +2721,7 @@ wxDialog(parent, wxID_ANY, _("Bezier Curves"), Pref.DialogPosition, wxSize(620,6
+ 	wxBoxSizer *TopSizer = new wxBoxSizer(wxHORIZONTAL);
+ 	wxGridSizer *BSizer = new wxGridSizer(2,2,0); //wxBoxSizer(wxVERTICAL);
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	wxPanel* curvepanel = new wxPanel((wxWindow *) this, wxID_ANY, wxPoint(-1,-1),wxSize(300 * DPIScalingFactor,300 * DPIScalingFactor), wxSIMPLE_BORDER);
+ 	curvewin = new DialogCurveWindow(curvepanel, wxPoint(-1,-1),wxSize(300 * DPIScalingFactor,300 * DPIScalingFactor), wxSIMPLE_BORDER);
+ 	TopSizer->Add(curvepanel,wxSizerFlags(1).Expand().Border(wxALL, 5));
+diff --git a/image_manip_grr.cpp b/image_manip_grr.cpp
+index 6e4a652..8e19e42 100644
+--- a/image_manip_grr.cpp
++++ b/image_manip_grr.cpp
+@@ -2465,7 +2465,7 @@ wxDialog(parent, wxID_ANY, _("Bezier Curves"), Pref_DialogPosition, wxSize(600,6
+ 	wxBoxSizer *TopSizer = new wxBoxSizer(wxHORIZONTAL);
+ 	wxGridSizer *BSizer = new wxGridSizer(2,2,0); //wxBoxSizer(wxVERTICAL);
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	wxPanel* curvepanel = new wxPanel((wxWindow *) this, wxID_ANY, wxPoint(-1,-1),wxSize(300,300), wxBORDER_NONE);
+ 	curvewin = new DialogCurveWindow(curvepanel, wxPoint(3,3),wxSize(300,300), wxSIMPLE_BORDER);
+ 	TopSizer->Add(curvepanel,wxSizerFlags(1).Expand());
+diff --git a/image_math.cpp b/image_math.cpp
+index c3e570b..5cde36b 100644
+--- a/image_math.cpp
++++ b/image_math.cpp
+@@ -41,6 +41,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ #include <wx/numdlg.h>
+ #include <wx/stdpaths.h>
+ #include "FreeImage.h"
++#ifdef __LINUX__
++#undef _WINDOWS_  // FreeImage.h defines it on Linux, which confuses wx headers
++#endif
+ #include "setup_tools.h"
+ 
+ //#define ROUND(x) (int) floor(x + 0.5)
+diff --git a/macro.cpp b/macro.cpp
+index 57a61a3..d7cde2a 100644
+--- a/macro.cpp
++++ b/macro.cpp
+@@ -74,7 +74,7 @@ void MacroDialog::OnLoad(wxCommandEvent& WXUNUSED(evt)) {
+ 									wxT("txt"), wxT("Text files (*.txt)|*.txt"),wxFD_OPEN | wxFD_CHANGE_DIR);
+ 	if (fname.IsEmpty()) return;  // Check for canceled dialog
+ 	// On Mac, wildcard not added
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ 	//	fname.Append(_T(".txt"));
+ #endif
+ 	
+diff --git a/precomp.h b/precomp.h
+index 62ab7e0..1583c07 100644
+--- a/precomp.h
++++ b/precomp.h
+@@ -43,7 +43,7 @@
+  #import "progid:QSICamera.CCDCamera"
+ #endif
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__)  // macOS only (Carbon)
+  #ifdef OSX_10_7_BUILD
+   #include </Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.7.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Headers/Carbon.h>
+  #else
+diff --git a/preferences.cpp b/preferences.cpp
+index 3c1dbca..97e9e06 100644
+--- a/preferences.cpp
++++ b/preferences.cpp
+@@ -170,7 +170,7 @@ wxDialog(parent, wxID_ANY, _("Preferences"), wxPoint(-1,-1), wxSize(-1,-1), wxCA
+ 	pg->SetPropertyValue(wxT("QHY Driver"),QHY9Camera.Driver); // convert to 0-index
+ #endif // Windows
+     
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+     pg->Append(new wxIntProperty(wxT("Atik 16IC ChipID"), wxPG_LABEL, Pref.AOSX_16IC_SN) );
+ #endif
+     pg->Append(new wxIntProperty(_("ZWO USB Speed"), wxPG_LABEL, Pref.ZWO_Speed));
+@@ -936,7 +936,7 @@ void ReadPreferences() {
+ 	config->Read("YDialog",&lval2);
+ 	if (lval < 0) lval = 0;
+ 	if (lval2 < 0) lval2 = 0;
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	if (lval2 < 20) lval2 = 20;
+ #endif
+ 	Pref.DialogPosition=wxPoint(lval,lval2);
+diff --git a/setup_tools.cpp b/setup_tools.cpp
+index 94fdb0d..f7d51ce 100644
+--- a/setup_tools.cpp
++++ b/setup_tools.cpp
+@@ -124,7 +124,7 @@ void TextDialog::LoadText(wxCommandEvent& WXUNUSED(evt)) {
+ 									 wxT("txt"), wxT("Text files (*.txt)|*.txt"),wxFD_OPEN | wxFD_CHANGE_DIR);
+ 	if (fname.IsEmpty()) return;  // Check for canceled dialog
+ 								  // On Mac, wildcard not added
+-#if defined (__APPLE__)
++#if (defined (__APPLE__) || defined (__LINUX__))
+ //	fname.Append(_T(".txt"));
+ #endif
+ 	
+@@ -710,7 +710,7 @@ PixStatsDialog::PixStatsDialog(wxWindow *parent):
+ wxPanel(parent,wxID_ANY,wxPoint(-1,-1),wxSize(-1,-1)) {
+ 	wxBoxSizer *TopSizer = new wxBoxSizer(wxHORIZONTAL);
+ 
+-#ifdef __APPLE__
++#if defined (__APPLE__) || defined (__LINUX__)
+ 	info1 = new wxStaticText(this,wxID_ANY,_("Image info:") + "          \n\n\n\n\n\n\n\n\n\n",wxDefaultPosition,wxSize(80,-1));
+ 	info2 = new wxStaticText(this,wxID_ANY,_("  -Not available-") + "       \n\n\n\n\n\n\n\n\n\n",wxDefaultPosition,wxSize(100,-1),wxST_NO_AUTORESIZE);
+ 	info1->SetFont(wxFont(10,wxFONTFAMILY_DEFAULT,wxFONTSTYLE_NORMAL,wxFONTWEIGHT_NORMAL));

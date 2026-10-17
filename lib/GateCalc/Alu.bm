@@ -1,0 +1,165 @@
+' ============================================================
+' Alu.bm - 16-bit signed arithmetic built only from gates
+' (implementation). Needs Gate.bm and Adder.bm.
+' ============================================================
+
+Function AluIsZero% (v As Long, nBits As Integer)
+    Dim i As Integer, anyBit As Integer, r As Integer
+    anyBit = 0
+    For i = 0 To nBits - 1
+        anyBit = GateEval%(GATE_OR, anyBit, AddBit%(v, i))
+    Next
+    r = GateEval%(GATE_NOT, anyBit, 0)
+    AluIsZero% = r
+End Function
+
+Function AluMag& (v As Long)
+    Dim r As Long
+    If AddBit%(v, 15) Then
+        r = AddNegate&(v, 16)
+    Else
+        r = v And 65535
+    End If
+    AluMag& = r
+End Function
+
+' Shift-and-add: for each set bit i of b, add (a shifted left i).
+Function AluMulU& (a As Long, b As Long)
+    Dim acc As Long, sh As Long, tmp As Long
+    Dim i As Integer, cy As Integer, ov As Integer
+    acc = 0
+    For i = 0 To 15
+        If AddBit%(b, i) Then
+            sh = _ShL(a, i)
+            AddRipple acc, sh, 0, 32, tmp, cy, ov
+            acc = tmp
+        End If
+    Next
+    AluMulU& = acc
+End Function
+
+' Restoring division, one quotient bit per step: shift the next
+' dividend bit into the partial remainder, trial-subtract d, keep
+' the result if there was no borrow. 17 bits hold the partial
+' remainder (it can reach 2*d - 1).
+Sub AluDivU (n As Long, d As Long, qOut As Long, rOut As Long)
+    Dim i As Integer, bo As Integer, ov As Integer
+    Dim rmd As Long, t As Long, q As Long
+    rmd = 0
+    q = 0
+    For i = 15 To 0 Step -1
+        rmd = _ShL(rmd, 1)
+        If AddBit%(n, i) Then rmd = rmd Or 1
+        AddSubtract rmd, d, 17, t, bo, ov
+        If bo = 0 Then
+            rmd = t
+            q = q Or _ShL(1&, i)
+        End If
+    Next
+    qOut = q
+    rOut = rmd
+End Sub
+
+Sub AluMulS (a As Long, b As Long, resOut As Long, ovfOut As Integer)
+    Dim sa As Integer, sb As Integer, ng As Integer
+    Dim hiNz As Integer, nz As Integer, sgnBad As Integer
+    Dim ma As Long, mb As Long, mag As Long, hi As Long, lo As Long, r As Long
+    sa = AddBit%(a, 15)
+    sb = AddBit%(b, 15)
+    ma = AluMag&(a)
+    mb = AluMag&(b)
+    mag = AluMulU&(ma, mb)
+    ng = GateEval%(GATE_XOR, sa, sb)
+    hi = _ShR(mag, 16)
+    hiNz = GateEval%(GATE_NOT, AluIsZero%(hi, 16), 0)
+    lo = mag And 65535
+    If ng Then
+        r = AddNegate&(lo, 16)
+    Else
+        r = lo
+    End If
+    nz = GateEval%(GATE_NOT, AluIsZero%(r, 16), 0)
+    sgnBad = GateEval%(GATE_AND, nz, GateEval%(GATE_XOR, AddBit%(r, 15), ng))
+    resOut = r
+    ovfOut = GateEval%(GATE_OR, hiNz, sgnBad)
+End Sub
+
+Sub AluDivS (a As Long, b As Long, qOut As Long, rOut As Long, divZero As Integer, ovfOut As Integer)
+    Dim sa As Integer, sb As Integer, qs As Integer, nz As Integer
+    Dim ma As Long, mb As Long, q As Long, rr As Long
+    divZero = AluIsZero%(b, 16)
+    qOut = 0
+    rOut = 0
+    ovfOut = 0
+    If divZero Then Exit Sub
+    sa = AddBit%(a, 15)
+    sb = AddBit%(b, 15)
+    ma = AluMag&(a)
+    mb = AluMag&(b)
+    AluDivU ma, mb, q, rr
+    qs = GateEval%(GATE_XOR, sa, sb)
+    If qs Then q = AddNegate&(q, 16)
+    If sa Then rr = AddNegate&(rr, 16)
+    nz = GateEval%(GATE_NOT, AluIsZero%(q, 16), 0)
+    ovfOut = GateEval%(GATE_AND, nz, GateEval%(GATE_XOR, AddBit%(q, 15), qs))
+    qOut = q
+    rOut = rr
+End Sub
+
+' Double dabble: for each input bit from the top, add 3 to any BCD
+' nibble that is 5 or more, then shift everything left one place
+' and bring the input bit in at the bottom.
+Function AluToBcd& (mag As Long)
+    Dim bcd As Long, nib As Long, tmp As Long, three As Long
+    Dim i As Integer, k As Integer, cy As Integer, ov As Integer, ge5 As Integer
+    Dim b3 As Integer, b2 As Integer, b1 As Integer, b0 As Integer
+    three = 3
+    bcd = 0
+    For i = 15 To 0 Step -1
+        For k = 0 To 4
+            nib = _ShR(bcd, k * 4) And 15
+            b3 = AddBit%(nib, 3)
+            b2 = AddBit%(nib, 2)
+            b1 = AddBit%(nib, 1)
+            b0 = AddBit%(nib, 0)
+            ge5 = GateEval%(GATE_OR, b3, GateEval%(GATE_AND, b2, GateEval%(GATE_OR, b1, b0)))
+            If ge5 Then
+                AddRipple nib, three, 0, 4, tmp, cy, ov
+                bcd = (bcd And (Not _ShL(15&, k * 4))) Or _ShL(tmp, k * 4)
+            End If
+        Next
+        bcd = _ShL(bcd, 1)
+        If AddBit%(mag, i) Then bcd = bcd Or 1
+    Next
+    AluToBcd& = bcd
+End Function
+
+Function AluFmt$ (v As Long)
+    Dim bcd As Long, nib As Long
+    Dim s As String
+    Dim k As Integer, started As Integer
+    bcd = AluToBcd&(AluMag&(v))
+    s = ""
+    started = 0
+    For k = 4 To 0 Step -1
+        nib = _ShR(bcd, k * 4) And 15
+        If nib <> 0 Or started <> 0 Or k = 0 Then
+            s = s + Mid$("0123456789", nib + 1, 1)
+            started = -1
+        End If
+    Next
+    If AddBit%(v, 15) Then s = "-" + s
+    AluFmt$ = s
+End Function
+
+' v * 10 + digit = (v << 3) + (v << 1) + digit, two ripple adds.
+Function AluDigitAppend& (v As Long, digit As Integer)
+    Dim t8 As Long, t2 As Long, s1 As Long, s2 As Long, dg As Long
+    Dim cy As Integer, ov As Integer
+    t8 = _ShL(v, 3)
+    t2 = _ShL(v, 1)
+    AddRipple t8, t2, 0, 32, s1, cy, ov
+    dg = digit
+    AddRipple s1, dg, 0, 32, s2, cy, ov
+    AluDigitAppend& = s2
+End Function

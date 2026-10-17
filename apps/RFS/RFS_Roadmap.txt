@@ -1,0 +1,94 @@
+RFS (Russell File System) - Roadmap
+===================================
+Written 2026-09-30. None of these change the on-disk format, so
+existing .rfs volumes keep working.
+
+
+DONE SO FAR
+-----------
+V1.1  GUI with blinking red "working" dot during sync
+V1.2  New Volume: ALL = use all free space (FAT32 held under 4 GB)
+V1.3  Add Folder (button, F6, drop a folder) - one commit per folder
+      Library: rfsDeferCommit flag, RFSCatalogBytes&&
+V1.4  Get Folder (button, F7) - folder picker, extracts whole tree
+V1.5  Backup (button, F8) - copies the volume to a backup .rfs,
+      first run full, later runs only new/changed files; CRC-checked,
+      damaged files skipped; optional mirror of deletions; warns if
+      the backup is on the same drive. Window widened to 1010.
+      Library: RFSBackupPlan% / RFSBackupRun% / RFSBackupCancel
+
+
+PART 1 - SPEED FOR BIG FILE COUNTS  (planned as V1.6)
+----------------------------------
+[ ] 1. Merge sort for the file list
+       Where:  GUI, RebuildView
+       What:   replace insertion sort; build sort keys once
+               (uppercase name, yyyymmdd date) not per compare
+       Why:    20,000 files goes from tens of seconds to instant
+       Size:   small
+
+[ ] 2. Build catalog in one buffer
+       Where:  RFS.bm, RFSCatalogBlob$
+       What:   Space$(RFSCatalogBytes&&) then Mid$ each entry in,
+               instead of b = b + ... string appends
+       Size:   small
+
+[ ] 3. Hash table for name lookups
+       Where:  RFS.bm, RFSFind&
+       What:   name hash -> catalog index; rebuild on mount, keep
+               current in RFSPutFile / RFSDropEntry / RFSParseCatalog
+       Why:    lookups stay instant no matter how many files
+       Size:   medium
+
+[ ] 4. One commit for multi-select Add Files
+       Where:  GUI, ActAdd
+       What:   same rfsDeferCommit trick Add Folder uses
+       Size:   small
+
+
+PART 2 - FOLDER FEATURES  (GUI only)
+------------------------
+[ ] 5. Delete Folder
+       Reuse the Get Folder picker, drop every file under that
+       path, one commit.
+       Size:   small
+
+[ ] 6. Folder browser (optional)
+       Double-click into folders, ".." row to go up, path bar.
+       Extract / Delete / Verify act on the folder you're in.
+       Size:   medium
+
+
+PART 3 - BIG DRIVES  (3 TB, 8 TB)
+-------------------
+[ ] 7. Multi-core compression
+       C helper with pthreads (like Linabench / CPULoad) to
+       deflate several 1 MB chunks at once on the i7-5960X.
+       Roughly 4-8x faster adds at level 6.
+       Size:   biggest job on the list
+
+[ ] 8. Recent volumes menu
+       Quick switching between several .rfs files on one drive.
+       Size:   small
+
+
+NOTES FOR BIG DRIVES
+--------------------
+- Use ext4, exFAT or NTFS (not FAT32 - 4 GB file limit).
+- Deflate is the bottleneck, not the disk: level 6 on one core is
+  about 30-80 MB/s. Levels 1-3 are much faster. Already-compressed
+  files (JPG, MP4, ZIP) skip deflate and go at disk speed.
+- Compact needs room for a full second copy of the volume.
+- On an 8 TB drive, use several smaller volumes (e.g. 4 x 2 TB)
+  grouped by topic: each can be compacted on its own, and one
+  damaged file on the drive doesn't take everything with it.
+- RFS saves space; it is not a backup of itself. Use Backup (F8)
+  to keep a second copy on another drive, and run Check now and then.
+
+
+FORMAT LIMITS (for reference)
+-----------------------------
+Files per volume   ~20 million (catalog record must stay < 2 GB)
+Size of one file   ~2 PB (1 MB chunks, LONG chunk count)
+Volume size        64-bit offsets - disk runs out first
+Name length        1024 characters including folder path

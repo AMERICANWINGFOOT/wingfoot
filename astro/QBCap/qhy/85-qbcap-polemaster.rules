@@ -1,0 +1,6 @@
+# QHY PoleMaster for QBCap
+# The PoleMaster arrives as 1618:0940 and needs its firmware loaded each time it
+# is plugged in (fxload); it then comes back as a working camera.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1618", ATTRS{idProduct}=="0940", RUN+="/sbin/fxload -t fx2lp -I /lib/firmware/qhy/POLEMASTER.HEX -D $env{DEVNAME}"
+# normal-user access to QHY cameras
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1618", MODE="0666"

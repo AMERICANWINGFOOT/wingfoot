@@ -1,0 +1,991 @@
+'==================================================================
+'  QBCapRemote.bm  -  remote interface (file bridge)
+'
+'  QBCap_cmd.txt   in : commands, one per line. QBCap waits until the file
+'                       stops growing, reads it, deletes it and queues the lines.
+'  QBCap_reply.txt out: one line per command:  time  command  ->  OK / ERR / WAIT ...
+'                       (new file each session; also copied into QBCap.log)
+'  QBCap_status.txt out: key = value lines, rewritten every 2 seconds
+'
+'  Rules
+'   - Commands run in order. WAIT holds the queue until something is done.
+'   - A command that fails (ERR) clears the rest of the queue, so a batch
+'     never carries on after a failed step (e.g. no CAPTURE after a failed FILTER).
+'   - CLEAR, ABORT, MSTOP, STATUS, SCREENSHOT, PING and HELP run at once,
+'     even while a WAIT is holding the queue.
+'   - The mount only moves (GOTO, TRACK ON) when "Allow remote mount moves"
+'     is ticked by hand in the Remote panel. It is off at every start.
+'   - The mouse always works; the Remote panel can pause or clear the queue.
+'  The same command code is meant to run the sequencer later (RUN file.txt
+'  already runs a list of commands from a text file).
+'==================================================================
+
+Sub RemoteInit
+    Dim f$, ff As Long, l$, k As Long
+    rmOn = -1: rmMount = 0: rmSize = -1
+    ' remote on/off is remembered in QBCap_remote.txt (mount permission never is)
+    f$ = exeDir$ + "QBCap_remote.txt"
+    If _FileExists(f$) Then
+        ff = FreeFile
+        Open f$ For Input As #ff
+        Do While Not EOF(ff)
+            Line Input #ff, l$
+            l$ = LCase$(_Trim$(l$))
+            k = InStr(l$, "=")
+            If k > 0 And Left$(l$, 1) <> "#" Then
+                If _Trim$(Left$(l$, k - 1)) = "remote" Then rmOn = (Left$(_Trim$(Mid$(l$, k + 1)), 2) = "on")
+            End If
+        Loop
+        Close #ff
+    Else
+        RemoteSaveSetting
+    End If
+    ' a command file left over from an earlier session is NOT run
+    f$ = exeDir$ + "QBCap_cmd.txt"
+    If _FileExists(f$) Then
+        If _FileExists(exeDir$ + "QBCap_cmd.old") Then Kill exeDir$ + "QBCap_cmd.old"
+        Name f$ As exeDir$ + "QBCap_cmd.old"
+        LogLine "  remote: old QBCap_cmd.txt found at start - not run, renamed QBCap_cmd.old"
+    End If
+    ff = FreeFile
+    Open exeDir$ + "QBCap_reply.txt" For Output As #ff
+    Print #ff, "# QBCap remote replies - session " + Date$ + " " + Time$
+    Close #ff
+    If rmOn Then LogLine "  remote control on (QBCap_cmd.txt / QBCap_status.txt)"
+    RemoteWriteStatus
+End Sub
+
+Sub RemoteSaveSetting
+    Dim ff As Long
+    ff = FreeFile
+    Open exeDir$ + "QBCap_remote.txt" For Output As #ff
+    Print #ff, "# QBCap remote control: on = read QBCap_cmd.txt, off = ignore it"
+    Print #ff, "# (remote mount moves are never saved - tick them in the Remote panel each night)"
+    If rmOn Then Print #ff, "remote = on" Else Print #ff, "remote = off"
+    Close #ff
+End Sub
+
+' seconds that keep counting past midnight (Timer starts again at 0)
+Function RmClock#
+    Dim t As Double
+    t = Timer(.001)
+    If t < rmLastTimer - 1 Then rmDayOff = rmDayOff + 86400#
+    rmLastTimer = t
+    RmClock# = t + rmDayOff
+End Function
+
+' every frame, from the main loop
+Sub RemotePoll
+    Dim t As Double
+    If guideMode Then Exit Sub
+    t = RmClock#
+    If rmOn Then
+        If t - rmPollT >= 0.5 Or t < rmPollT Then rmPollT = t: RemoteReadFile
+    End If
+    If t - rmStatT >= 2 Or t < rmStatT Then rmStatT = t: RemoteWriteStatus
+    RemoteRun
+End Sub
+
+' after _Display: the screenshot shows exactly what is on screen
+Sub RemoteAfterDisplay
+    Dim f$
+    Static waitFrame As Long
+    If rmShot$ = "" Then Exit Sub
+    ' one frame later, so a SHOW in the same batch has settled (panel scroll)
+    If waitFrame = 0 Then waitFrame = -1: Exit Sub
+    waitFrame = 0
+    f$ = rmShot$: rmShot$ = ""
+    If _FileExists(f$) Then Kill f$
+    _SaveImage f$, _Display
+    If _FileExists(f$) Then
+        RemoteReply rmShotCmd$, "OK saved " + ShortMasterName$(f$)
+    Else
+        RemoteReply rmShotCmd$, "ERR could not write " + f$
+    End If
+End Sub
+
+Sub RemoteReadFile
+    Dim f$, ff As Long, sz As Long, l$, w$, n As Long
+    f$ = exeDir$ + "QBCap_cmd.txt"
+    If _FileExists(f$) = 0 Then rmSize = -1: Exit Sub
+    ff = FreeFile
+    Open f$ For Binary As #ff
+    sz = LOF(ff)
+    Close #ff
+    ' still being written? wait until the size holds for one check (0.5 s)
+    If sz <> rmSize Then rmSize = sz: Exit Sub
+    rmSize = -1
+    If sz = 0 Then Kill f$: Exit Sub
+    ReDim lines$(0)
+    ff = FreeFile
+    Open f$ For Input As #ff
+    Do While Not EOF(ff)
+        Line Input #ff, l$
+        n = n + 1
+        ReDim _Preserve lines$(n)
+        lines$(n) = l$
+    Loop
+    Close #ff
+    Kill f$
+    RemoteAddLines lines$(), n, 0
+End Sub
+
+' put lines in the queue (atFront: a RUN script goes before what is waiting)
+' From QBCap_cmd.txt: CLEAR, ABORT and MSTOP always run at once (safety).
+' A file holding only quick lines (STATUS, SCREENSHOT, PING, HELP, SHOW) also
+' runs at once, even during a WAIT; mixed with other commands they keep their
+' place in the order. A RUN script is always run strictly in order.
+Sub RemoteAddLines (lines$(), n As Long, atFront As Long)
+    Dim i As Long, l$, w$, m As Long, k As Long, allQuick As Long
+    ReDim keep$(n)
+    m = 0
+    allQuick = -1
+    For i = 1 To n
+        k = InStr(lines$(i), Chr$(13)): If k Then lines$(i) = Left$(lines$(i), k - 1)
+        lines$(i) = _Trim$(lines$(i))
+        l$ = lines$(i)
+        If Len(l$) > 0 And Left$(l$, 1) <> "#" And Left$(l$, 1) <> "'" Then
+            Select Case UCase$(RmWord$(l$, 1))
+                Case "CLEAR", "ABORT", "MSTOP", "STATUS", "SCREENSHOT", "PING", "HELP", "SHOW"
+                Case Else: allQuick = 0
+            End Select
+        End If
+    Next
+    For i = 1 To n
+        l$ = lines$(i)
+        If Len(l$) > 0 And Left$(l$, 1) <> "#" And Left$(l$, 1) <> "'" Then
+            w$ = UCase$(RmWord$(l$, 1))
+            If atFront = 0 And (allQuick Or w$ = "CLEAR" Or w$ = "ABORT" Or w$ = "MSTOP") Then
+                RemoteExec l$ ' run now, even during a WAIT
+            Else
+                m = m + 1: keep$(m) = l$
+            End If
+        End If
+    Next
+    If m = 0 Then Exit Sub
+    If rmQN + m > RM_QMAX Then
+        RemoteReply "(" + I2S$(m) + " lines)", "ERR queue full (" + I2S$(RM_QMAX) + ") - nothing added"
+        Exit Sub
+    End If
+    If atFront Then
+        For i = rmQN To 1 Step -1: rmQ$(i + m) = rmQ$(i): Next
+        For i = 1 To m: rmQ$(i) = keep$(i): Next
+    Else
+        For i = 1 To m: rmQ$(rmQN + i) = keep$(i): Next
+    End If
+    rmQN = rmQN + m
+End Sub
+
+' run queued commands until the queue is empty or a WAIT holds it
+Sub RemoteRun
+    Dim n As Long, c$, i As Long
+    If rmPaused Then Exit Sub
+    Do
+        If rmShot$ <> "" Then Exit Sub ' a SCREENSHOT is taken after this frame - keep the order
+        If rmWait$ <> "" Then
+            If RemoteWaitDone% = 0 Then Exit Sub
+        End If
+        If rmQN = 0 Then Exit Sub
+        c$ = rmQ$(1)
+        For i = 1 To rmQN - 1: rmQ$(i) = rmQ$(i + 1): Next
+        rmQN = rmQN - 1
+        RemoteExec c$
+        n = n + 1
+    Loop While n < 20 ' the rest next frame, so the screen keeps updating
+End Sub
+
+Sub RemoteExec (c$)
+    Dim r$
+    rmCount = rmCount + 1
+    r$ = RemoteDo$(c$)
+    If r$ <> "" Then RemoteReply c$, r$
+End Sub
+
+Sub RemoteReply (c$, r$)
+    Dim ff As Long
+    ff = FreeFile
+    Open exeDir$ + "QBCap_reply.txt" For Append As #ff
+    Print #ff, Time$ + "  " + c$ + "  ->  " + RmText$(r$)
+    Close #ff
+    LogLine "  REMOTE " + c$ + "  ->  " + r$
+    rmLast$ = c$: rmLastRes$ = r$
+    If Left$(r$, 3) = "ERR" Then
+        rmLastErr$ = Time$ + " " + c$ + " -> " + r$
+        SeqStopped c$ + " -> " + r$
+        If rmQN > 0 Or rmWait$ <> "" Then
+            rmQN = 0: rmWait$ = ""
+            ff = FreeFile
+            Open exeDir$ + "QBCap_reply.txt" For Append As #ff
+            Print #ff, Time$ + "  (queue cleared after the error)"
+            Close #ff
+        End If
+    End If
+End Sub
+
+' degree sign of the screen font -> plain text for the files
+Function RmText$ (s$)
+    Dim t$, k As Long
+    t$ = s$
+    k = InStr(t$, Chr$(248))
+    Do While k > 0
+        t$ = Left$(t$, k - 1) + "d" + Mid$(t$, k + 1)
+        k = InStr(t$, Chr$(248))
+    Loop
+    RmText$ = t$
+End Function
+
+' word n of a line (1 = the command)
+Function RmWord$ (l$, n As Long)
+    Dim t$, i As Long, k As Long
+    t$ = _Trim$(l$)
+    For i = 1 To n - 1
+        k = InStr(t$, " ")
+        If k = 0 Then RmWord$ = "": Exit Function
+        t$ = LTrim$(Mid$(t$, k + 1))
+    Next
+    k = InStr(t$, " ")
+    If k Then RmWord$ = Left$(t$, k - 1) Else RmWord$ = t$
+End Function
+
+' everything after the command word
+Function RmRest$ (l$)
+    Dim t$, k As Long
+    t$ = _Trim$(l$)
+    k = InStr(t$, " ")
+    If k Then RmRest$ = _Trim$(Mid$(t$, k + 1)) Else RmRest$ = ""
+End Function
+
+Function RmIsNum% (s$)
+    Dim c$
+    c$ = Left$(s$, 1)
+    RmIsNum% = (c$ >= "0" And c$ <= "9") Or ((c$ = "-" Or c$ = "+" Or c$ = ".") And Len(s$) > 1)
+End Function
+
+' "500ms", "2s", "1.5s", "2min", "90" (bare number = defUnit ms per unit)
+Function RmMs& (s$, defUnit As Long)
+    Dim t$, v As Double, u$
+    t$ = LCase$(_Trim$(s$))
+    If RmIsNum%(t$) = 0 Then RmMs& = -1: Exit Function
+    v = Val(t$)
+    u$ = t$
+    Do While Len(u$) > 0 And InStr("0123456789.+-", Left$(u$, 1)) > 0
+        u$ = Mid$(u$, 2)
+    Loop
+    u$ = _Trim$(u$)
+    Select Case u$
+        Case "": v = v * defUnit
+        Case "ms": v = v
+        Case "s", "sec", "secs": v = v * 1000
+        Case "m", "min", "mins": v = v * 60000
+        Case "h", "hr", "hour", "hours": v = v * 3600000
+        Case Else: RmMs& = -1: Exit Function
+    End Select
+    If v < 0 Or v > 2000000000 Then RmMs& = -1: Exit Function
+    RmMs& = CLng(v)
+End Function
+
+' OK / ERR from what the action left in the status bar
+Function RmResult$
+    If InStr(statusMsg$, "ERROR") > 0 Then RmResult$ = "ERR " + statusMsg$ Else RmResult$ = "OK " + statusMsg$
+End Function
+
+Function RmOnOff% (s$)
+    ' -1 on, 0 off, 1 = not given / not understood
+    Select Case UCase$(s$)
+        Case "ON", "1", "YES", "TRUE": RmOnOff% = -1
+        Case "OFF", "0", "NO", "FALSE": RmOnOff% = 0
+        Case Else: RmOnOff% = 1
+    End Select
+End Function
+
+'------------------------------------------------------------------
+'  the commands - returns "OK ...", "ERR ...", "WAIT ..." or "" (reply later)
+'------------------------------------------------------------------
+Function RemoteDo$ (c$)
+    Dim w$, a$, a2$, v As Long, i As Long, k As Long, r$, s$, keep As Long
+    w$ = UCase$(RmWord$(c$, 1))
+    a$ = RmRest$(c$)
+    a2$ = UCase$(RmWord$(c$, 2))
+    Select Case w$
+        Case "HELP"
+            RemoteHelp
+            RemoteDo$ = "OK command list written above"
+        Case "PING"
+            RemoteDo$ = "OK pong  QBCap v0.12"
+        Case "STATUS"
+            RemoteWriteStatus
+            RemoteDo$ = "OK QBCap_status.txt written"
+        Case "SCREENSHOT"
+            s$ = CleanName$(a$)
+            If s$ = "" Then s$ = "QBCap_screen"
+            If LCase$(Right$(s$, 4)) <> "-png" Then s$ = s$ + ".png" Else s$ = Left$(s$, Len(s$) - 4) + ".png"
+            rmShot$ = exeDir$ + s$: rmShotCmd$ = c$
+            RemoteDo$ = "" ' replied after the next frame is on screen
+        Case "SHOW"
+            ' open one panel group (others folded) so a SCREENSHOT shows it
+            k = 0
+            For i = 1 To NGRP
+                If InStr(UCase$(grpName$(i)), UCase$(a$)) > 0 Then k = i: Exit For
+            Next
+            If a$ = "" Or k = 0 Then
+                s$ = ""
+                For i = 1 To NGRP: s$ = s$ + grpName$(i) + ", ": Next
+                RemoteDo$ = "ERR SHOW one of: " + Left$(s$, Len(s$) - 2): Exit Function
+            End If
+            For i = 1 To NGRP: grpOpen(i) = 0: Next
+            grpOpen(k) = -1: panelScroll = (k - 1) * 28 ' its header at the top (the folded ones above are 28 px each)
+            RemoteDo$ = "OK panel '" + grpName$(k) + "' open"
+        Case "LOG", "NOTE"
+            LogLine "  NOTE: " + a$
+            RemoteDo$ = "OK noted in QBCap.log"
+        Case "CLEAR"
+            rmQN = 0: rmWait$ = ""
+            SeqStopped "queue cleared (CLEAR)"
+            RemoteDo$ = "OK queue cleared"
+        Case "ABORT"
+            rmQN = 0: rmWait$ = ""
+            SeqStopped "ABORT"
+            s$ = ""
+            If recOn Then qcRecordStop: recOn = 0: s$ = s$ + " capture stopped (" + I2S$(recWritten) + " frames saved);"
+            If solveOn Then qc_solve_cancel: s$ = s$ + " solve cancelled;"
+            If calActive Then qc_master_cancel: calActive = 0: s$ = s$ + " master cancelled;"
+            If mntOpen And (gotoState <> 0 Or mntGoWait <> 0 Or paTurn <> 0) Then
+                v = MountStopRetry&: mntTrack = 0
+                gotoState = 0: lrnStep = 0: paTurn = 0: mntGoWait = 0
+                s$ = s$ + " slew stopped (tracking off);"
+            End If
+            If s$ = "" Then s$ = " nothing was running"
+            statusMsg$ = "Remote ABORT:" + s$
+            RemoteDo$ = "OK queue cleared;" + s$
+        Case "QUIT", "EXIT"
+            rmQN = 0: rmWait$ = ""
+            SeqStopped "QUIT"
+            quitFlag = -1
+            RemoteDo$ = "OK shutting down (normal ShutDown: recording saved, cooler off, mount stopped)"
+
+            '---------------- camera ----------------
+        Case "CONNECT"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            If a$ <> "" Then
+                k = 0
+                For i = 1 To NCAM
+                    If InStr(UCase$(camName$(i)), UCase$(a$)) > 0 Or InStr(UCase$(a$), UCase$(camName$(i))) > 0 Then k = i: Exit For
+                Next
+                If k = 0 Then RemoteDo$ = "ERR camera must be ASI174, ASI178, ASI1600, G3Mono, G3Color, USBCam or QHYCam": Exit Function
+                camSel = k
+            End If
+            DoAction "Connect"
+            If camConn Then RemoteDo$ = "OK " + statusMsg$ Else RemoteDo$ = "ERR " + statusMsg$
+        Case "DISCONNECT"
+            If recOn Then qcRecordStop: recOn = 0
+            DoAction "Disconnect"
+            RemoteDo$ = "OK camera closed"
+        Case "LIVE"
+            If camConn = 0 Then RemoteDo$ = "ERR no camera connected": Exit Function
+            v = RmOnOff%(a2$)
+            If v = 1 Then v = -1
+            If (v <> 0) <> (liveOn <> 0) Then DoAction "Live"
+            If (v <> 0) = (liveOn <> 0) Then RemoteDo$ = "OK live " + ItemOf$("off|on", 1 - (liveOn <> 0)) Else RemoteDo$ = "ERR " + statusMsg$
+        Case "STOP"
+            DoAction "Stop"
+            RemoteDo$ = "OK " + statusMsg$
+        Case "EXP", "EXPOSURE"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first (file names carry the exposure)": Exit Function
+            v = RmMs&(a$, 1)
+            If v < 1 Or v > expMaxMs Then RemoteDo$ = "ERR exposure must be 1 ms .. " + ExpStr$(expMaxMs) + " for this camera (e.g. EXP 500ms, EXP 2s, EXP 2min)": Exit Function
+            expMs = v
+            qcCtrlSet ASI_EXPOSURE, expMs * 1000, autoExp, "Exposure"
+            r$ = RmResult$
+            If Left$(r$, 2) = "OK" Then r$ = "OK exposure " + ExpStr$(expMs)
+            RemoteDo$ = r$
+        Case "GAIN"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            If RmIsNum%(a$) = 0 Then RemoteDo$ = "ERR GAIN needs a number": Exit Function
+            gainV = _Clamp(CLng(Val(a$)), gainLo, gainHi)
+            qcCtrlSet ASI_GAIN, gainV, autoGain, "Gain"
+            RemoteDo$ = RmResult$
+        Case "OFFSET"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            If RmIsNum%(a$) = 0 Then RemoteDo$ = "ERR OFFSET needs a number": Exit Function
+            offsetV = _Clamp(CLng(Val(a$)), 0, offHi)
+            qcCtrlSet ASI_OFFSET, offsetV, 0, "Offset"
+            RemoteDo$ = RmResult$
+        Case "BIN"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            v = Val(a$)
+            If v < 1 Or v > 4 Then RemoteDo$ = "ERR BIN 1, 2, 3 or 4": Exit Function
+            binIdx = v: qcApplyFormat
+            RemoteDo$ = RmResult$
+        Case "FORMAT"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            Select Case a2$
+                Case "RAW8", "8": fmtIdx = 1
+                Case "RAW16", "16": fmtIdx = 2
+                Case Else: RemoteDo$ = "ERR FORMAT RAW8 or RAW16": Exit Function
+            End Select
+            qcApplyFormat
+            RemoteDo$ = RmResult$
+        Case "ROI"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            Select Case a2$
+                Case "FULL": roiIdx = 1
+                Case "HALF": roiIdx = 2
+                Case "QUARTER": roiIdx = 3
+                Case "640", "640X480": roiIdx = 4
+                Case Else: RemoteDo$ = "ERR ROI FULL, HALF, QUARTER or 640": Exit Function
+            End Select
+            qcApplyFormat
+            RemoteDo$ = RmResult$
+        Case "COOLER"
+            If camConn = 0 Then RemoteDo$ = "ERR no camera connected": Exit Function
+            If camCooled = 0 Then RemoteDo$ = "ERR this camera has no cooler": Exit Function
+            v = RmOnOff%(a2$)
+            If v = 1 Then RemoteDo$ = "ERR COOLER ON or OFF": Exit Function
+            coolOn = v
+            qcCtrlSet ASI_COOLER_ON, -(coolOn <> 0), 0, "Cooler"
+            RemoteDo$ = RmResult$
+        Case "COOLTEMP", "TEMP"
+            If RmIsNum%(a$) = 0 Then RemoteDo$ = "ERR COOLTEMP needs a number (-30 .. 20)": Exit Function
+            coolTarget = _Clamp(CLng(Val(a$)), -30, 20)
+            If camConn <> 0 And camCooled = 0 Then RemoteDo$ = "ERR this camera has no cooler": Exit Function
+            qcCtrlSet ASI_TARGET_TEMP, coolTarget, 0, "Target temp"
+            RemoteDo$ = RmResult$
+
+            '---------------- filter wheel / names / files ----------------
+        Case "FILTER"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            If efwOpen Then k = efwSlots Else k = manualSlots
+            If k > NFILT Then k = NFILT
+            v = 0
+            If RmIsNum%(a$) Then
+                v = Val(a$)
+            Else
+                For i = 1 To k
+                    If UCase$(filtName$(i)) = UCase$(a$) Or UCase$(CleanName$(filtName$(i))) = UCase$(CleanName$(a$)) Then v = i: Exit For
+                Next
+            End If
+            If v < 1 Or v > k Then
+                s$ = ""
+                For i = 1 To k: s$ = s$ + " " + I2S$(i) + "=" + filtName$(i): Next
+                RemoteDo$ = "ERR no filter '" + a$ + "' - slots:" + s$: Exit Function
+            End If
+            SelectFilter v
+            If InStr(statusMsg$, "still moving") Or InStr(statusMsg$, "only") Or InStr(statusMsg$, "ERROR") Then RemoteDo$ = "ERR " + statusMsg$: Exit Function
+            rmFiltWant = v
+            If efwOpen Then
+                RemoteDo$ = "OK " + statusMsg$ + "  (WAIT FILTER before capturing)"
+            Else
+                RemoteDo$ = "OK " + statusMsg$
+            End If
+        Case "OBJECT", "TARGETNAME"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            objName$ = Left$(a$, 24)
+            RemoteDo$ = "OK object name " + ObjTag$ + "  next file " + ShortName$(CapBase$)
+        Case "SAVEAS"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            Select Case a2$
+                Case "SER": outIdx = 1
+                Case "FITS", "FIT": outIdx = 2
+                Case Else: RemoteDo$ = "ERR SAVEAS SER or FITS": Exit Function
+            End Select
+            RemoteDo$ = "OK saving as " + ItemOf$("SER|FITS", outIdx)
+        Case "LIMIT"
+            If recOn Then RemoteDo$ = "ERR recording - STOP first": Exit Function
+            Select Case a2$
+                Case "NONE", "0": limitIdx = 1
+                Case "100": limitIdx = 2
+                Case "500": limitIdx = 3
+                Case "1000": limitIdx = 4
+                Case "5000": limitIdx = 5
+                Case "30S": limitIdx = 6
+                Case "1MIN": limitIdx = 7
+                Case "5MIN": limitIdx = 8
+                Case Else: RemoteDo$ = "ERR LIMIT NONE|100|500|1000|5000|30S|1MIN|5MIN (or CAPTURE n for any frame count)": Exit Function
+            End Select
+            RemoteDo$ = "OK limit " + ItemOf$(LIMIT_LIST, limitIdx)
+
+            '---------------- capture ----------------
+        Case "CAPTURE", "RECORD"
+            If camConn = 0 Then RemoteDo$ = "ERR no camera connected": Exit Function
+            If recOn Then RemoteDo$ = "ERR already recording": Exit Function
+            rmCapN = 0
+            If a$ <> "" Then
+                rmCapN = Val(a$)
+                If rmCapN < 1 Or rmCapN > 100000 Then rmCapN = 0: RemoteDo$ = "ERR CAPTURE n needs 1 .. 100000 frames": Exit Function
+            End If
+            DoAction "Capture"
+            rmCapN = 0
+            If recOn Then
+                s$ = "OK recording -> " + ShortName$(recPath$)
+                If Val(a$) > 0 Then s$ = s$ + "  (" + I2S$(Val(a$)) + " frames, about " + HMS$(CSng(Val(a$)) * expMs / 1000) + ")"
+                RemoteDo$ = s$
+            Else
+                RemoteDo$ = "ERR " + statusMsg$
+            End If
+        Case "SNAP", "SNAPSHOT"
+            If camConn = 0 Then RemoteDo$ = "ERR no camera connected": Exit Function
+            DoAction "Snapshot"
+            RemoteDo$ = RmResult$
+        Case "DARK", "FLAT"
+            If a$ <> "" Then
+                k = 0
+                For i = 1 To ItemCount&(CALN_LIST)
+                    If Val(ItemOf$(CALN_LIST, i)) = Val(a$) Then k = i
+                Next
+                If k = 0 Then RemoteDo$ = "ERR frames must be " + CALN_LIST: Exit Function
+                calNIdx = k
+            End If
+            If w$ = "DARK" Then StartMaster 0 Else StartMaster 1
+            If calActive Then RemoteDo$ = "OK " + statusMsg$ + "  (WAIT MASTER)" Else RemoteDo$ = "ERR " + statusMsg$
+        Case "STRETCH", "AUTOSTRETCH"
+            AutoStretch
+            RemoteDo$ = RmResult$
+        Case "STACK"
+            Select Case a2$
+                Case "START": If stkOn = 0 Then StartStack
+                Case "STOP": If stkOn Then StopStack
+                Case "SAVE": SaveStack
+                Case "RESET": v = qc_stack_reset&: stkAuto = 0: statusMsg$ = "Stack cleared"
+                Case Else: RemoteDo$ = "ERR STACK START|STOP|SAVE|RESET": Exit Function
+            End Select
+            RemoteDo$ = RmResult$
+
+            '---------------- plate solve ----------------
+        Case "SOLVE"
+            If solveOn Then RemoteDo$ = "ERR a solve is already running": Exit Function
+            If camConn = 0 Then RemoteDo$ = "ERR no camera connected": Exit Function
+            If liveOn = 0 Then RemoteDo$ = "ERR start LIVE first (and give it one exposure)": Exit Function
+            keep = solveSrc: solveSrc = 1
+            StartSolve
+            solveSrc = keep
+            If solveOn Then
+                s$ = "OK " + statusMsg$ + "  (WAIT SOLVE)"
+                If mntOpen Then s$ = s$ + " - the mount is synced from it"
+                RemoteDo$ = s$
+            Else
+                RemoteDo$ = "ERR " + statusMsg$
+            End If
+
+            '---------------- mount ----------------
+        Case "MOUNT"
+            Select Case a2$
+                Case "CONNECT"
+                    If mntOpen = 0 Then MountConnect
+                    If mntOpen Then RemoteDo$ = "OK " + statusMsg$ Else RemoteDo$ = "ERR " + statusMsg$
+                Case "DISCONNECT"
+                    If mntOpen Then MountDisconnect
+                    RemoteDo$ = "OK mount disconnected (axes stopped)"
+                Case Else
+                    RemoteDo$ = "ERR MOUNT CONNECT or MOUNT DISCONNECT"
+            End Select
+        Case "MSTOP"
+            If mntOpen = 0 Then RemoteDo$ = "ERR mount not connected": Exit Function
+            v = MountStopRetry&: mntTrack = 0
+            gotoState = 0: lrnStep = 0: paTurn = 0: mntGoWait = 0
+            statusMsg$ = "Mount stopped by remote (tracking off)."
+            If v = 0 Then RemoteDo$ = "OK mount stopped, tracking off" Else RemoteDo$ = "ERR stop not confirmed by the mount - " + LibErr$
+        Case "TRACK"
+            If mntOpen = 0 Then RemoteDo$ = "ERR mount not connected": Exit Function
+            v = RmOnOff%(a2$)
+            If v = 1 Then RemoteDo$ = "ERR TRACK ON, TRACK ON LUNAR or TRACK OFF": Exit Function
+            If v And rmMount = 0 And (sqRun = 0 Or sqLocal = 0) Then RemoteDo$ = "ERR remote mount moves are not allowed - tick 'Allow remote mount moves' in the Remote panel": Exit Function
+            If v Then
+                k = (UCase$(RmWord$(c$, 3)) = "LUNAR")
+                i = qc_mount_track_rate&(-(k <> 0)): mntLunar = k
+            End If
+            If MountTrackRetry&(-(v <> 0)) <> 0 Then RemoteDo$ = "ERR tracking not confirmed - " + LibErr$: Exit Function
+            mntTrack = v
+            If v Then RemoteDo$ = "OK tracking on (" + ItemOf$("sidereal|lunar", 1 - (mntLunar <> 0)) + ")" Else RemoteDo$ = "OK tracking off"
+        Case "CENTRE", "CENTER"
+            v = RmOnOff%(a2$)
+            If v = 1 Then RemoteDo$ = "ERR CENTRE ON or OFF": Exit Function
+            gotoCentre = v
+            RemoteDo$ = "OK plate-solve centring after GoTo " + ItemOf$("off|on", 1 - (v <> 0))
+        Case "FIND"
+            If a$ = "" Then RemoteDo$ = "ERR FIND needs a name (M31, NGC7000, Vega, Moon)": Exit Function
+            FindTarget a$
+            If InStr(statusMsg$, "Nothing called") Then RemoteDo$ = "ERR " + statusMsg$: Exit Function
+            UpdateMoon
+            If mntOpen = 0 Then mntLST = qc_mount_lst#(siteLon)
+            RemoteDo$ = "OK " + catName$(tgtIdx) + "  " + catDesc$(tgtIdx) + "  RA " + RAStr$(catRA(tgtIdx) * 15#) + "  Dec " + DecStr$(catDec(tgtIdx)) + "  alt " + I2S$(CLng(AltOf#(TgtHA#(tgtIdx), catDec(tgtIdx)))) + " deg"
+        Case "GOTO", "SLEW"
+            If mntOpen = 0 Then RemoteDo$ = "ERR mount not connected (MOUNT CONNECT)": Exit Function
+            If rmMount = 0 And (sqRun = 0 Or sqLocal = 0) Then RemoteDo$ = "ERR remote mount moves are not allowed - tick 'Allow remote mount moves' in the Remote panel": Exit Function
+            If gotoState <> 0 Or mntGoWait <> 0 Or paTurn <> 0 Then RemoteDo$ = "ERR the mount is busy (GoTo / turn running)": Exit Function
+            If a$ = "" Then RemoteDo$ = "ERR GOTO needs a name (M31, NGC7000, Vega, Moon)": Exit Function
+            FindTarget a$
+            If InStr(statusMsg$, "Nothing called") Then RemoteDo$ = "ERR " + statusMsg$: Exit Function
+            UpdateMoon
+            If PlanGoto%(tgtIdx) = 0 Then RemoteDo$ = "ERR " + statusMsg$: Exit Function
+            s$ = "RA axis " + Fmt1$(CSng(gotoA)) + " deg, Dec axis " + Fmt1$(CSng(gotoD)) + " deg"
+            GotoConfirm tgtIdx
+            If gotoState = 2 Then RemoteDo$ = "OK slewing to " + catName$(tgtIdx) + " (" + s$ + ")  (WAIT GOTO)" Else RemoteDo$ = "ERR " + statusMsg$
+
+            '---------------- guider (guide window over the UDP link) ----------------
+        Case "GUIDE"
+            Select Case a2$
+                Case "PAUSE", "RESUME", "DITHER", "STOP", "STATUS"
+                    s$ = GuideLinkSend$(a2$)
+                    If s$ = "" Then RemoteDo$ = "ERR guide window not answering": Exit Function
+                    If Left$(s$, 3) = "ERR" Then RemoteDo$ = "ERR guider: " + s$ Else RemoteDo$ = "OK guider: " + s$
+                Case Else
+                    RemoteDo$ = "ERR GUIDE PAUSE|RESUME|DITHER|STOP|STATUS"
+            End Select
+
+            '---------------- waiting + scripts ----------------
+        Case "WAIT"
+            RemoteDo$ = RemoteStartWait$(c$)
+        Case "RUN"
+            If a$ = "" Then RemoteDo$ = "ERR RUN needs a file name": Exit Function
+            If Left$(a$, 1) = "/" Then s$ = a$ Else s$ = exeDir$ + a$
+            If _FileExists(s$) = 0 Then RemoteDo$ = "ERR file not found: " + s$: Exit Function
+            ReDim lines$(0)
+            k = 0
+            v = FreeFile
+            Open s$ For Input As #v
+            Do While Not EOF(v)
+                k = k + 1
+                ReDim _Preserve lines$(k)
+                Line Input #v, lines$(k)
+            Loop
+            Close #v
+            rmRunFile$ = a$
+            i = rmQN
+            RemoteAddLines lines$(), k, -1
+            RemoteDo$ = "OK " + a$ + " loaded - " + I2S$(rmQN - i) + " commands, run next"
+        Case "SEQ", "SEQBEGIN", "SEQROW", "SEQEND", "FRESH"
+            RemoteDo$ = SeqCommand$(w$, c$)
+        Case Else
+            RemoteDo$ = "ERR unknown command '" + w$ + "' - send HELP for the list"
+    End Select
+End Function
+
+'------------------------------------------------------------------
+'  WAIT
+'------------------------------------------------------------------
+Function RemoteStartWait$ (c$)
+    Dim a2$, lim$, v As Long, t As Double
+    a2$ = UCase$(RmWord$(c$, 2))
+    lim$ = RmWord$(c$, 3)
+    t = RmClock#
+    rmWaitStart = t: rmWaitCmd$ = c$: rmWaitLimit = 0
+    If a2$ = "" Then RemoteStartWait$ = "ERR WAIT seconds | FILTER | CAPTURE | SOLVE | GOTO | MASTER | COOL | SETTLE": Exit Function
+    If RmIsNum%(a2$) Then
+        v = RmMs&(a2$, 1000)
+        If v < 0 Then RemoteStartWait$ = "ERR WAIT 30, WAIT 30s, WAIT 2min": Exit Function
+        rmWait$ = "TIME": rmWaitUntil = t + v / 1000
+        RemoteStartWait$ = "WAIT " + I2S$(v \ 1000) + " s"
+        Exit Function
+    End If
+    Select Case a2$
+        Case "FILTER": rmWaitLimit = 90
+        Case "CAPTURE": rmWaitLimit = 0
+        Case "SOLVE": rmWaitLimit = 240
+        Case "GOTO": rmWaitLimit = 600
+        Case "MASTER": rmWaitLimit = 0
+        Case "COOL": rmWaitLimit = 1200
+        Case "SETTLE": rmWaitLimit = 180
+        Case Else
+            RemoteStartWait$ = "ERR WAIT seconds | FILTER | CAPTURE | SOLVE | GOTO | MASTER | COOL | SETTLE": Exit Function
+    End Select
+    If lim$ <> "" Then
+        v = RmMs&(lim$, 1000)
+        If v > 0 Then rmWaitLimit = v / 1000
+    End If
+    rmWait$ = a2$
+    If rmWaitLimit > 0 Then
+        RemoteStartWait$ = "WAIT for " + a2$ + " (gives up after " + I2S$(CLng(rmWaitLimit)) + " s)"
+    Else
+        RemoteStartWait$ = "WAIT for " + a2$
+    End If
+End Function
+
+' -1 when the wait is over (its reply written), 0 while still waiting
+Function RemoteWaitDone%
+    Dim t As Double, done As Long, r$, el As Double
+    t = RmClock#
+    el = t - rmWaitStart
+    RemoteWaitDone% = 0
+    Select Case rmWait$
+        Case "TIME"
+            done = (t >= rmWaitUntil)
+            r$ = "OK waited " + I2S$(CLng(el)) + " s"
+        Case "FILTER"
+            done = (efwOpen = 0) Or (efwTarget = 0 And efwPos <> -1)
+            If done Then
+                If efwOpen And rmFiltWant > 0 And fwSlot <> rmFiltWant Then
+                    r$ = "ERR wheel is at slot " + I2S$(fwSlot) + ", not " + I2S$(rmFiltWant)
+                ElseIf fwSlot > 0 Then
+                    r$ = "OK filter in place: slot " + I2S$(fwSlot) + " " + filtName$(fwSlot)
+                Else
+                    r$ = "OK (no wheel)"
+                End If
+            End If
+        Case "CAPTURE"
+            done = (recOn = 0)
+            If done Then
+                SeqCaptureDone
+                If InStr(statusMsg$, "ERROR") Then r$ = "ERR " + statusMsg$ Else r$ = "OK saved " + I2S$(recWritten) + " frames (" + I2S$(recMB) + " MB, " + I2S$(recDrop) + " dropped) -> " + ShortName$(recPath$)
+            End If
+        Case "SOLVE"
+            done = (solveOn = 0)
+            If done Then
+                If solveState = 0 Then
+                    r$ = "ERR no plate solve has run (SOLVE first)"
+                ElseIf solveState = 2 Then
+                    r$ = "OK solved RA " + RAStr$(solRA) + " (" + Fmt2$(CSng(solRA)) + " deg)  Dec " + DecStr$(solDec) + " (" + Fmt2$(CSng(solDec)) + " deg)  " + Fmt2$(solScale) + " arcsec/px  rot " + Fmt1$(solRot) + "  " + Fmt1$(solSecs) + " s"
+                Else
+                    r$ = "ERR solve failed: " + solveMsg$
+                End If
+            End If
+        Case "GOTO"
+            done = (gotoState = 0 And mntGoWait = 0)
+            If done Then
+                If InStr(statusMsg$, "STALL") Or InStr(statusMsg$, "LOST") Or InStr(statusMsg$, "refused") Or InStr(statusMsg$, "too long") Or InStr(statusMsg$, "cancel") Or InStr(statusMsg$, "ERROR") Or InStr(statusMsg$, "below") Then
+                    r$ = "ERR " + statusMsg$
+                ElseIf InStr(statusMsg$, "still") Or InStr(statusMsg$, "fail") Then
+                    ' close but not centred (or the check solve failed): carry on, say so
+                    r$ = "OK WARNING " + statusMsg$
+                Else
+                    r$ = "OK " + statusMsg$
+                End If
+            End If
+        Case "MASTER"
+            done = (calActive = 0)
+            If done Then r$ = RmResult$
+        Case "COOL"
+            If camConn = 0 Or camCooled = 0 Then
+                done = -1: r$ = "ERR no cooled camera connected"
+            Else
+                done = (Abs(statTemp / 10 - coolTarget) <= 1)
+                r$ = "OK sensor at " + Fmt1$(statTemp / 10) + " C (target " + I2S$(coolTarget) + " C, cooler " + I2S$(statPower) + "%)"
+            End If
+        Case "SETTLE"
+            If glAlive = 0 Then
+                done = -1: r$ = "ERR guide window not running"
+            Else
+                done = (Val(GlField$("STATE")) = 2 And Val(GlField$("SETTLED")) = 1 And Val(GlField$("PAUSED")) = 0)
+                r$ = "OK guiding settled, RMS " + GlField$("RMS") + Chr$(34)
+            End If
+        Case Else
+            done = -1: r$ = "OK"
+    End Select
+    If done = 0 Then
+        If rmWaitLimit > 0 And el > rmWaitLimit Then
+            rmWait$ = ""
+            If rmWaitCmd$ = "WAIT COOL" And sqRun Then
+                RemoteReply rmWaitCmd$, "OK WARNING sensor " + Fmt1$(statTemp / 10) + " C, not " + I2S$(coolTarget) + " C after " + I2S$(CLng(el)) + " s - carrying on"
+            Else
+                RemoteReply rmWaitCmd$, "ERR gave up after " + I2S$(CLng(el)) + " s"
+            End If
+            RemoteWaitDone% = -1
+        End If
+        Exit Function
+    End If
+    rmWait$ = ""
+    RemoteReply rmWaitCmd$, r$
+    RemoteWaitDone% = -1
+End Function
+
+'------------------------------------------------------------------
+'  QBCap_status.txt
+'------------------------------------------------------------------
+Sub RemoteWriteStatus
+    Dim f$, tmp$, ff As Long, s$, i As Long, j As Long
+    f$ = exeDir$ + "QBCap_status.txt"
+    tmp$ = exeDir$ + "QBCap_status.tmp"
+    ff = FreeFile
+    Open tmp$ For Output As #ff
+    Print #ff, "time = " + Date$ + " " + Time$
+    Print #ff, "qbcap = v0.12  " + ItemOf$("running|CLOSED (equipment shut down)", 1 - (quitFlag <> 0))
+    Print #ff, "remote = " + ItemOf$("off|on", 1 - (rmOn <> 0))
+    Print #ff, "remote_mount_allowed = " + ItemOf$("no|yes", 1 - (rmMount <> 0))
+    s$ = I2S$(rmQN)
+    If rmPaused Then s$ = s$ + " (PAUSED)"
+    Print #ff, "queue = " + s$
+    If rmWait$ <> "" Then s$ = rmWaitCmd$ + " (" + I2S$(CLng(RmClock# - rmWaitStart)) + " s)" Else s$ = "none"
+    Print #ff, "waiting = " + s$
+    Print #ff, "commands_run = " + I2S$(rmCount)
+    Print #ff, "last_command = " + rmLast$
+    Print #ff, "last_result = " + RmText$(rmLastRes$)
+    Print #ff, "last_error = " + RmText$(rmLastErr$)
+    Print #ff, "status_bar = " + RmText$(statusMsg$)
+    ' camera
+    If camConn Then
+        Print #ff, "camera = " + camName$(camConn) + "  (" + camFull$ + ")"
+    Else
+        Print #ff, "camera = none"
+    End If
+    Print #ff, "live = " + ItemOf$("no|yes", 1 - (liveOn <> 0))
+    Print #ff, "fps = " + Fmt1$(statFps / 10) + "  frames = " + I2S$(statCap) + "  dropped = " + I2S$(statDrop)
+    Print #ff, "exposure_ms = " + I2S$(expMs) + "  (" + ExpStr$(expMs) + ")" + ItemOf$("| auto", 1 - (autoExp <> 0))
+    Print #ff, "gain = " + I2S$(gainV) + ItemOf$("| auto", 1 - (autoGain <> 0)) + "  offset = " + I2S$(offsetV)
+    Print #ff, "format = " + ItemOf$("RAW8|RAW16", fmtIdx) + "  bin = " + I2S$(binIdx) + "  roi = " + ItemOf$("Full|Half|Quarter|640x480", roiIdx) + "  frame = " + I2S$(frW) + "x" + I2S$(frH)
+    If camConn And camIsUSB = 0 Then s$ = Fmt1$(statTemp / 10) Else s$ = "--"
+    Print #ff, "sensor_temp_c = " + s$
+    If camConn And camIsUSB = 0 Then Print #ff, "sensor_temp_f = " + TempF$(statTemp)
+    If camCooled Then
+        Print #ff, "cooler = " + ItemOf$("off|on", 1 - (coolOn <> 0)) + "  target_c = " + I2S$(coolTarget) + "  power_pct = " + I2S$(statPower)
+    Else
+        Print #ff, "cooler = none"
+    End If
+    ' filter wheel
+    If efwOpen Then
+        s$ = efwName$ + " (" + I2S$(efwSlots) + " slots)"
+        If efwPos = -1 Or efwTarget > 0 Then s$ = s$ + "  MOVING"
+    Else
+        s$ = "none (labels only)"
+    End If
+    Print #ff, "wheel = " + s$
+    If fwSlot > 0 Then s$ = I2S$(fwSlot) + " " + filtName$(fwSlot) Else s$ = "unknown"
+    Print #ff, "filter = " + s$
+    If efwOpen Then i = efwSlots Else i = manualSlots
+    If i > NFILT Then i = NFILT
+    s$ = ""
+    For j = 1 To i: s$ = s$ + I2S$(j) + "=" + filtName$(j) + " ": Next
+    Print #ff, "filters = " + RTrim$(s$)
+    ' capture
+    Print #ff, "object = " + ObjTag$
+    Print #ff, "save_as = " + ItemOf$("SER|FITS", outIdx) + "  limit = " + ItemOf$(LIMIT_LIST, limitIdx)
+    Print #ff, "capture_folder = " + capDir$
+    If recOn Then
+        Print #ff, "recording = yes  frames = " + I2S$(recWritten) + "  mb = " + I2S$(recMB) + "  dropped = " + I2S$(recDrop) + "  buffer_pct = " + I2S$(recBuf)
+        Print #ff, "recording_file = " + recPath$
+    Else
+        Print #ff, "recording = no"
+        Print #ff, "last_recording_file = " + recPath$
+    End If
+    If calActive Then Print #ff, "master = building " + ItemOf$("dark|flat", calType + 1) + " " + I2S$(calDone) + "/" + I2S$(calTotal)
+    If stkOn Or skN > 0 Then Print #ff, "stack = " + ItemOf$("stopped|running", 1 - (stkOn <> 0)) + "  frames = " + I2S$(skN) + "  failed = " + I2S$(skFail)
+    ' plate solve
+    Select Case solveState
+        Case 1: s$ = "solving"
+        Case 2: s$ = "solved"
+        Case 3: s$ = "failed"
+        Case Else: s$ = "none"
+    End Select
+    If solveOn Then s$ = "solving"
+    Print #ff, "solve = " + s$
+    If solveState = 2 Then
+        Print #ff, "solve_ra = " + RAStr$(solRA) + "  (" + Fmt2$(CSng(solRA)) + " deg)"
+        Print #ff, "solve_dec = " + RmText$(DecStr$(solDec)) + "  (" + Fmt2$(CSng(solDec)) + " deg)"
+        Print #ff, "solve_scale = " + Fmt2$(solScale) + " arcsec/px  rot = " + Fmt1$(solRot) + "  field = " + Fmt1$(solFW) + "x" + Fmt1$(solFH) + " arcmin  secs = " + Fmt1$(solSecs)
+    ElseIf solveState = 3 Then
+        Print #ff, "solve_message = " + solveMsg$
+    End If
+    ' mount
+    If mntOpen Then
+        Print #ff, "mount = connected  " + mntInfo$ + "  " + mntAddr$
+        Print #ff, "mount_axes = RA " + Fmt2$(CSng(mntRA)) + "  Dec " + Fmt2$(CSng(mntDec)) + " deg"
+        Print #ff, "mount_state = RA " + ItemOf$("stopped|moving|tracking|goto", mntRASt + 1) + "  Dec " + ItemOf$("stopped|moving|moving|goto", mntDecSt + 1) + "  tracking = " + ItemOf$("off|on", 1 - (mntTrack <> 0)) + ItemOf$("| (lunar)", 1 - (mntLunar <> 0))
+        If syncOk Then
+            Print #ff, "pointing = RA " + RAStr$(Wrap360#(mntLST - CurHA#)) + "  Dec " + RmText$(DecStr$(CurDec#)) + "  (synced)"
+        Else
+            Print #ff, "pointing = not synced (SOLVE at HOME first)"
+        End If
+        Print #ff, "mount_message = " + RmText$(mntMsg$)
+    Else
+        Print #ff, "mount = not connected"
+    End If
+    Select Case gotoState
+        Case 1: s$ = "waiting for Confirm"
+        Case 2: s$ = "slewing to " + catName$(gotoTgt)
+        Case 3: s$ = "plate solving to centre " + catName$(gotoTgt)
+        Case 4: s$ = "waiting for a clean frame (" + catName$(gotoTgt) + ")"
+        Case Else: s$ = "idle"
+    End Select
+    Print #ff, "goto = " + s$ + "  centre_after = " + ItemOf$("off|on", 1 - (gotoCentre <> 0))
+    Print #ff, "target = " + catName$(tgtIdx) + "  alt " + I2S$(CLng(AltOf#(TgtHA#(tgtIdx), catDec(tgtIdx)))) + " deg"
+    SeqStatus ff
+    ' guider window
+    If mntOpen = 0 Then mntLST = qc_mount_lst#(siteLon) ' sky time for target altitudes
+    If glAlive Then Print #ff, "guider = " + glState$ Else Print #ff, "guider = not running"
+    Close #ff
+    If _FileExists(f$) Then Kill f$
+    Name tmp$ As f$
+End Sub
+
+'------------------------------------------------------------------
+'  HELP  (into QBCap_reply.txt)
+'------------------------------------------------------------------
+Sub RemoteHelp
+    Dim ff As Long
+    ff = FreeFile
+    Open exeDir$ + "QBCap_reply.txt" For Append As #ff
+    Print #ff, "---- QBCap remote commands (one per line in QBCap_cmd.txt) ----"
+    Print #ff, "PING | STATUS | SCREENSHOT [name] | SHOW panel (Mount, Guider, Plate Solve...) | LOG text | HELP"
+    Print #ff, "CONNECT [ASI174|ASI178|ASI1600|G3Mono|G3Color|USBCam|QHYCam] | DISCONNECT | LIVE [ON|OFF] | STOP"
+    Print #ff, "EXP 500ms|2s|2min | GAIN n | OFFSET n | BIN 1-4 | FORMAT RAW8|RAW16 | ROI FULL|HALF|QUARTER|640"
+    Print #ff, "COOLER ON|OFF | COOLTEMP -10"
+    Print #ff, "FILTER 3 | FILTER Red | OBJECT M57 | SAVEAS SER|FITS | LIMIT NONE|100|500|1000|5000|30S|1MIN|5MIN"
+    Print #ff, "CAPTURE [frames] | SNAP | DARK [10|20|50|100] | FLAT [n] | STRETCH | STACK START|STOP|SAVE|RESET"
+    Print #ff, "SOLVE   (live frame; syncs the mount when connected)"
+    Print #ff, "MOUNT CONNECT|DISCONNECT | MSTOP | FIND name | CENTRE ON|OFF"
+    Print #ff, "GOTO name | TRACK ON [LUNAR] | TRACK OFF   (GOTO / TRACK ON need 'Allow remote mount moves')"
+    Print #ff, "GUIDE PAUSE|RESUME|DITHER|STOP|STATUS"
+    Print #ff, "WAIT 30s | WAIT FILTER|CAPTURE|SOLVE|GOTO|MASTER|COOL|SETTLE [give-up time]"
+    Print #ff, "RUN plan.txt (queue a command file) | CLEAR | ABORT | QUIT"
+    Print #ff, "SEQ START [file] | SEQ STOP | SEQ SKIP | SEQ PAUSE | SEQ RESUME | SEQ LOAD [file] | FRESH (restart the exposure)"
+    Print #ff, "CLEAR ABORT MSTOP run at once. A file of only STATUS/SCREENSHOT/PING/HELP/SHOW runs at once too."
+    Print #ff, "A failed command (ERR) clears the rest of the queue."
+    Print #ff, "----"
+    Close #ff
+End Sub
+
+'------------------------------------------------------------------
+'  panel group 15 + toolbar badge
+'------------------------------------------------------------------
+Sub RemotePanel (y As Long)
+    Dim v As Long, bw As Long, c As _Unsigned Long, s$
+    v = PCheck&(y, "Remote control (QBCap_cmd.txt)", rmOn)
+    If v <> rmOn Then
+        rmOn = v: RemoteSaveSetting
+        If rmOn Then statusMsg$ = "Remote control on" Else statusMsg$ = "Remote control off - QBCap_cmd.txt is ignored"
+    End If
+    v = PCheck&(y, "Allow remote mount moves", rmMount)
+    If v <> rmMount Then
+        rmMount = v
+        If rmMount Then statusMsg$ = "Remote may now GoTo / track - watch the scope and cables." Else statusMsg$ = "Remote mount moves off"
+    End If
+    If rmMount Then PInfoC y, "MOUNT MAY MOVE BY REMOTE", C_REC
+    PInfo y, "Commands run " + I2S$(rmCount) + "   queued " + I2S$(rmQN)
+    If rmWait$ <> "" Then PInfoWrap y, "Waiting: " + rmWaitCmd$ + " (" + I2S$(CLng(RmClock# - rmWaitStart)) + " s)", C_TXT
+    If rmPaused Then PInfoC y, "QUEUE PAUSED", _RGB32(255, 200, 80)
+    If rmLast$ <> "" Then
+        PInfoWrap y, "Last: " + rmLast$, C_DIM
+        If Left$(rmLastRes$, 3) = "ERR" Then c = C_REC Else c = C_OK
+        PInfoWrap y, RmText$(rmLastRes$), c
+    End If
+    bw = (PANEL_W - 34) \ 2
+    If rmPaused Then
+        If Btn%(10, y, bw, 24, "Resume queue", -1) Then rmPaused = 0: statusMsg$ = "Remote queue resumed"
+    Else
+        If Btn%(10, y, bw, 24, "Pause queue", 0) Then rmPaused = -1: statusMsg$ = "Remote queue paused"
+    End If
+    If Btn%(14 + bw, y, bw, 24, "Clear queue", 0) Then
+        rmQN = 0: rmWait$ = ""
+        SeqStopped "queue cleared by hand"
+        statusMsg$ = "Remote queue cleared"
+        RemoteReply "(Remote panel)", "OK queue cleared by hand"
+    End If
+    y = y + 30
+    PInfo y, "Replies: QBCap_reply.txt"
+    y = y + 6
+    s$ = ""
+End Sub
+
+' on the menu bar, left of the version (x = right end of the free space)
+Sub RemoteBadge (x As Long)
+    Dim s$, c As _Unsigned Long
+    If rmOn = 0 Or guideMode Then Exit Sub
+    If rmMount Then
+        s$ = "REMOTE + MOUNT": c = C_REC
+    ElseIf rmPaused Then
+        s$ = "REMOTE paused": c = _RGB32(255, 200, 80)
+    ElseIf rmQN > 0 Or rmWait$ <> "" Then
+        s$ = "REMOTE busy": c = C_OK
+    Else
+        s$ = "REMOTE on": c = C_DIM
+    End If
+    Color c: _PrintString (x - Len(s$) * 8, 3), s$
+End Sub

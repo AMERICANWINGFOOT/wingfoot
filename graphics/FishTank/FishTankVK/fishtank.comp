@@ -1,0 +1,341 @@
+// fishtank.comp  -  Vulkan compute version of the FishTank pixel shader
+//
+// Line-for-line port of shadePixel() from fishtank.cu.
+// Compile:  glslangValidator -V --target-env vulkan1.0 -o fishtank.spv fishtank.comp
+// (build.sh does this and embeds the result in fishtank_spv.h)
+//
+// Data layouts match fishtank.cu exactly (all float):
+//   fish : 8 per fish   x, y, face, rot, size, hue, phase, z
+//   bub  : 3 per bubble x, y, r
+//   food : 2 per flake  x, y
+// Output: one uint per pixel, memory order B,G,R,A (QB64 32-bit image layout).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) writeonly buffer OutBuf  { uint  px[];   } outb;
+layout(std430, binding = 1) readonly  buffer FishBuf { float f[];    } fishb;
+layout(std430, binding = 2) readonly  buffer BubBuf  { float f[];    } bubb;
+layout(std430, binding = 3) readonly  buffer FoodBuf { float f[];    } foodb;
+
+layout(push_constant) uniform PC {
+    int   W;
+    int   H;
+    float t;
+    int   nf;
+    int   nb;
+    int   nfd;
+} pc;
+
+#define N_WEED 11
+#define N_ROCK 4
+
+// ---------------------------------------------------------------- helpers
+float clampf(float x, float a, float b) { return x < a ? a : (x > b ? b : x); }
+float smoothf(float e0, float e1, float x) { float t = clampf((x - e0) / (e1 - e0), 0.0, 1.0); return t * t * (3.0 - 2.0 * t); }
+float fractf(float x) { return x - floor(x); }
+// Integer hashes (PCG) - bit-exact on every GPU vendor, unlike sin()-based hashes,
+// so the tank layout and fish patterns look the same on NVIDIA, Intel and AMD.
+uint pcg(uint v) {
+    uint st = v * 747796405u + 2891336453u;
+    uint w = ((st >> ((st >> 28u) + 4u)) ^ st) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+float hash1(float n) { return float(pcg(floatBitsToUint(n)) >> 8) * (1.0 / 16777216.0); }
+float hash2(float x, float y) { return float(pcg(floatBitsToUint(x) ^ pcg(floatBitsToUint(y))) >> 8) * (1.0 / 16777216.0); }
+
+vec3 hsv(float h, float s, float v) {
+    h = fractf(h) * 6.0;
+    float c = v * s;
+    float x = c * (1.0 - abs(mod(h, 2.0) - 1.0));
+    float m = v - c;
+    vec3 o;
+    if      (h < 1.0) o = vec3(c, x, 0.0);
+    else if (h < 2.0) o = vec3(x, c, 0.0);
+    else if (h < 3.0) o = vec3(0.0, c, x);
+    else if (h < 4.0) o = vec3(0.0, x, c);
+    else if (h < 5.0) o = vec3(x, 0.0, c);
+    else              o = vec3(c, 0.0, x);
+    return o + vec3(m);
+}
+
+// ---------------------------------------------------------------- scenery
+float sandTop(float x, float H) {
+    return H * 0.84 + sin(x * 0.004) * H * 0.025 + sin(x * 0.011 + 1.3) * H * 0.012;
+}
+
+float caustic(float x, float y, float t) {
+    float xx = x * 0.018, yy = y * 0.018, c = 0.0;
+    c += sin(xx * 1.0 + sin(yy * 1.3 + t * 0.6) + t * 0.40);
+    c += sin(yy * 1.7 + sin(xx * 1.9 - t * 0.8) - t * 0.35);
+    c += sin((xx + yy) * 1.2 + sin(xx * 0.7 + t * 0.5) + t * 0.25);
+    c = 1.0 - abs(sin(c * 1.3));
+    return c * c * c * c * c * c;
+}
+
+vec3 waterColor(float px, float py, float W, float H, float s, float t) {
+    float v = py / H;
+    vec3 shallow = vec3(0.06, 0.38, 0.56);
+    vec3 deep    = vec3(0.01, 0.07, 0.17);
+    vec3 col = mix(shallow, deep, pow(clampf(v, 0.0, 1.0), 0.8));
+
+    // slanted light shafts
+    float a = px / s + py / s * 0.38;
+    float r1 = 0.5 + 0.5 * sin(a * 0.011 + t * 0.13);
+    float r2 = 0.5 + 0.5 * sin(a * 0.029 - t * 0.21 + 1.7);
+    float ray = r1 * r2; ray = ray * ray * ray;
+    col += vec3(0.55, 0.75, 0.80) * (ray * 0.16 * (1.0 - v));
+
+    // caustics shimmering near the surface
+    col += vec3(0.6, 0.85, 0.9) * (caustic(px / s, py / s, t) * 0.10 * (1.0 - v) * (1.0 - v));
+    return col;
+}
+
+vec3 drawSand(vec3 col, float px, float py, float W, float H, float s, float t, vec3 water) {
+    float top = sandTop(px, H);
+    if (py < top - 1.5) return col;
+    float depth = (py - top) / (H - top + 1.0);
+    float grain = hash2(floor(px), floor(py)) * 0.10;
+    vec3 sand = vec3(0.78, 0.67, 0.46) * (0.75 + grain - depth * 0.25);
+
+    // pebbles: one maybe per 16px cell
+    float cell = 16.0 * s;
+    float cx = floor(px / cell), cy = floor(py / cell);
+    float hp = hash2(cx, cy);
+    if (hp > 0.72) {
+        float ox = (cx + 0.3 + 0.4 * hash2(cy, cx)) * cell;
+        float oy = (cy + 0.3 + 0.4 * hash2(cx + 7.0, cy)) * cell;
+        float rr = cell * (0.18 + 0.18 * hash1(hp * 91.0));
+        float d = sqrt((px - ox) * (px - ox) + (py - oy) * (py - oy) * 1.6);
+        if (d < rr && oy > top + 3.0) {
+            vec3 peb = hsv(0.06 + hash1(hp * 13.0) * 0.08, 0.25, 0.45 + 0.35 * hash1(hp * 7.0));
+            peb *= 0.75 + 0.35 * (1.0 - d / rr);
+            sand = mix(sand, peb, smoothf(rr, rr - 1.5, d));
+        }
+    }
+    // light ripples on the bottom
+    sand += vec3(0.5, 0.6, 0.5) * (caustic(px / s * 1.4, py / s * 2.2, t * 1.1) * 0.22);
+    sand = mix(sand, water, 0.30);
+    return mix(col, sand, smoothf(top - 1.5, top + 1.5, py));
+}
+
+vec3 drawRocks(vec3 col, float px, float py, float W, float H, float s, vec3 water) {
+    for (int i = 0; i < N_ROCK; i++) {
+        float fi = float(i);
+        float cx = W * (0.12 + 0.25 * fi + 0.08 * hash1(fi * 3.1));
+        float rx = (50.0 + 45.0 * hash1(fi * 5.7)) * s;
+        float ry = rx * (0.55 + 0.2 * hash1(fi * 9.3));
+        float cy = sandTop(cx, H) + ry * 0.35;
+        float dx = (px - cx) / rx, dy = (py - cy) / ry;
+        // lumpy outline
+        float ang = atan(dy, dx);
+        float lump = 1.0 + 0.08 * sin(ang * 3.0 + fi) + 0.05 * sin(ang * 7.0 + fi * 2.0);
+        float e = sqrt(dx * dx + dy * dy) / lump;
+        if (e < 1.0 && py < sandTop(px, H) + ry * 0.2) {
+            float light = 0.45 + 0.55 * clampf(-dy * 0.8 + 0.3 - dx * 0.2, 0.0, 1.0);
+            float tex = 0.85 + 0.15 * hash2(floor(px / (3.0 * s)), floor(py / (3.0 * s)));
+            vec3 rock = hsv(0.58 + 0.05 * fi, 0.12, 0.55) * (light * tex);
+            rock = mix(rock, water, 0.25);
+            float edge = (1.0 - e) * min(rx, ry);
+            col = mix(col, rock, clampf(edge, 0.0, 1.0));
+        }
+    }
+    return col;
+}
+
+vec3 drawWeed(vec3 col, float px, float py, float W, float H, float s, float t, vec3 water, bool backLayer) {
+    for (int i = 0; i < N_WEED; i++) {
+        bool isBack = (i % 3) == 0;
+        if (isBack != backLayer) continue;
+        float fi = float(i);
+        float bx = W * (0.04 + 0.92 * hash1(fi * 17.3 + 2.0));
+        float base = sandTop(bx, H) + 6.0 * s;
+        float height = H * (0.22 + 0.30 * hash1(fi * 4.1));
+        float topY = base - height;
+        if (py < topY - 2.0 || py > base) continue;
+        float f = (base - py) / height;
+        float sway = sin(t * 0.8 + fi * 1.7 + f * 2.6) * f * f * 34.0 * s
+                   + sin(t * 1.9 + fi + f * 6.0) * f * 4.0 * s;
+        float cx = bx + sway;
+        float w = (8.0 - 5.5 * f) * s * (0.85 + 0.25 * sin(f * 24.0 + fi));
+        float d = abs(px - cx);
+        if (d < w + 1.0) {
+            float shade = 0.55 + 0.45 * (1.0 - d / w);
+            vec3 g = hsv(0.27 + 0.08 * hash1(fi * 2.3), 0.70, 0.55 + 0.2 * f) * shade;
+            g += vec3(0.2, 0.3, 0.1) * (0.15 * sin(py * 0.25));
+            if (isBack) g = mix(g, water, 0.55);
+            col = mix(col, g, smoothf(w + 1.0, w - 0.5, d));
+        }
+    }
+    return col;
+}
+
+// ---------------------------------------------------------------- fish
+vec3 drawFish(vec3 col, float px, float py, int idx, float s, vec3 water) {
+    int o = idx * 8;
+    float fx = fishb.f[o], fy = fishb.f[o + 1], face = fishb.f[o + 2], rot = fishb.f[o + 3];
+    float size = fishb.f[o + 4], hue = fishb.f[o + 5], phase = fishb.f[o + 6], z = fishb.f[o + 7];
+    float sz = size * s * (1.0 - 0.35 * z);
+    float dx = px - fx, dy = py - fy;
+    if (abs(dx) > sz * 0.8 || abs(dy) > sz * 0.8) return col;
+
+    float cr = cos(rot), sr = sin(rot);
+    float lx = dx * cr + dy * sr;
+    float ly = -dx * sr + dy * cr;
+    float fc = (abs(face) < 0.12) ? (face < 0.0 ? -0.12 : 0.12) : face;
+    float X = lx / fc / sz;
+    float Y = ly / sz;
+    // tail wag, stronger toward the back
+    Y -= sin(phase - X * 4.0) * 0.055 * clampf(0.45 - X, 0.0, 1.2);
+
+    float px1 = 1.0 / (sz * abs(fc));     // ~ one pixel in local X units
+    int pattern = int(hash1(hue * 97.0) * 3.0);
+    vec3 base = hsv(hue, 0.78, 0.95);
+    vec3 finc = hsv(hue + 0.03, 0.55, 0.90);
+    float alpha = 0.0;
+    vec3 c = base;
+
+    // tail (forked)
+    if (X < -0.33 && X > -0.66) {
+        float th = 0.04 + (-0.33 - X) * 1.05;
+        float notch = max(0.0, (-0.52 - X) * 1.1);
+        float ay = abs(Y);
+        if (ay < th && ay >= notch) {
+            float streak = 0.80 + 0.20 * sin(Y * 70.0);
+            c = finc * streak;
+            alpha = 0.85 * smoothf(th, th - 0.02, ay);
+        }
+    }
+    // dorsal fin
+    float ys = 0.18 * sqrt(max(0.0, 1.0 - (X / 0.43) * (X / 0.43)));
+    {
+        float fw = 0.20;
+        float xf = X + 0.02;
+        if (abs(xf) < fw) {
+            float topY = -ys - 0.13 * (1.0 - abs(xf) / fw) * (1.0 - 0.4 * (xf / fw));
+            if (Y < -ys * 0.8 && Y > topY) {
+                c = finc * (0.85 + 0.15 * sin(X * 80.0));
+                alpha = 0.85;
+            }
+        }
+        // small belly fin
+        float xb = X + 0.05;
+        if (abs(xb) < 0.09) {
+            float botY = ys + 0.07 * (1.0 - abs(xb) / 0.09);
+            if (Y > ys * 0.8 && Y < botY) { c = finc * 0.9; alpha = 0.8; }
+        }
+    }
+    // body
+    float bh = 0.18 + 0.03 * X;
+    float e = (X / 0.43) * (X / 0.43) + (Y / bh) * (Y / bh);
+    if (e < 1.0) {
+        float shade = 0.62 + 0.48 * clampf(Y / bh * 0.5 + 0.5, 0.0, 1.0);
+        vec3 b = base * shade;
+        if (pattern == 1) {
+            // white bands, clownfish-ish
+            float band = abs(sin((X + 0.05) * 11.0));
+            if (band < 0.22) b = mix(b, vec3(0.95), 0.9);
+        } else if (pattern == 2) {
+            // dark spots
+            float sp = hash2(floor(X * 14.0), floor(Y * 14.0));
+            float cxs = (floor(X * 14.0) + 0.5) / 14.0, cys = (floor(Y * 14.0) + 0.5) / 14.0;
+            float ds = sqrt((X - cxs) * (X - cxs) + (Y - cys) * (Y - cys));
+            if (sp > 0.6 && ds < 0.025) b *= 0.35;
+        }
+        // belly highlight and scale shimmer
+        b += vec3(0.10 * smoothf(0.3, 1.0, Y / bh));
+        b += vec3(0.025 * sin(X * 60.0 + phase) * sin(Y * 60.0));
+        float edgeDist = (1.0 - sqrt(e)) * 0.17;   // in local units
+        float a = clampf(edgeDist / px1 + 0.3, 0.0, 1.0);
+        c = mix(c, b, alpha > 0.0 ? a : 1.0);
+        alpha = max(alpha, a);
+
+        // pectoral fin, flapping
+        float pfx = X - 0.10, pfy = Y - 0.05;
+        float flap = 0.75 + 0.25 * sin(phase * 1.7);
+        float pe = (pfx / 0.09) * (pfx / 0.09) + (pfy / (0.035 * flap)) * (pfy / (0.035 * flap));
+        if (pe < 1.0) c = mix(c, finc * 1.1, 0.5);
+
+        // gill line
+        if (abs(X - 0.20 + Y * Y * 3.0) < 0.008 && abs(Y) < bh * 0.7) c *= 0.75;
+
+        // eye
+        float ex = X - 0.29, ey = Y + 0.035;
+        float ed = sqrt(ex * ex + ey * ey);
+        if (ed < 0.045) {
+            vec3 eye = vec3(0.95, 0.95, 0.9);
+            if (ed < 0.027) eye = vec3(0.02, 0.02, 0.03);
+            float hx = ex + 0.010, hy = ey + 0.010;
+            if (sqrt(hx * hx + hy * hy) < 0.009) eye = vec3(1.0);
+            c = mix(c, eye, smoothf(0.045, 0.045 - px1, ed));
+        }
+    }
+    if (alpha <= 0.0) return col;
+    c = mix(c, water, z * 0.55);   // depth haze
+    return mix(col, c, alpha);
+}
+
+// ---------------------------------------------------------------- bubbles / food
+vec3 drawBubble(vec3 col, float px, float py, int idx) {
+    int o = idx * 3;
+    float r = bubb.f[o + 2];
+    float dx = px - bubb.f[o], dy = py - bubb.f[o + 1];
+    if (abs(dx) > r + 2.0 || abs(dy) > r + 2.0) return col;
+    float d = sqrt(dx * dx + dy * dy);
+    if (d > r + 1.0) return col;
+    float ring = smoothf(r - 2.0, r - 0.3, d) * smoothf(r + 1.0, r, d);
+    col += vec3(0.75, 0.9, 1.0) * 0.06;
+    col = mix(col, vec3(0.85, 0.95, 1.0), ring * 0.65);
+    float hx = dx + r * 0.35, hy = dy + r * 0.35;
+    float hd = sqrt(hx * hx + hy * hy);
+    col = mix(col, vec3(1.0), smoothf(r * 0.28, r * 0.10, hd) * 0.85);
+    return col;
+}
+
+vec3 drawFood(vec3 col, float px, float py, int idx, float s) {
+    int o = idx * 2;
+    float r = 4.5 * s;
+    float dx = px - foodb.f[o], dy = py - foodb.f[o + 1];
+    if (abs(dx) > r + 1.0 || abs(dy) > r + 1.0) return col;
+    float d = sqrt(dx * dx + dy * dy * 1.6);
+    vec3 f = vec3(0.78, 0.45, 0.18) * (0.8 + 0.3 * (1.0 - d / r));
+    return mix(col, f, smoothf(r, r - 1.0, d));
+}
+
+// ---------------------------------------------------------------- per-pixel
+void main() {
+    int ix = int(gl_GlobalInvocationID.x);
+    int iy = int(gl_GlobalInvocationID.y);
+    if (ix >= pc.W || iy >= pc.H) return;
+
+    float px = float(ix) + 0.5, py = float(iy) + 0.5;
+    float fW = float(pc.W), fH = float(pc.H);
+    float s = fH / 720.0;
+    float t = pc.t;
+
+    vec3 water = waterColor(px, py, fW, fH, s, t);
+    vec3 col = water;
+    col = drawWeed(col, px, py, fW, fH, s, t, water, true);
+    col = drawSand(col, px, py, fW, fH, s, t, water);
+    col = drawRocks(col, px, py, fW, fH, s, water);
+    col = drawWeed(col, px, py, fW, fH, s, t, water, false);
+    for (int i = 0; i < pc.nfd; i++) col = drawFood(col, px, py, i, s);
+    for (int i = 0; i < pc.nf;  i++) col = drawFish(col, px, py, i, s, water);
+    for (int i = 0; i < pc.nb;  i++) col = drawBubble(col, px, py, i);
+
+    // wavy surface line at the top
+    float surf = fH * 0.025 + sin(px * 0.018 + t * 1.4) * 2.5 * s + sin(px * 0.047 - t * 2.1) * 1.2 * s;
+    if (py < surf + 2.0) {
+        float a = smoothf(surf + 2.0, surf - 1.0, py);
+        col = mix(col, vec3(0.55, 0.82, 0.92), a * 0.6);
+        if (abs(py - surf) < 1.2) col += vec3(0.25, 0.3, 0.3);
+    }
+    // vignette / glass
+    float u = px / fW - 0.5, v = py / fH - 0.5;
+    col *= 1.0 - 0.55 * (u * u + v * v);
+
+    uint R  = uint(clampf(col.r, 0.0, 1.0) * 255.0 + 0.5);
+    uint G  = uint(clampf(col.g, 0.0, 1.0) * 255.0 + 0.5);
+    uint Bc = uint(clampf(col.b, 0.0, 1.0) * 255.0 + 0.5);
+    outb.px[iy * pc.W + ix] = 0xFF000000u | (R << 16) | (G << 8) | Bc;
+}

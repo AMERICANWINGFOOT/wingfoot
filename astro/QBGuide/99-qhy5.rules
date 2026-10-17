@@ -1,0 +1,6 @@
+# Original QHY5 guide camera (16c0:296d) - lets QBGuide use it without sudo.
+# Install once:
+#   sudo cp ~/Desktop/astro/QBGuide/99-qhy5.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+# then unplug and replug the camera.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="296d", MODE="0666"

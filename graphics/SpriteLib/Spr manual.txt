@@ -1,0 +1,669 @@
+# SPR — 2D Sprite Helper for QB64-PE 4.5.0
+
+**User Manual**
+
+A companion to `W3` (wireframe) and `OBJ3` (model display) in the QB64Starter toolkit.
+
+---
+
+## Contents
+
+1. [What SPR is](#1-what-spr-is)
+2. [Quick start](#2-quick-start)
+3. [Core concepts](#3-core-concepts)
+4. [API reference](#4-api-reference)
+5. [Recipes](#5-recipes)
+6. [Gotchas](#6-gotchas)
+7. [Constants](#7-constants)
+
+---
+
+## 1. What SPR is
+
+SPR manages sprite sheets and sprites for a frame-redraw game loop. You load a sheet, it
+cuts every cell into a cached image once, and from then on drawing costs a `_PutImage`
+(or two `_MapTriangle` calls when rotated). Nothing is allocated per frame.
+
+Design decisions worth knowing up front, because they differ from the 2011 Ritchie library
+this grew out of:
+
+| | SPR | Ritchie 2011 |
+|---|---|---|
+| Redraw model | `Cls`, draw everything, `_Display` | background save/restore per sprite |
+| Cell numbering | zero based, `0 .. count-1` | one based |
+| Errors | never halt; return 0 / no-op, `SPRError$` explains | — |
+| Stale handles | generation counter, fails cleanly | — |
+| Pixel collision | inverse-transforms screen points into cell space, so rotation and scale work with no temp images | — |
+| Namespace | everything prefixed `SPR` | — |
+
+**Angles are degrees, 0 = up (north), increasing clockwise.**
+
+---
+
+## 2. Quick start
+
+Include `SPR.bi` at the top of your program and `SPR.bm` at the bottom, using the include
+metacommand. Call `SPRInit` once, after your screen is set up.
+
+```basic
+Option _Explicit
+
+'$Include:'SPR.bi'
+
+Dim sheet&, guy&
+Dim lastT#, nowT#, dt!
+
+Screen _NewImage(800, 600, 32)
+SPRInit
+
+sheet& = SPRSheetLoad&("hero.png", 32, 32)
+If sheet& = SPR_NOHANDLE Then Print SPRError$: End
+
+guy& = SPRNew&(sheet&, 0)
+SPRMove guy&, 400, 300
+SPRAnimSet guy&, 0, 7, 12, SPR_FORWARD
+SPRAnimOn guy&
+
+lastT# = Timer(.001)
+Do
+    nowT# = Timer(.001)
+    dt! = nowT# - lastT#
+    If dt! < 0 Then dt! = 0
+    lastT# = nowT#
+
+    SPRUpdate dt!
+
+    Cls
+    SPRDrawAll
+    _Display
+    _Limit 60
+Loop Until _KeyHit = 27
+
+SPRReset
+System
+
+'$Include:'SPR.bm'
+```
+
+That is the whole shape of an SPR program: advance time, clear, draw, display.
+
+> **Note.** Write those two include lines only as live code. QB64-PE's preprocessor scans
+> for the pattern line by line and will execute it even from inside a comment.
+
+---
+
+## 3. Core concepts
+
+### Handles
+
+`SPRSheetLoad&`, `SPRSheetFromImage&`, `SPRNew&` and `SPRClone&` all return a `Long`
+handle. A handle encodes a pool index in its low bits plus a generation counter, so a
+handle you kept after freeing its sprite fails cleanly rather than addressing whatever got
+recycled into that slot.
+
+A failed call returns `SPR_NOHANDLE` (0). Test for it. Every function that can fail also
+leaves an explanation in `SPRError$`.
+
+Pool ceilings: 32 sheets, 1023 sprites, 8192 cached cells across all sheets. The sprite
+ceiling is structural — the handle encoding reserves 1024 values per generation — so raising
+`SPR_MAXSPRITE` past 1023 will corrupt handles. `SPR_MAXSHEET` and `SPR_MAXCELL` are free to
+raise.
+
+### Sheets and cells
+
+A sheet is a source image plus a uniform grid. `cols = imageWidth \ cellW`,
+`rows = imageHeight \ cellH`; any leftover pixels on the right or bottom edge are ignored.
+Cells are numbered row-major from zero:
+
+```
+sheet 4 columns wide:
+
+    0   1   2   3
+    4   5   6   7
+    8   9  10  11
+```
+
+`SPRSheetLoad&` opens the file with `_LoadImage(file, 32)`, so a PNG's own alpha channel
+comes through. You do not need `_ClearColor`, and you should not call it — SPR relies on
+real alpha for both drawing and pixel collision.
+
+### Origin
+
+Each sprite has a normalized origin: `0,0` is the cell's top-left, `.5,.5` its center
+(the default), `1,1` its bottom-right. The sprite's `x,y` is always that point, and
+rotation and scale both pivot around it.
+
+### Layers
+
+Layers run `0 .. 63`, drawn low to high. `SPRSetLayer` clamps into that range.
+`SPRDrawAll` walks layers in order; inside a layer, lower pool index — effectively creation
+order — draws first.
+
+**Layers also gate collision.** Two sprites on different layers never register a hit. This
+is deliberate (it keeps HUD sprites from colliding with gameplay) but it is the single
+easiest thing to trip over. See [Gotchas](#6-gotchas).
+
+### The error model
+
+Nothing in SPR halts your program. Functions return 0, subs quietly do nothing, and the
+reason lands in `SPRError$`.
+
+`SPRError$` **clears the message as it reads it.** Capture it once:
+
+```basic
+Dim e$
+e$ = SPRError$
+If Len(e$) Then Print e$
+```
+
+Calling `SPRError$` twice gives you the message and then an empty string.
+
+---
+
+## 4. API reference
+
+### 4.1 Housekeeping
+
+| Call | Returns | Notes |
+|---|---|---|
+| `SPRInit` | — | Clears all pools. Call once after your screen exists. Sheet loads fail until you do. |
+| `SPRReset` | — | Frees every sheet and drops every sprite. Leaves SPR initialized and ready to reuse. |
+| `SPRError$` | `String` | Last error message. **Self-consuming** — reading clears it. Empty when no error is pending. |
+| `SPRCount%` | `Integer` | How many sprites are currently live. |
+
+### 4.2 Sheets
+
+```basic
+Function SPRSheetLoad&      (fileName$, cellW%, cellH%)
+Function SPRSheetFromImage& (img&, cellW%, cellH%, adopt%)
+Sub      SPRSheetFree       (sheet&)
+Function SPRSheetCells%     (sheet&)
+Function SPRSheetCellW%     (sheet&)
+Function SPRSheetCellH%     (sheet&)
+Function SPRSheetCols%      (sheet&)
+Function SPRSheetImage&     (sheet&)
+```
+
+**`SPRSheetLoad&`** — loads from disk with 32-bit alpha, cuts and caches every cell, returns
+a sheet handle. Returns `SPR_NOHANDLE` if `SPRInit` was never called, the file does not
+exist, or the image will not decode. The sheet owns the loaded image and frees it on
+`SPRSheetFree`.
+
+**`SPRSheetFromImage&`** — same, from an image handle you already have. `adopt% = -1` hands
+ownership to the sheet (it frees the image with the sheet); `adopt% = 0` keeps ownership
+yours. Fails if the cell size is below 1×1, the image handle is invalid, or the image is
+smaller than a single cell.
+
+**`SPRSheetFree`** — frees the sheet's cached cells, frees the source image if adopted, and
+**silently drops every sprite still using that sheet**. Handles to those sprites become
+invalid.
+
+The queries all return 0 for a bad handle.
+
+### 4.3 Creating sprites
+
+```basic
+Function SPRNew&   (sheet&, cell%)
+Function SPRClone& (handle&)
+Sub      SPRFree   (handle&)
+Function SPRValid% (handle&)
+```
+
+**`SPRNew&`** fails if the sheet handle is bad, `cell%` is outside `0 .. cellCount-1`, or the
+sprite pool is full. A new sprite starts as:
+
+| Property | Default |
+|---|---|
+| position, velocity | `0,0`, `0,0` |
+| visible | on |
+| layer | 0 |
+| flip | `SPR_NOFLIP` |
+| scale | `1, 1` |
+| angle | 0 |
+| origin | `.5, .5` (center) |
+| animation | off, `SPR_FORWARD`, range `cell..cell`, 10 cells/sec |
+| detection | `SPR_NODETECT` |
+| user values | `0`, `0` |
+
+**`SPRClone&`** duplicates every field including position and animation state — the copy
+lands exactly on top of the original. Move it before you draw.
+
+**`SPRValid%`** returns `-1` for a live handle, `0` otherwise. Useful after a
+`SPRSheetFree`, or when holding handles across a level change.
+
+### 4.4 Position and motion
+
+```basic
+Sub      SPRMove      (handle&, x!, y!)
+Sub      SPRMoveBy    (handle&, dx!, dy!)
+Sub      SPRSetVel    (handle&, vx!, vy!)
+Sub      SPRSetOrigin (handle&, ox!, oy!)
+Function SPRX!        (handle&)
+Function SPRY!        (handle&)
+Function SPRVX!       (handle&)
+Function SPRVY!       (handle&)
+```
+
+Velocity is in **pixels per second** and is applied by `SPRUpdate`, not by anything else.
+If you never call `SPRUpdate`, velocity does nothing.
+
+### 4.5 Appearance
+
+```basic
+Sub      SPRSetCell  (handle&, cell%)
+Sub      SPRSetAngle (handle&, degrees!)
+Sub      SPRTurn     (handle&, degrees!)
+Sub      SPRSetZoom  (handle&, percent!)
+Sub      SPRSetScale (handle&, sx!, sy!)
+Sub      SPRSetFlip  (handle&, mode%)
+Sub      SPRSetLayer (handle&, layer%)
+Sub      SPRShow     (handle&)
+Sub      SPRHide     (handle&)
+Function SPRCellOf%  (handle&)
+Function SPRAngleOf! (handle&)
+Function SPRVisible% (handle&)
+Function SPRLayerOf% (handle&)
+```
+
+- **`SPRSetAngle` / `SPRTurn`** normalize into `0 .. 359.99`. `SPRTurn` is relative.
+- **`SPRSetZoom`** takes a **percentage** — `100` is native size, `50` is half, `200` is
+  double. Must be greater than zero.
+- **`SPRSetScale`** takes **multipliers** and allows different values per axis. Neither may
+  be zero. Use `SPRSetFlip` rather than negative scale for mirroring; flip is handled
+  correctly in both the axis-aligned and rotated draw paths, and in pixel collision.
+- **`SPRSetFlip`** takes `SPR_NOFLIP`, `SPR_FLIPH`, `SPR_FLIPV`, or `SPR_FLIPHV`. Anything
+  else is rejected with an error.
+- **`SPRSetLayer`** clamps to `0 .. SPR_MAXLAYER` (63).
+- **`SPRHide`** removes the sprite from `SPRDraw`, `SPRDrawAll`, `SPRPut`, collision, and
+  `SPRMouseOver%`. It does **not** stop `SPRUpdate` from moving or animating it, and it does
+  not stop `SPRStamp`.
+
+### 4.6 Animation
+
+```basic
+Sub      SPRAnimSet  (handle&, startCell%, endCell%, cellsPerSec!, style%)
+Sub      SPRAnimOn   (handle&)
+Sub      SPRAnimOff  (handle&)
+Function SPRAnimDone% (handle&)
+Sub      SPRAnimNext (handle&)
+Sub      SPRAnimPrev (handle&)
+```
+
+**`SPRAnimSet`** defines the loop. If `endCell%` is below `startCell%` the two are swapped,
+so you cannot accidentally define an empty range by ordering. The range must fall inside the
+sheet or the call is rejected. Setting a range also resets the accumulator, clears the done
+flag, resets direction to forward, and jumps the current cell to the start of the range
+(the *end* of it for `SPR_BACKWARD`).
+
+`cellsPerSec!` is frames per second of animation, independent of your render rate — but only
+when you drive with `SPRUpdate`. Under `SPRPut` it is ignored (see below).
+
+**Styles:**
+
+| Style | Behavior |
+|---|---|
+| `SPR_FORWARD` | start → end, wrap to start |
+| `SPR_BACKWARD` | end → start, wrap to end |
+| `SPR_PINGPONG` | start → end → start, bouncing |
+| `SPR_ONCE` | start → end, then stops and sets the done flag |
+
+**`SPRAnimDone%`** returns `-1` only after an `SPR_ONCE` sequence reaches its last cell. It
+also switches `animOn` off at that moment. `SPRAnimOn` clears the flag, so re-triggering a
+one-shot is just `SPRAnimSet` (or `SPRAnimOn` again).
+
+**`SPRAnimNext` / `SPRAnimPrev`** step one cell manually, honoring the current style. They
+work whether or not animation is switched on — handy for a paused walk cycle or a
+frame-by-frame debug key.
+
+### 4.7 The frame step
+
+```basic
+Sub SPRUpdate (dt!)
+```
+
+**`SPRUpdate` is global, not per-sprite.** One call per frame advances every live sprite:
+velocity is integrated, and any sprite with animation on accumulates `dt! * cellsPerSec`
+and steps as many cells as that earns. Pass elapsed seconds since your previous call.
+
+A guard caps the work at 64 animation steps per sprite per call, so a long stall (a
+breakpoint, a blocking file dialog) will not spin.
+
+### 4.8 Drawing
+
+```basic
+Sub SPRDraw    (handle&)
+Sub SPRDrawAll ()
+Sub SPRStamp   (handle&, x!, y!)
+Sub SPRPut     (handle&, x!, y!)
+```
+
+| Call | Moves the sprite? | Steps animation? | Respects hidden? | Layer ordered? |
+|---|---|---|---|---|
+| `SPRDraw` | no | no | yes | n/a |
+| `SPRDrawAll` | no | no | yes | **yes** |
+| `SPRStamp` | no | no | **no** | n/a |
+| `SPRPut` | **yes** | **yes, one cell** | yes | n/a |
+
+**`SPRDrawAll`** is the normal path — it scans for the lowest and highest layer in use and
+walks only that span, so unused layers cost nothing.
+
+**`SPRStamp`** draws at an arbitrary point without touching the sprite's own position, and
+ignores the hidden flag. It is how you build a HUD from one sprite, tile a background, or
+stamp scenery. Its bounding box is not updated, so do not follow a stamp with a collision
+test and expect the stamped position to matter.
+
+**`SPRPut`** moves, then advances animation by exactly **one cell** if animation is on, then
+draws. It is the frame-driven alternative to `SPRUpdate` and the reason a straight port from
+a `PUT`-style loop works with no restructuring. Because it steps per rendered frame, the
+`cellsPerSec!` you gave `SPRAnimSet` does not apply — the animation runs at your frame rate.
+
+Rendering picks its own path: at angle 0 it is a single `_PutImage` with the source rect
+corner-swapped for flips; at any other angle it is a `_MapTriangle` pair against the cached
+cell. There is no temporary image either way.
+
+### 4.9 Bounds
+
+```basic
+Function SPRLeft%   (handle&)
+Function SPRTop%    (handle&)
+Function SPRRight%  (handle&)
+Function SPRBottom% (handle&)
+Function SPRWidth%  (handle&)
+Function SPRHeight% (handle&)
+```
+
+Screen-space axis-aligned bounding box **after** flip, scale and rotation. Recomputed
+automatically on move, cell change, angle change, scale change, and origin change. All
+return 0 for a bad handle.
+
+A rotated sprite's box is the box of its rotated corners, so it grows and shrinks as the
+sprite spins — expected, and exactly what the collision broad phase wants.
+
+### 4.10 Collision and spatial queries
+
+```basic
+Sub      SPRSetDetect (handle&, mode%)
+Function SPRHit%      (handleA&, handleB&)
+Function SPRHitAny&   (handle&)
+Function SPRHitList%  (handle&, result&())
+Function SPRDistance! (handleA&, handleB&)
+Function SPRAngleTo!  (handleA&, handleB&)
+Function SPRMouseOver% (handle&)
+```
+
+**Detection is opt-in.** Every sprite starts at `SPR_NODETECT` and never collides until you
+say otherwise.
+
+| Mode | Test |
+|---|---|
+| `SPR_NODETECT` | never collides |
+| `SPR_BOXDETECT` | axis-aligned bounding box only |
+| `SPR_PIXELDETECT` | box first, then per-pixel alpha |
+
+**`SPRHit%`** returns `-1` on overlap. It requires, in order: both handles valid and
+different; neither set to `SPR_NODETECT`; both visible; **both on the same layer**; boxes
+overlapping. Only if **both** sprites are `SPR_PIXELDETECT` does it then walk the overlap
+rectangle testing alpha. One `SPR_BOXDETECT` participant makes the whole test box-only.
+
+The pixel phase inverse-transforms each screen point back through the sprite's rotation,
+scale, flip and origin to find the source pixel, reading alpha straight out of
+`_MemImage`. Rotation and scaling are respected exactly, with no temporary images built.
+
+**`SPRHitAny&`** returns the handle of the first colliding sprite, or `SPR_NOHANDLE`.
+**`SPRHitList%`** fills a caller-dimensioned array with *every* collider and returns the
+count — it does not stop at the first hit. Results past `UBound(result&)` are discarded and
+the returned count is capped at that bound, so size the array for your worst case:
+
+```basic
+Dim hits&(1 To 16)
+Dim n%, i%
+n% = SPRHitList%(bullet&, hits&())
+For i% = 1 To n%
+    ' hits&(i%) collided with bullet&
+Next i%
+```
+
+Both scan the entire sprite pool, so calling `SPRHitList%` for every sprite each frame is
+quadratic. For a few hundred sprites that is fine at 60 FPS; past that, gate by layer or
+pre-filter on distance.
+
+**`SPRDistance!`** is center-to-center in pixels (origin-to-origin, strictly).
+**`SPRAngleTo!`** gives the bearing from A to B in SPR's convention, so it feeds
+`SPRSetAngle` directly:
+
+```basic
+SPRSetAngle turret&, SPRAngleTo!(turret&, target&)
+```
+
+**`SPRMouseOver%`** is a **bounding-box** test against the current `_MouseX`/`_MouseY`,
+returning `-1` when inside. It does not do a pixel test regardless of detect mode, and
+returns 0 for a hidden sprite. Call `_MouseInput` first, as usual.
+
+### 4.11 User values
+
+```basic
+Sub      SPRSetVal  (handle&, value!)
+Sub      SPRSetVal2 (handle&, value!)
+Function SPRVal!    (handle&)
+Function SPRVal2!   (handle&)
+```
+
+Two general-purpose `Single` slots per sprite, untouched by the library. Use them for
+health, an alive flag, a score value, a state enum — whatever saves you a parallel array.
+The Invaders port uses the first as an active/inactive flag.
+
+---
+
+## 5. Recipes
+
+### Load a sheet with real transparency
+
+```basic
+Dim sheet&
+sheet& = SPRSheetLoad&("invaders64x32.png", 16, 8)
+If sheet& = SPR_NOHANDLE Then Print SPRError$: End
+```
+
+The PNG's alpha channel is used as-is. No `_ClearColor`, no magic-pink key colour, and do
+not call `_DontBlend` on anything SPR hands you — the cells are cut with blending off and
+switched back on deliberately, and undoing that makes every transparent pixel draw as
+opaque black.
+
+### A ping-pong walk cycle
+
+```basic
+SPRAnimSet hero&, 0, 3, 8, SPR_PINGPONG
+SPRAnimOn hero&
+' then once per frame:
+SPRUpdate dt!
+```
+
+### A one-shot explosion that cleans itself up
+
+```basic
+Dim boom&
+boom& = SPRNew&(fxSheet&, 0)
+SPRMove boom&, x!, y!
+SPRAnimSet boom&, 0, 11, 20, SPR_ONCE
+SPRAnimOn boom&
+
+' in the frame loop:
+If SPRAnimDone%(boom&) Then
+    SPRFree boom&
+    boom& = SPR_NOHANDLE
+End If
+```
+
+### Pixel-accurate collision between two things
+
+```basic
+SPRSetDetect ship&, SPR_PIXELDETECT
+SPRSetDetect rock&, SPR_PIXELDETECT
+SPRSetLayer ship&, 1
+SPRSetLayer rock&, 1          ' same layer, or they will never register
+
+If SPRHit%(ship&, rock&) Then ...
+```
+
+### A HUD that does not collide with gameplay
+
+```basic
+SPRSetLayer scoreDigit&, 10   ' above the action, and isolated from it
+SPRSetDetect scoreDigit&, SPR_NODETECT
+```
+
+Layer separation alone is enough — gameplay sprites on layer 1 cannot hit anything on
+layer 10 — but leaving HUD sprites at `SPR_NODETECT` also keeps them out of every
+`SPRHitAny&` scan.
+
+### Draw one sprite in many places
+
+```basic
+Dim i%
+For i% = 0 To 9
+    SPRStamp brick&, 40 + i% * 64, 80
+Next i%
+```
+
+### Point a turret and fire along its bearing
+
+```basic
+Dim a!
+a! = SPRAngleTo!(turret&, player&)
+SPRSetAngle turret&, a!
+SPRSetVel shell&, Sin(a! / 57.2957795131) * 300, -Cos(a! / 57.2957795131) * 300
+```
+
+`0 = up, clockwise` means `x` uses sine and `y` uses negative cosine — the reverse of the
+maths convention.
+
+---
+
+## 6. Gotchas
+
+**Different layers never collide.** `SPRHit%` bails on a layer mismatch before it ever looks
+at geometry. If a collision "just doesn't fire" and the boxes clearly overlap, check
+`SPRLayerOf%` on both sprites first — it is the most common cause by a wide margin.
+
+**Detection is off by default.** `SPRNew&` sets `SPR_NODETECT`. A brand-new sprite collides
+with nothing until you call `SPRSetDetect`.
+
+**Pixel detection needs both sides.** One `SPR_BOXDETECT` participant downgrades the whole
+test to boxes. Set both.
+
+**Never mix `SPRPut` and `SPRUpdate` on the same sprite.** Both advance animation, so the
+sprite steps twice per frame. Pick one per sprite; mixing across *different* sprites in the
+same program is fine.
+
+**`SPR_ONCE` on a single-cell range never completes.** The stepper exits immediately when
+the range end is not above its start, so `SPRAnimSet h&, 5, 5, 10, SPR_ONCE` leaves
+`SPRAnimDone%` at 0 forever. Guard any code that waits on the done flag.
+
+**`SPRError$` clears itself.** Read it into a variable once. A `Print SPRError$` followed by
+`If Len(SPRError$)` will always look clean.
+
+**Partial-screen repaints smear.** SPR has no background save/restore. If your loop only
+repaints part of the screen — a play field between two fixed bands, say — then any sprite
+drawn in the untouched region leaves its previous frame behind. Blank those bands yourself
+before drawing into them. This is what the `BlankArea` helper does in the Invaders port.
+
+**`SPRStamp` ignores `SPRHide`.** It is the one draw call that does not check visibility.
+That is intentional for HUD and scenery use, but it means hiding a sprite will not stop a
+stamp loop from drawing it.
+
+**Freeing sheets out of order leaks cell-pool slots.** The cell pool only reclaims space
+when the freed sheet's cells sit on top of the stack. Free sheets in reverse load order, or
+just call `SPRReset` between levels.
+
+**`SPRSheetFree` drops sprites without warning.** Every sprite bound to that sheet is
+silently deactivated. Their handles fail `SPRValid%` afterwards.
+
+**1023 sprites is a hard ceiling.** The handle encoding is `index + generation * 1024`.
+Raising `SPR_MAXSPRITE` past 1023 breaks handle decoding.
+
+**Velocity does nothing without `SPRUpdate`.** `SPRSetVel` only records; the integration
+happens in the frame step.
+
+---
+
+## 7. Constants
+
+**Pool sizes**
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `SPR_MAXSHEET` | 32 | sheets loaded at once |
+| `SPR_MAXSPRITE` | 1023 | live sprites; do not raise |
+| `SPR_MAXCELL` | 8192 | cached cells across all sheets |
+| `SPR_MAXLAYER` | 63 | layers are `0..63`, low drawn first |
+
+**Flip modes** — `SPRSetFlip`
+
+`SPR_NOFLIP` (0), `SPR_FLIPH` (1), `SPR_FLIPV` (2), `SPR_FLIPHV` (3)
+
+**Animation styles** — `SPRAnimSet`
+
+`SPR_FORWARD` (0), `SPR_BACKWARD` (1), `SPR_PINGPONG` (2), `SPR_ONCE` (3)
+
+**Detection modes** — `SPRSetDetect`
+
+`SPR_NODETECT` (0), `SPR_BOXDETECT` (1), `SPR_PIXELDETECT` (2)
+
+**Misc**
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `SPR_NOHANDLE` | 0 | returned by any function that failed |
+| `SPR_HANDLEMASK` | 1023 | low bits of a handle are the pool index |
+
+---
+
+## Appendix — full call list
+
+```
+SPRInit                                             SPRAnimSet   (h, startCell, endCell, cps, style)
+SPRReset                                            SPRAnimOn    (h)
+SPRError$                          -> String        SPRAnimOff   (h)
+SPRCount%                          -> Integer       SPRAnimDone% (h)             -> Integer
+                                                    SPRAnimNext  (h)
+SPRSheetLoad&      (file$, cw, ch) -> Long          SPRAnimPrev  (h)
+SPRSheetFromImage& (img, cw, ch, adopt) -> Long
+SPRSheetFree       (sheet)                          SPRUpdate    (dt)
+SPRSheetCells%     (sheet)         -> Integer       SPRDraw      (h)
+SPRSheetCellW%     (sheet)         -> Integer       SPRDrawAll
+SPRSheetCellH%     (sheet)         -> Integer       SPRStamp     (h, x, y)
+SPRSheetCols%      (sheet)         -> Integer       SPRPut       (h, x, y)
+SPRSheetImage&     (sheet)         -> Long
+                                                    SPRLeft%     (h)             -> Integer
+SPRNew&            (sheet, cell)   -> Long          SPRTop%      (h)             -> Integer
+SPRClone&          (h)             -> Long          SPRRight%    (h)             -> Integer
+SPRFree            (h)                              SPRBottom%   (h)             -> Integer
+SPRValid%          (h)             -> Integer       SPRWidth%    (h)             -> Integer
+                                                    SPRHeight%   (h)             -> Integer
+SPRMove            (h, x, y)
+SPRMoveBy          (h, dx, dy)                      SPRSetDetect (h, mode)
+SPRSetVel          (h, vx, vy)                      SPRHit%      (a, b)          -> Integer
+SPRSetOrigin       (h, ox, oy)                      SPRHitAny&   (h)             -> Long
+SPRX!              (h)             -> Single        SPRHitList%  (h, result&())  -> Integer
+SPRY!              (h)             -> Single        SPRDistance! (a, b)          -> Single
+SPRVX!             (h)             -> Single        SPRAngleTo!  (a, b)          -> Single
+SPRVY!             (h)             -> Single        SPRMouseOver% (h)            -> Integer
+
+SPRSetCell         (h, cell)                        SPRSetVal    (h, value)
+SPRSetAngle        (h, degrees)                     SPRSetVal2   (h, value)
+SPRTurn            (h, degrees)                     SPRVal!      (h)             -> Single
+SPRSetZoom         (h, percent)                     SPRVal2!     (h)             -> Single
+SPRSetScale        (h, sx, sy)
+SPRSetFlip         (h, mode)
+SPRSetLayer        (h, layer)
+SPRShow            (h)
+SPRHide            (h)
+SPRCellOf%         (h)             -> Integer
+SPRAngleOf!        (h)             -> Single
+SPRVisible%        (h)             -> Integer
+SPRLayerOf%        (h)             -> Integer
+```
+
+Anything prefixed `SPRIdx`, `SPRSheetIdx`, `SPRFail`, `SPRBox`, `SPRCorners`, `SPRCellImg`,
+`SPRAlphaAt` or `SPRRender` is internal and takes pool indices rather than handles. Leave
+them alone.

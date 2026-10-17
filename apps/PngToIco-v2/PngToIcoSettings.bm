@@ -1,0 +1,48 @@
+'=======================================================================
+'  PngToIcoSettings.bm  --  Implementation
+'=======================================================================
+
+'--- Restore toggles and paths. Each key defaults to whatever sizeOn()
+'    already holds, so a missing file or a missing key simply leaves the
+'    Standard preset from InitSizes in place - no duplicated default list.
+Sub IcoSettingsLoad
+    Dim i As Integer
+    Dim kname As String
+    Dim dflt As Long
+
+    If MemBufValid%(icoCfg) = 0 Then Exit Sub
+
+    For i = 0 To NSIZES - 1
+        kname = "Size" + _Trim$(Str$(sizeList(i)))
+        If sizeOn(i) Then dflt = 1 Else dflt = 0
+        If IniGetLong&(icoCfg, "Sizes", kname, dflt) Then
+            sizeOn(i) = -1
+        Else
+            sizeOn(i) = 0
+        End If
+    Next i
+
+    lastInPath = IniGet$(icoCfg, "Paths", "LastInput", "")
+    lastOutPath = IniGet$(icoCfg, "Paths", "LastOutput", "")
+End Sub
+
+
+'--- Write current state into the buffer. Caller calls IniSave% to commit.
+Sub IcoSettingsSave
+    Dim i As Integer
+    Dim kname As String
+
+    If MemBufValid%(icoCfg) = 0 Then Exit Sub
+
+    For i = 0 To NSIZES - 1
+        kname = "Size" + _Trim$(Str$(sizeList(i)))
+        If sizeOn(i) Then
+            IniSetLong icoCfg, "Sizes", kname, 1
+        Else
+            IniSetLong icoCfg, "Sizes", kname, 0
+        End If
+    Next i
+
+    IniSet icoCfg, "Paths", "LastInput", lastInPath
+    IniSet icoCfg, "Paths", "LastOutput", lastOutPath
+End Sub

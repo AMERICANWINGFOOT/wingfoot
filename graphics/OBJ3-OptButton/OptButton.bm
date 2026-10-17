@@ -1,0 +1,65 @@
+'=======================================================================
+' OptButton.bm  -  Option (toggle) & Radio button helper (implementation)
+'
+' Reuses ButtonUI's DrawBevel for the body, then stamps a bright accent
+' strip along the top edge to mark the engaged state.  An engaged widget
+' is also drawn sunken (state 2) so it reads as "pressed in / selected".
+'=======================================================================
+
+
+Function OptionButton% (x As Integer, y As Integer, w As Integer, h As Integer, caption As String, state As Integer)
+    Dim over As Integer, st As Integer, oout As Integer
+    over = PtInRect%(gMouse.mx, gMouse.my, x, y, w, h)
+
+    ' visual state: an ON toggle always looks engaged (sunken);
+    ' otherwise it behaves like a plain button (normal / hover / press)
+    If state Then
+        st = 2
+    ElseIf over And gMouse.held Then
+        st = 2
+    ElseIf over Then
+        st = 1
+    Else
+        st = 0
+    End If
+
+    DrawBevel x, y, w, h, caption, st
+
+    ' bright accent along the top edge when ON -- sits above the
+    ' vertically centered caption, so captions never collide with it
+    If state Then Line (x + 3, y + 3)-(x + w - 3, y + 4), uiText, BF
+
+    ' a click toggles.  Written as an explicit 0 / -1 so the result is
+    ' always a clean boolean even if the caller seeded state with 1.
+    oout = state
+    If over And gMouse.clicked Then
+        If state Then oout = 0 Else oout = -1
+    End If
+    OptionButton% = oout
+End Function
+
+
+Function RadioButton% (x As Integer, y As Integer, w As Integer, h As Integer, caption As String, myVal As Integer, curVal As Integer)
+    Dim over As Integer, st As Integer, oout As Integer
+    over = PtInRect%(gMouse.mx, gMouse.my, x, y, w, h)
+
+    ' engaged when this button IS the current selection
+    If curVal = myVal Then
+        st = 2
+    ElseIf over And gMouse.held Then
+        st = 2
+    ElseIf over Then
+        st = 1
+    Else
+        st = 0
+    End If
+
+    DrawBevel x, y, w, h, caption, st
+
+    If curVal = myVal Then Line (x + 3, y + 3)-(x + w - 3, y + 4), uiText, BF
+
+    ' clicking selects this button's value; otherwise selection is unchanged
+    oout = curVal
+    If over And gMouse.clicked Then oout = myVal
+    RadioButton% = oout
+End Function

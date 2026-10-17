@@ -1,0 +1,9 @@
+# Orion StarShoot All-in-One (a QHY5LII-C inside) for QBCap
+# It arrives as 16c0:29a0 and needs QHY5II.HEX loaded each time it is plugged
+# in (fxload); it then comes back as 1618:0921 "QHY5-II", a working camera.
+ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="29a0", RUN+="/sbin/fxload -t fx2 -I /lib/firmware/qhy/QHY5II.HEX -D $env{DEVNAME}"
+# normal-user access to the blank camera too, so QBCap can load the firmware
+# itself (no password) if the line above ever doesn't
+SUBSYSTEM=="usb", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="29a0", MODE="0666"
+# normal-user access to QHY cameras
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1618", MODE="0666"

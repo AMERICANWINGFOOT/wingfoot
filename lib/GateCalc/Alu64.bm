@@ -1,0 +1,231 @@
+' ============================================================
+' Alu64.bm - 64-bit signed arithmetic built only from gates
+' (implementation). Needs Gate.bm.
+' ============================================================
+
+Function Alu64Bit% (v As _Integer64, i As Integer)
+    Dim r As Integer
+    r = ((_ShR(v, i) And 1) <> 0)
+    Alu64Bit% = r
+End Function
+
+' A chain of full adders, one per bit.
+Sub Alu64Add (a As _Integer64, b As _Integer64, cin As Integer, nBits As Integer, sumOut As _Integer64, coutOut As Integer, ovfOut As Integer)
+    Dim i As Integer, abit As Integer, bbit As Integer, sbit As Integer
+    Dim cy As Integer, cyNext As Integer, cyMsb As Integer
+    Dim r As _Integer64
+    r = 0
+    cy = (cin <> 0)
+    cyMsb = cy
+    For i = 0 To nBits - 1
+        abit = Alu64Bit%(a, i)
+        bbit = Alu64Bit%(b, i)
+        cyMsb = cy
+        GateFullAdd abit, bbit, cy, sbit, cyNext
+        If sbit <> 0 Then r = r Or _ShL(1&&, i)
+        cy = cyNext
+    Next
+    sumOut = r
+    coutOut = cy
+    ovfOut = GateEval%(GATE_XOR, cyMsb, cy)
+End Sub
+
+' Subtract = add the inverted b with a carry in of 1.
+Sub Alu64Sub (a As _Integer64, b As _Integer64, nBits As Integer, diffOut As _Integer64, borrowOut As Integer, ovfOut As Integer)
+    Dim nb As _Integer64, cy As Integer
+    nb = Not b
+    Alu64Add a, nb, -1, nBits, diffOut, cy, ovfOut
+    borrowOut = GateEval%(GATE_NOT, cy, 0)
+End Sub
+
+Function Alu64Negate&& (a As _Integer64)
+    Dim zero As _Integer64, r As _Integer64, bo As Integer, ov As Integer
+    zero = 0
+    Alu64Sub zero, a, 64, r, bo, ov
+    Alu64Negate&& = r
+End Function
+
+Function Alu64IsZero% (v As _Integer64)
+    Dim i As Integer, anyBit As Integer, r As Integer
+    anyBit = 0
+    For i = 0 To 63
+        anyBit = GateEval%(GATE_OR, anyBit, Alu64Bit%(v, i))
+    Next
+    r = GateEval%(GATE_NOT, anyBit, 0)
+    Alu64IsZero% = r
+End Function
+
+Function Alu64Mag&& (v As _Integer64)
+    Dim r As _Integer64
+    If Alu64Bit%(v, 63) Then
+        r = Alu64Negate&&(v)
+    Else
+        r = v
+    End If
+    Alu64Mag&& = r
+End Function
+
+' Shift-and-add into a 128-bit result held as two 64-bit words.
+' a sits in a 128-bit shift register (shHi:shLo) that moves left
+' one place per step, the bit leaving the top of shLo entering
+' the bottom of shHi. For each set bit of b the register is
+' added in: the low adder's carry out feeds the high adder's
+' carry in, two 64-bit adders cascaded.
+Sub Alu64MulU (a As _Integer64, b As _Integer64, hiOut As _Integer64, loOut As _Integer64)
+    Dim i As Integer, cy As Integer, cy2 As Integer, ov As Integer
+    Dim hw As _Integer64, lw As _Integer64, t As _Integer64
+    Dim shHi As _Integer64, shLo As _Integer64
+    hw = 0
+    lw = 0
+    shHi = 0
+    shLo = a
+    For i = 0 To 63
+        If Alu64Bit%(b, i) Then
+            Alu64Add lw, shLo, 0, 64, t, cy, ov
+            lw = t
+            Alu64Add hw, shHi, cy, 64, t, cy2, ov
+            hw = t
+        End If
+        shHi = _ShL(shHi, 1)
+        If Alu64Bit%(shLo, 63) Then shHi = shHi Or 1
+        shLo = _ShL(shLo, 1)
+    Next
+    hiOut = hw
+    loOut = lw
+End Sub
+
+' Restoring division, one quotient bit per step: shift the next
+' dividend bit into the partial remainder, trial-subtract d, keep
+' the result if there was no borrow.
+'
+' The partial remainder can reach 2*d - 1, one bit wider than 64.
+' As in Alu32, the bit shifted out of the top (topOut) stands in
+' for the 65th bit: when it is set the true remainder is at
+' least 2^64, always bigger than d, so the subtract is kept even
+' though the 64-bit subtractor reports a borrow - and its 64-bit
+' result is exactly right.
+Sub Alu64DivU (n As _Integer64, d As _Integer64, qOut As _Integer64, rOut As _Integer64)
+    Dim i As Integer, bo As Integer, ov As Integer, topOut As Integer, keep As Integer
+    Dim rmd As _Integer64, t As _Integer64, q As _Integer64
+    rmd = 0
+    q = 0
+    For i = 63 To 0 Step -1
+        topOut = Alu64Bit%(rmd, 63)
+        rmd = _ShL(rmd, 1)
+        If Alu64Bit%(n, i) Then rmd = rmd Or 1
+        Alu64Sub rmd, d, 64, t, bo, ov
+        keep = GateEval%(GATE_OR, topOut, GateEval%(GATE_NOT, bo, 0))
+        If keep Then
+            rmd = t
+            q = q Or _ShL(1&&, i)
+        End If
+    Next
+    qOut = q
+    rOut = rmd
+End Sub
+
+Sub Alu64MulS (a As _Integer64, b As _Integer64, resOut As _Integer64, ovfOut As Integer)
+    Dim sa As Integer, sb As Integer, ng As Integer
+    Dim hiNz As Integer, nz As Integer, sgnBad As Integer
+    Dim ma As _Integer64, mb As _Integer64, hw As _Integer64, lw As _Integer64, r As _Integer64
+    sa = Alu64Bit%(a, 63)
+    sb = Alu64Bit%(b, 63)
+    ma = Alu64Mag&&(a)
+    mb = Alu64Mag&&(b)
+    Alu64MulU ma, mb, hw, lw
+    ng = GateEval%(GATE_XOR, sa, sb)
+    hiNz = GateEval%(GATE_NOT, Alu64IsZero%(hw), 0)
+    If ng Then
+        r = Alu64Negate&&(lw)
+    Else
+        r = lw
+    End If
+    nz = GateEval%(GATE_NOT, Alu64IsZero%(r), 0)
+    sgnBad = GateEval%(GATE_AND, nz, GateEval%(GATE_XOR, Alu64Bit%(r, 63), ng))
+    resOut = r
+    ovfOut = GateEval%(GATE_OR, hiNz, sgnBad)
+End Sub
+
+Sub Alu64DivS (a As _Integer64, b As _Integer64, qOut As _Integer64, rOut As _Integer64, divZero As Integer, ovfOut As Integer)
+    Dim sa As Integer, sb As Integer, qs As Integer, nz As Integer
+    Dim ma As _Integer64, mb As _Integer64, q As _Integer64, rr As _Integer64
+    divZero = Alu64IsZero%(b)
+    qOut = 0
+    rOut = 0
+    ovfOut = 0
+    If divZero Then Exit Sub
+    sa = Alu64Bit%(a, 63)
+    sb = Alu64Bit%(b, 63)
+    ma = Alu64Mag&&(a)
+    mb = Alu64Mag&&(b)
+    Alu64DivU ma, mb, q, rr
+    qs = GateEval%(GATE_XOR, sa, sb)
+    If qs Then q = Alu64Negate&&(q)
+    If sa Then rr = Alu64Negate&&(rr)
+    nz = GateEval%(GATE_NOT, Alu64IsZero%(q), 0)
+    ovfOut = GateEval%(GATE_AND, nz, GateEval%(GATE_XOR, Alu64Bit%(q, 63), qs))
+    qOut = q
+    rOut = rr
+End Sub
+
+' Double dabble into twenty BCD digits held as an array of
+' nibbles. For each input bit from the top: add 3 to any digit
+' that is 5 or more (a 4-bit adder), then shift every digit left
+' one place, passing each digit's bit 3 up into the next digit's
+' bit 0, and bring the input bit in at the bottom.
+Function Alu64Fmt$ (v As _Integer64)
+    Dim dg(0 To 19) As _Integer64
+    Dim mag As _Integer64, nib As _Integer64, tmp As _Integer64, three As _Integer64
+    Dim i As Integer, k As Integer, cy As Integer, ov As Integer, ge5 As Integer
+    Dim b3 As Integer, b2 As Integer, b1 As Integer, b0 As Integer
+    Dim s As String, started As Integer
+    three = 3
+    mag = Alu64Mag&&(v)
+    For i = 63 To 0 Step -1
+        For k = 0 To 19
+            nib = dg(k)
+            b3 = Alu64Bit%(nib, 3)
+            b2 = Alu64Bit%(nib, 2)
+            b1 = Alu64Bit%(nib, 1)
+            b0 = Alu64Bit%(nib, 0)
+            ge5 = GateEval%(GATE_OR, b3, GateEval%(GATE_AND, b2, GateEval%(GATE_OR, b1, b0)))
+            If ge5 Then
+                Alu64Add nib, three, 0, 4, tmp, cy, ov
+                dg(k) = tmp
+            End If
+        Next
+        For k = 19 To 1 Step -1
+            dg(k) = (_ShL(dg(k), 1) And 15) Or (_ShR(dg(k - 1), 3) And 1)
+        Next
+        dg(0) = _ShL(dg(0), 1) And 15
+        If Alu64Bit%(mag, i) Then dg(0) = dg(0) Or 1
+    Next
+    s = ""
+    started = 0
+    For k = 19 To 0 Step -1
+        If dg(k) <> 0 Or started <> 0 Or k = 0 Then
+            s = s + Mid$("0123456789", dg(k) + 1, 1)
+            started = -1
+        End If
+    Next
+    If Alu64Bit%(v, 63) Then s = "-" + s
+    Alu64Fmt$ = s
+End Function
+
+' v * 10 + digit: the 128-bit gate multiply by ten, then the
+' digit is added to the low word with its carry rippled into the
+' high word. The result fits only if the high word is zero and
+' bit 63 of the low word is clear.
+Function Alu64DigitAppend&& (v As _Integer64, digit As Integer, okOut As Integer)
+    Dim ten As _Integer64, hw As _Integer64, lw As _Integer64
+    Dim dd As _Integer64, zero As _Integer64, s As _Integer64, h2 As _Integer64
+    Dim cy As Integer, cy2 As Integer, ov As Integer
+    ten = 10
+    zero = 0
+    Alu64MulU v, ten, hw, lw
+    dd = digit
+    Alu64Add lw, dd, 0, 64, s, cy, ov
+    Alu64Add hw, zero, cy, 64, h2, cy2, ov
+    okOut = GateEval%(GATE_AND, Alu64IsZero%(h2), GateEval%(GATE_NOT, Alu64Bit%(s, 63), 0))
+    Alu64DigitAppend&& = s
+End Function

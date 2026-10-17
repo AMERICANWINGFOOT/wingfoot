@@ -1,0 +1,10 @@
+# ZWO cameras + EFW filter wheel (USB vendor 03c3): allow normal-user access
+SUBSYSTEMS=="usb", ATTR{idVendor}=="03c3", MODE="0666"
+
+# The EFW filter wheel is opened through a hidraw device node, not the plain
+# USB node - without this line EFWOpen fails with "wheel removed" (EFW 4)
+KERNEL=="hidraw*", ATTRS{idVendor}=="03c3", MODE="0666", TAG+="uaccess"
+
+# Raise the USB buffer limit when a ZWO device is plugged in
+# (default 16 MB makes USB3 cameras drop frames at full size)
+ACTION=="add", ATTR{idVendor}=="03c3", RUN+="/bin/sh -c '/bin/echo 1024 >/sys/module/usbcore/parameters/usbfs_memory_mb'"

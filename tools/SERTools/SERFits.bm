@@ -1,0 +1,104 @@
+' ============================================================================
+' SERFits.bm  -  Write a SER frame out as a mono FITS image (for plate solving)
+'
+' Include at the BOTTOM of a program that reads SER:
+'     '$INCLUDE:'SERFits.bm'
+'
+' Plate solvers (StellarSolver / astrometry.net / ASTAP) read FITS, not SER.
+' FITS is simple: a header of 80-char text "cards" packed into 2880-byte blocks,
+' then the raw pixel data. We write an 8-bit mono image -- plenty for the star
+' extractor to detect stars and solve -- gamma-stretched so faint stars show.
+'
+' Notes:
+'   * 8-bit (BITPIX=8) avoids endian and BZERO complications entirely.
+'   * FITS stores the BOTTOM image row first, so rows are written bottom-up.
+'   * Colour input is reduced to luma; mono/raw is used directly.
+'
+'   FitsCard$      - format one 80-char header card
+'   WriteFits      - write the whole FITS file
+' ============================================================================
+
+' --- One raw sample (8/16-bit, endian-aware), by sample index ---
+Function RdSampF& (m As _MEM, sampleIdx As Long, sampleBytes As Long, le As Long)
+    Dim lo As _Unsigned _Byte, hi As _Unsigned _Byte
+    If sampleBytes = 1 Then
+        RdSampF& = _MemGet(m, m.OFFSET + sampleIdx, _Unsigned _Byte)
+    Else
+        lo = _MemGet(m, m.OFFSET + sampleIdx * 2 + 0, _Unsigned _Byte)
+        hi = _MemGet(m, m.OFFSET + sampleIdx * 2 + 1, _Unsigned _Byte)
+        If le <> 0 Then RdSampF& = lo + hi * 256 Else RdSampF& = hi + lo * 256
+    End If
+End Function
+
+' --- Mono/luma value of pixel (x,y) ---
+Function LumaFits& (m As _MEM, x As Long, y As Long, w As Long, planes As Long, sampleBytes As Long, le As Long)
+    Dim pix As Long, a As Long, b As Long, c As Long
+    pix = y * w + x
+    If planes = 3 Then
+        a = RdSampF&(m, pix * 3 + 0, sampleBytes, le)
+        b = RdSampF&(m, pix * 3 + 1, sampleBytes, le)
+        c = RdSampF&(m, pix * 3 + 2, sampleBytes, le)
+        LumaFits& = (a + b + c) \ 3
+    Else
+        LumaFits& = RdSampF&(m, pix, sampleBytes, le)
+    End If
+End Function
+
+' --- Format a fixed-format FITS header card (80 chars) ---
+Function FitsCard$ (kw As String, vall As String, comment As String)
+    Dim c As String
+    c = Left$(kw + Space$(8), 8) + "= " + Right$(Space$(20) + vall, 20)
+    If comment <> "" Then c = c + " / " + comment
+    FitsCard$ = Left$(c + Space$(80), 80)
+End Function
+
+' --- Write an 8-bit mono FITS of one frame ---
+Sub WriteFits (fileName As String, m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, planes As Long)
+    ' --- header (2880-byte block) ---
+    Dim hdr As String
+    hdr = FitsCard$("SIMPLE", "T", "Standard FITS")
+    hdr = hdr + FitsCard$("BITPIX", "8", "8-bit unsigned")
+    hdr = hdr + FitsCard$("NAXIS", "2", "")
+    hdr = hdr + FitsCard$("NAXIS1", _Trim$(Str$(w)), "image width")
+    hdr = hdr + FitsCard$("NAXIS2", _Trim$(Str$(h)), "image height")
+    hdr = hdr + Left$("END" + Space$(80), 80)
+    Dim padH As Long
+    padH = (2880 - (Len(hdr) Mod 2880)) Mod 2880
+    If padH > 0 Then hdr = hdr + Space$(padH)
+
+    ' --- pixel data through a _MEM block: 8-bit, bottom row first, padded ---
+    Dim dbytes As Long, dtot As Long
+    dbytes = w * h
+    dtot = dbytes + ((2880 - (dbytes Mod 2880)) Mod 2880)
+    Dim dm As _MEM
+    dm = _MemNew(dtot)
+    _MemFill dm, dm.OFFSET, dtot, 0 As _Unsigned _Byte ' zero (covers the padding)
+
+    Dim x As Long, y As Long, r As Long, v As Long, g8 As Long, maxs As Long
+    If sampleBytes = 1 Then maxs = 255 Else maxs = 65535
+    For r = 0 To h - 1 ' FITS row r ...
+        y = h - 1 - r ' ... is image row (h-1-r)
+        For x = 0 To w - 1
+            v = LumaFits&(m, x, y, w, planes, sampleBytes, le)
+            g8 = Int(Sqr(v / maxs) * 255)
+            If g8 > 255 Then g8 = 255
+            If g8 < 0 Then g8 = 0
+            _MemPut dm, dm.OFFSET + (r * w + x), g8 As _Unsigned _Byte
+        Next x
+    Next r
+
+    Dim ds As String
+    ds = Space$(dtot)
+    _MemGet dm, dm.OFFSET, ds
+    _MemFree dm
+
+    ' --- write header + data in ONE explicit Put ---
+    Dim fileBytes As String
+    fileBytes = hdr + ds
+    Dim f As Integer
+    If _FileExists(fileName) Then Kill fileName
+    f = FreeFile
+    Open fileName For Binary As #f
+    Put #f, 1, fileBytes
+    Close #f
+End Sub

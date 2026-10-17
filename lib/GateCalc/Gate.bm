@@ -1,0 +1,259 @@
+' ============================================================
+' Gate.bm - logic gate helper for QB64-PE (implementation)
+' Include at the bottom of the program, after Gate.bi is
+' included at the top.
+' ============================================================
+
+' Evaluate any of the eight standard gates. One-input gates
+' (BUF, NOT) ignore b.
+Function GateEval% (gateType As Integer, a As Integer, b As Integer)
+    Dim x As Integer, y As Integer, r As Integer
+    GateEvalCount = GateEvalCount + 1
+    x = (a <> 0)
+    y = (b <> 0)
+    Select Case gateType
+        Case GATE_BUF
+            r = x
+        Case GATE_NOT
+            r = Not x
+        Case GATE_AND
+            r = x And y
+        Case GATE_OR
+            r = x Or y
+        Case GATE_NAND
+            r = Not (x And y)
+        Case GATE_NOR
+            r = Not (x Or y)
+        Case GATE_XOR
+            r = x Xor y
+        Case GATE_XNOR
+            r = Not (x Xor y)
+        Case Else
+            r = 0
+    End Select
+    GateEval% = r
+End Function
+
+' Number of inputs the gate uses (1 or 2).
+Function GateInputs% (gateType As Integer)
+    Dim r As Integer
+    If gateType = GATE_BUF Or gateType = GATE_NOT Then
+        r = 1
+    Else
+        r = 2
+    End If
+    GateInputs% = r
+End Function
+
+Function GateName$ (gateType As Integer)
+    Dim s As String
+    Select Case gateType
+        Case GATE_BUF
+            s = "BUFFER"
+        Case GATE_NOT
+            s = "NOT"
+        Case GATE_AND
+            s = "AND"
+        Case GATE_OR
+            s = "OR"
+        Case GATE_NAND
+            s = "NAND"
+        Case GATE_NOR
+            s = "NOR"
+        Case GATE_XOR
+            s = "XOR"
+        Case GATE_XNOR
+            s = "XNOR"
+        Case Else
+            s = "?"
+    End Select
+    GateName$ = s
+End Function
+
+Function GateExpr$ (gateType As Integer)
+    Dim s As String
+    Select Case gateType
+        Case GATE_BUF
+            s = "Y = A"
+        Case GATE_NOT
+            s = "Y = NOT A"
+        Case GATE_AND
+            s = "Y = A AND B"
+        Case GATE_OR
+            s = "Y = A OR B"
+        Case GATE_NAND
+            s = "Y = NOT (A AND B)"
+        Case GATE_NOR
+            s = "Y = NOT (A OR B)"
+        Case GATE_XOR
+            s = "Y = A XOR B"
+        Case GATE_XNOR
+            s = "Y = NOT (A XOR B)"
+        Case Else
+            s = "?"
+    End Select
+    GateExpr$ = s
+End Function
+
+' One-character display of a logic/bus value: 0, 1, Z or X.
+Function GateBit$ (v As Integer)
+    Dim s As String
+    If v = GATE_Z Then
+        s = "Z"
+    ElseIf v = GATE_X Then
+        s = "X"
+    ElseIf v <> 0 Then
+        s = "1"
+    Else
+        s = "0"
+    End If
+    GateBit$ = s
+End Function
+
+' Compact output row. Two-input gates list Y for AB = 00 01 10 11.
+' One-input gates list Y for A = 0 1.
+Function GateRow$ (gateType As Integer)
+    Dim s As String, a As Integer, b As Integer
+    s = ""
+    If GateInputs%(gateType) = 1 Then
+        For a = 0 To 1
+            s = s + GateBit$(GateEval%(gateType, a, 0)) + "  "
+        Next
+        s = s + "(A = 0, 1)"
+    Else
+        For a = 0 To 1
+            For b = 0 To 1
+                s = s + GateBit$(GateEval%(gateType, a, b)) + "  "
+            Next
+        Next
+    End If
+    GateRow$ = RTrim$(s)
+End Function
+
+' Print a full truth table for one gate at the current cursor.
+Sub GateTable (gateType As Integer)
+    Dim a As Integer, b As Integer
+    Print GateName$(gateType); "   "; GateExpr$(gateType)
+    If GateInputs%(gateType) = 1 Then
+        Print " A  Y"
+        For a = 0 To 1
+            Print " "; GateBit$(a); "  "; GateBit$(GateEval%(gateType, a, 0))
+        Next
+    Else
+        Print " A  B  Y"
+        For a = 0 To 1
+            For b = 0 To 1
+                Print " "; GateBit$(a); "  "; GateBit$(b); "  "; GateBit$(GateEval%(gateType, a, b))
+            Next
+        Next
+    End If
+End Sub
+
+' ------------------------------------------------------------
+' NAND universality: every gate built from NAND alone.
+' ------------------------------------------------------------
+Function GateNand% (a As Integer, b As Integer)
+    Dim r As Integer
+    r = GateEval%(GATE_NAND, a, b)
+    GateNand% = r
+End Function
+
+Function GateFromNand% (gateType As Integer, a As Integer, b As Integer)
+    Dim r As Integer, t As Integer, na As Integer, nb As Integer, u As Integer, v As Integer
+    t = GateNand%(a, b)
+    na = GateNand%(a, a)
+    nb = GateNand%(b, b)
+    Select Case gateType
+        Case GATE_BUF
+            r = GateNand%(na, na)
+        Case GATE_NOT
+            r = na
+        Case GATE_AND
+            r = GateNand%(t, t)
+        Case GATE_OR
+            r = GateNand%(na, nb)
+        Case GATE_NAND
+            r = t
+        Case GATE_NOR
+            u = GateNand%(na, nb)
+            r = GateNand%(u, u)
+        Case GATE_XOR
+            u = GateNand%(a, t)
+            v = GateNand%(b, t)
+            r = GateNand%(u, v)
+        Case GATE_XNOR
+            u = GateNand%(a, t)
+            v = GateNand%(b, t)
+            u = GateNand%(u, v)
+            r = GateNand%(u, u)
+        Case Else
+            r = 0
+    End Select
+    GateFromNand% = r
+End Function
+
+' ------------------------------------------------------------
+' Adders built from the gates above. Outputs are 0 or -1.
+' ------------------------------------------------------------
+Sub GateHalfAdd (a As Integer, b As Integer, sumOut As Integer, carryOut As Integer)
+    sumOut = GateEval%(GATE_XOR, a, b)
+    carryOut = GateEval%(GATE_AND, a, b)
+End Sub
+
+Sub GateFullAdd (a As Integer, b As Integer, cin As Integer, sumOut As Integer, carryOut As Integer)
+    Dim x1 As Integer, c1 As Integer, c2 As Integer
+    x1 = GateEval%(GATE_XOR, a, b)
+    sumOut = GateEval%(GATE_XOR, x1, cin)
+    c1 = GateEval%(GATE_AND, a, b)
+    c2 = GateEval%(GATE_AND, x1, cin)
+    carryOut = GateEval%(GATE_OR, c1, c2)
+End Sub
+
+' ------------------------------------------------------------
+' Tri-state buffer: en = 0 releases the line (GATE_Z), en <> 0
+' passes a through as 0 or -1.
+' ------------------------------------------------------------
+Function GateTri% (a As Integer, en As Integer)
+    Dim r As Integer
+    If en = 0 Then
+        r = GATE_Z
+    Else
+        r = (a <> 0)
+    End If
+    GateTri% = r
+End Function
+
+' Resolve two drivers on one shared line. Z yields to the other
+' driver; two drivers that disagree give GATE_X (contention).
+Function GateBusResolve% (v1 As Integer, v2 As Integer)
+    Dim r As Integer
+    If v1 = GATE_Z Then
+        r = v2
+    ElseIf v2 = GATE_Z Then
+        r = v1
+    ElseIf v1 = GATE_X Or v2 = GATE_X Then
+        r = GATE_X
+    ElseIf v1 = v2 Then
+        r = v1
+    Else
+        r = GATE_X
+    End If
+    GateBusResolve% = r
+End Function
+
+' ------------------------------------------------------------
+' Schmitt-trigger buffer. The caller keeps the returned value
+' and passes it back in as state on the next call:
+'   above hiThr -> -1, below loThr -> 0, in between -> holds.
+' ------------------------------------------------------------
+Function GateSchmitt% (vin As Single, state As Integer, loThr As Single, hiThr As Single)
+    Dim r As Integer
+    If vin >= hiThr Then
+        r = -1
+    ElseIf vin <= loThr Then
+        r = 0
+    Else
+        r = state
+    End If
+    GateSchmitt% = r
+End Function

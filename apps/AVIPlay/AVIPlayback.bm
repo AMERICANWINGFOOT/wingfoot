@@ -1,0 +1,92 @@
+' ============================================================================
+' AVIPlayback.bm  -  Audio-mastered playback loop
+'
+' Include this at the BOTTOM of the main program:
+'     '$INCLUDE:'AVIPlayback.bm'
+'
+' Playback time = (audio queued) - _SndRawLen(handle); the frame that timestamp
+' lands on is the one shown. Audio is the clock, video follows. If there's no
+' audio, a wall-clock timer takes over. ESC or the close button quits.
+' ============================================================================
+
+Sub PlayAVI
+    Dim scr As Long
+    scr = _NewImage(g_vidW, g_vidH, 32)
+    Screen scr
+    _Title "AVI Player  -  " + _Trim$(Str$(g_vidW)) + "x" + _Trim$(Str$(g_vidH)) + " @ " + _Trim$(Str$(Int(g_fps + 0.5))) + "fps"
+    _ScreenMove _Middle
+
+    Dim fimg As Long, mblk As _MEM, s As String
+    fimg = _NewImage(g_vidW, g_vidH, 32)
+    mblk = _MemImage(fimg)
+
+    Dim handle As Long
+    handle = _SndOpenRaw
+
+    Dim hasAudio As Integer
+    hasAudio = (g_audCount > 1)
+
+    Dim audIdx As Long, shownFrame As Long, quitFlag As Integer
+    Dim playT As Single, queuedSec As Single, targetFrame As Long
+    Dim lSamp As Single, rSamp As Single, kk As Long
+    Dim startT As Double
+    audIdx = 1: shownFrame = 0: quitFlag = 0
+    startT = Timer(0.001)
+
+    Do
+        ' Keep ~0.4s of audio queued
+        If hasAudio Then
+            Do While _SndRawLen(handle) < 0.4 And audIdx + g_audChannels - 1 <= g_audCount
+                lSamp = g_aud(audIdx) / 32768.0
+                If g_audChannels >= 2 Then
+                    rSamp = g_aud(audIdx + 1) / 32768.0
+                    audIdx = audIdx + 2
+                Else
+                    rSamp = lSamp
+                    audIdx = audIdx + 1
+                End If
+                _SndRaw lSamp, rSamp, handle
+            Loop
+        End If
+
+        ' Master clock
+        If hasAudio Then
+            queuedSec = ((audIdx - 1) \ g_audChannels) / g_audRate
+            playT = queuedSec - _SndRawLen(handle)
+        Else
+            playT = Timer(0.001) - startT
+        End If
+        If playT < 0 Then playT = 0
+
+        targetFrame = Int(playT * g_fps) + 1
+        If targetFrame > g_frCount Then targetFrame = g_frCount
+        If targetFrame < 1 Then targetFrame = 1
+
+        If targetFrame <> shownFrame Then
+            shownFrame = targetFrame
+            s = Space$(g_frSize(shownFrame))
+            Get #g_fnum, g_frPos(shownFrame), s
+            _MemPut mblk, mblk.OFFSET, s
+            _PutImage (0, 0), fimg
+            _Display
+        End If
+
+        kk = _KeyHit
+        If kk = 27 Then quitFlag = -1
+        If _Exit Then quitFlag = -1
+
+        _Limit 240
+
+        ' Finished when audio has drained and the last frame is up
+        If hasAudio Then
+            If audIdx + g_audChannels - 1 > g_audCount And _SndRawLen(handle) <= 0 And shownFrame >= g_frCount Then quitFlag = -1
+        Else
+            If shownFrame >= g_frCount Then quitFlag = -1
+        End If
+    Loop Until quitFlag
+
+    _SndRawDone handle
+    _SndClose handle
+    _MemFree mblk
+    _FreeImage fimg
+End Sub

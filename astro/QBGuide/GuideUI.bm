@@ -1,0 +1,139 @@
+'=====================================================================
+' GuideUI.bm - QBGuide small immediate-mode UI + settings file
+'=====================================================================
+
+' Call once per loop before drawing any buttons.
+Sub UIPoll
+    Dim b As Long
+    ' catch a press even if the button is released again before the
+    ' next frame (fast clicks), by checking every queued mouse event
+    MClick = 0
+    Do While _MouseInput
+        b = (_MouseButton(1) <> 0)
+        If b <> 0 And MPrev = 0 Then
+            MClick = -1
+            MX = _MouseX: MY = _MouseY
+        End If
+        MPrev = b
+    Loop
+    If MClick = 0 Then MX = _MouseX: MY = _MouseY
+    MDown = MPrev
+    UIKey = InKey$
+End Sub
+
+Function InRect& (x As Long, y As Long, w As Long, h As Long)
+    InRect& = (MX >= x And MX < x + w And MY >= y And MY < y + h)
+End Function
+
+' Draw a button; returns -1 on the frame it is clicked.
+' lit = -1 shows it as "on" (green).
+Function Btn& (x As Long, y As Long, w As Long, h As Long, label As String, lit As Long)
+    Dim c As _Unsigned Long, hov As Long, tx As Long
+    hov = InRect(x, y, w, h)
+    c = C_BTN
+    If hov Then c = C_BTNHI
+    If lit Then c = C_BTNON
+    Line (x, y)-(x + w - 1, y + h - 1), c, BF
+    Line (x, y)-(x + w - 1, y + h - 1), C_GRID, B
+    tx = x + (w - Len(label) * 8) \ 2
+    Color C_TEXT, c
+    _PrintString (tx, y + (h - 16) \ 2), label
+    Color C_TEXT, C_PANEL
+    Btn& = (hov <> 0 And MClick <> 0)
+End Function
+
+' A settings row: label, value and [-] [+]. Returns -1, 0 or +1.
+Function SpinRow& (x As Long, y As Long, label As String, valueText As String)
+    Dim r As Long
+    Color C_DIM, C_PANEL
+    _PrintString (x, y + 2), label
+    Color C_TEXT, C_PANEL
+    _PrintString (x + 150, y + 2), valueText
+    r = 0
+    If Btn(x + 300, y, 36, 20, "-", 0) Then r = -1
+    If Btn(x + 340, y, 36, 20, "+", 0) Then r = 1
+    SpinRow& = r
+End Function
+
+Sub TextAt (x As Long, y As Long, s As String, c As _Unsigned Long)
+    Color c, C_PANEL
+    _PrintString (x, y), s
+End Sub
+
+Function Fmt$ (v As Double, decimals As Long)
+    ' fixed-point text, never scientific notation
+    Dim sc As _Integer64, n As _Integer64, ip As _Integer64, fp As _Integer64
+    Dim s As String, f As String, dd As Long
+    dd = decimals
+    If dd < 0 Then dd = 0
+    If dd > 6 Then dd = 6
+    sc = 10 ^ dd
+    n = Int(Abs(v) * sc + 0.5)
+    ip = n \ sc
+    fp = n Mod sc
+    s = _Trim$(Str$(ip))
+    If dd > 0 Then
+        f = _Trim$(Str$(fp))
+        s = s + "." + Right$(String$(dd, "0") + f, dd)
+    End If
+    If v < 0 And n <> 0 Then s = "-" + s
+    Fmt$ = s
+End Function
+
+'---------------------------------------------------------------------
+' Tiny key=value settings file
+'---------------------------------------------------------------------
+Sub IniLoad (fileName As String)
+    Dim ff As Long, ln As String, eq As Long
+    IniCount = 0
+    If _FileExists(fileName) = 0 Then Exit Sub
+    ff = FreeFile
+    Open fileName For Input As #ff
+    Do While Not EOF(ff)
+        Line Input #ff, ln
+        eq = InStr(ln, "=")
+        If eq > 1 And Left$(ln, 1) <> "#" Then
+            IniSet _Trim$(Left$(ln, eq - 1)), _Trim$(Mid$(ln, eq + 1))
+        End If
+    Loop
+    Close #ff
+End Sub
+
+Sub IniSave (fileName As String)
+    Dim ff As Long, i As Long
+    ff = FreeFile
+    Open fileName For Output As #ff
+    Print #ff, "# QBGuide settings"
+    For i = 1 To IniCount
+        Print #ff, IniK(i); "="; IniV(i)
+    Next
+    Close #ff
+End Sub
+
+Sub IniSet (k As String, v As String)
+    Dim i As Long
+    For i = 1 To IniCount
+        If LCase$(IniK(i)) = LCase$(k) Then IniV(i) = v: Exit Sub
+    Next
+    If IniCount >= UBound(IniK) Then
+        ReDim _Preserve IniK(1 To IniCount + 50) As String
+        ReDim _Preserve IniV(1 To IniCount + 50) As String
+    End If
+    IniCount = IniCount + 1
+    IniK(IniCount) = k
+    IniV(IniCount) = v
+End Sub
+
+Function IniGet$ (k As String, dflt As String)
+    Dim i As Long
+    For i = 1 To IniCount
+        If LCase$(IniK(i)) = LCase$(k) Then IniGet$ = IniV(i): Exit Function
+    Next
+    IniGet$ = dflt
+End Function
+
+Function IniNum# (k As String, dflt As Double)
+    Dim s As String
+    s = IniGet$(k, "")
+    If s = "" Then IniNum# = dflt Else IniNum# = Val(s)
+End Function

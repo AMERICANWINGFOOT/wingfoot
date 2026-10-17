@@ -1,0 +1,132 @@
+// vortex.comp -- VortexVK ray-marched time-vortex tunnel
+// One invocation per pixel. Marches a bent tube whose wall ripples with
+// the music, then shades it with glowing rings, spiral arms and sparkles.
+// Output is packed BGRA (QB64 _RGB32 layout) into a storage buffer.
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) buffer OutBuf { uint px[]; };
+
+layout(push_constant) uniform PC {
+    int   w;
+    int   h;
+    float t;
+    float zpos;
+    float bass;
+    float mids;
+    float treb;
+    float flash;
+    float twist;
+    float level;
+    float pad0;
+    float pad1;
+    vec4  bands[4];
+} pc;
+
+float band(int i) { return pc.bands[i >> 2][i & 3]; }
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+// centre line of the tube: wanders in x/y as it goes deeper
+vec2 path(float z) {
+    return vec2(sin(z * 0.13 + pc.t * 0.31) * 2.2 + sin(z * 0.05) * 1.5,
+                cos(z * 0.10 + pc.t * 0.23) * 1.6);
+}
+
+float radiusAt(float z, vec2 q) {
+    float a = atan(q.y, q.x);
+    return 1.7
+         + 0.13 * sin(5.0 * a + z * 0.7 + pc.t * 1.7 + pc.twist) * (0.35 + pc.bass * 1.6)
+         + 0.06 * sin(z * 2.5 - pc.t * 5.0) * pc.mids;
+}
+
+// distance from an inside point to the wall
+float map(vec3 p) {
+    vec2 q = p.xy - path(p.z);
+    return radiusAt(p.z, q) - length(q);
+}
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if (gid.x >= pc.w || gid.y >= pc.h) return;
+
+    vec2 uv = (vec2(gid) - 0.5 * vec2(pc.w, pc.h)) / float(pc.h);
+    uv.y = -uv.y;
+
+    // camera rides the centre line, looking a little way ahead
+    float z0 = pc.zpos;
+    vec3 ro = vec3(path(z0), z0);
+    vec3 ta = vec3(path(z0 + 4.0), z0 + 4.0);
+    vec3 fw = normalize(ta - ro);
+    float roll = pc.twist * 0.6 + sin(pc.t * 0.3) * 0.3;
+    vec3 upv = vec3(sin(roll), cos(roll), 0.0);
+    vec3 rt = normalize(cross(upv, fw));
+    vec3 up = cross(fw, rt);
+    vec3 rd = normalize(fw * 1.3 + uv.x * rt + uv.y * up);
+
+    float dist = 0.0;
+    bool hit = false;
+    vec3 p = ro;
+    for (int i = 0; i < 128; i++) {
+        p = ro + rd * dist;
+        float d = map(p);
+        if (d < 0.002) { hit = true; break; }
+        dist += d * 0.55;
+        if (dist > 60.0) break;
+    }
+    // grazing rays can run out of steps while hugging the wall; they are
+    // still on the wall, so shade them rather than leaving black slashes
+    if (!hit && dist < 60.0) hit = true;
+
+    vec3 col = vec3(0.0);
+    float fog = exp(-dist * 0.055);
+
+    if (hit) {
+        vec2 q = p.xy - path(p.z);
+        float a = atan(q.y, q.x);
+        float z = p.z;
+
+        // ring slices take their colour from one spectrum band each
+        int bi = int(mod(floor(z * 0.9), 16.0));
+        float e = band(bi);
+        float mixv = clamp(e * e * 1.6, 0.0, 1.0);
+        vec3 base = mix(vec3(0.10, 0.27, 1.0), vec3(1.0, 0.65, 0.22), mixv);
+
+        float rf = fract(z * 0.9);
+        float rdist = min(rf, 1.0 - rf);
+        float ring = exp(-rdist * rdist * 400.0) * (0.5 + e * 2.0);
+
+        float sp = 0.5 + 0.5 * sin(a * 6.0 + z * 0.8 - pc.t * 1.2 + pc.twist * 1.3);
+        float arm = pow(sp, 24.0) * (0.25 + pc.mids * 1.8);
+
+        float sw = 0.5 + 0.5 * sin(a * 3.0 - z * 0.6 + pc.t * 2.0 + sin(z * 0.3 + a * 2.0) * 1.5);
+
+        vec2 sg = vec2(a * 8.0, z * 2.0);
+        vec2 cell = floor(sg);
+        float hv = hash(cell);
+        float dot_ = smoothstep(0.3, 0.0, length(fract(sg) - 0.5));
+        float spark = step(0.985 - pc.treb * 0.05, hv) * dot_ * (0.5 + 0.5 * sin(pc.t * 12.0 + hv * 60.0));
+
+        vec3 n = normalize(vec3(-q, 0.0));
+        float lam = max(dot(n, -rd), 0.0) * 0.6 + 0.4;
+
+        col = base * (0.18 + 0.45 * sw) * lam
+            + base * ring * (1.2 + pc.level * 2.0)
+            + vec3(1.0, 0.75, 0.35) * arm
+            + vec3(0.8, 0.9, 1.0) * spark;
+        col += base * pc.flash * 0.6;
+        col *= fog;
+    }
+
+    // glowing core at the far throat of the tunnel
+    vec3 farp = vec3(path(z0 + 40.0), z0 + 40.0);
+    float cg = max(dot(rd, normalize(farp - ro)), 0.0);
+    col += vec3(0.6, 0.75, 1.0) * pow(cg, 120.0) * (0.4 + pc.bass * 1.5 + pc.flash * 1.5);
+    col += vec3(0.6, 0.7, 1.0) * pc.flash * 0.08;
+
+    col *= 1.0 - 0.35 * dot(uv, uv);
+    col = 1.0 - exp(-col * 1.5);
+
+    uvec3 c = uvec3(clamp(col, 0.0, 1.0) * 255.0 + 0.5);
+    px[gid.y * pc.w + gid.x] = 0xFF000000u | (c.r << 16) | (c.g << 8) | c.b;
+}

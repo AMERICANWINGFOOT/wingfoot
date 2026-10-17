@@ -1,0 +1,211 @@
+'=======================================================================
+'  BRUSH.BM -- the user brush
+'
+'  Replaces the BMOB half of bmob.c plus rot90.c / stretch.c, and is
+'  the thing that turns this from a shape tool into DeluxePaint: you
+'  cut a rectangle out of the picture and then it IS your pen.
+'
+'  Because StampPenM is what every geometry primitive calls, adding a
+'  USERBRUSH path there means lines, circles, ovals and freehand all
+'  paint with the brush without any of them knowing it exists.
+'
+'  The brush is a plain byte array (brPix in GLOBALS.BI), not an image.
+'  Nothing ever blits it whole -- StampBrushM reads it a pixel at a
+'  time and every transform is an array shuffle -- and it used to cost
+'  a _MEMIMAGE/_MEMFREE pair PER STAMP, i.e. per pixel of every line
+'  drawn with a brush pen. Row stride is brW, never SCRW.
+'=======================================================================
+
+'--- capture -----------------------------------------------------------
+'  Rubber-band frame while the button is down. Runs through FlipIt, so
+'  it lands on the overlay and never touches the picture it is
+'  selecting from -- which matters, because a frame burned into hidbm
+'  would be inside the brush you just grabbed.
+Sub DoSelBrFrame
+    Dim bx As Integer, by As Integer, bw As Integer, bh As Integer
+    ConstBoxFromSM bx, by, bw, bh
+    mFrame bx, by, bw, bh
+END SUB
+
+SUB DoSelBr
+    DIM bx AS INTEGER, by AS INTEGER, bw AS INTEGER, bh AS INTEGER
+    DIM x2 AS INTEGER, y2 AS INTEGER
+    DIM ix AS INTEGER, iy AS INTEGER
+    DIM m AS _MEM
+
+    ConstBoxFromSM bx, by, bw, bh
+
+    '  Clip to the canvas: dragging off the edge is normal and must not
+    '  produce a brush full of garbage.
+    x2 = bx + bw: y2 = by + bh
+    IF bx < 0 THEN bx = 0
+    IF by < 0 THEN by = 0
+    IF x2 > SCRW - 1 THEN x2 = SCRW - 1
+    IF y2 > SCRH - 1 THEN y2 = SCRH - 1
+    IF x2 < bx OR y2 < by THEN EXIT SUB
+
+    brW = x2 - bx + 1
+    brH = y2 - by + 1
+
+    m = _MEMIMAGE(hidbm)
+    FOR iy = 0 TO brH - 1
+        FOR ix = 0 TO brW - 1
+            brPix(CLNG(iy) * brW + ix) = _MEMGET(m, _
+                m.OFFSET + CLNG(by + iy) * SCRW + (bx + ix), _UNSIGNED _BYTE)
+        NEXT
+    NEXT
+    _MEMFREE m
+
+    '  Handle at the centre, as DPaint does.
+    brHX = brW \ 2
+    brHY = brH \ 2
+    brValid = -1
+
+    CPChgPen USERBRUSH
+END SUB
+
+'  'B' -- go back to the last brush without re-selecting it.
+SUB UserBr
+    IF brValid THEN CPChgPen USERBRUSH
+END SUB
+
+'--- stamping ----------------------------------------------------------
+'  Transparency is a function of the paint mode, which is what makes
+'  F1/F2 mean something:
+'     Matte   -- background-coloured pixels drop out (the DPaint default)
+'     Color   -- the brush is a stencil; curcol is painted through it
+'     others  -- copy every pixel as-is
+'
+'  This is the hot loop of the whole program: it runs once per pixel of
+'  every primitive drawn with a brush pen. Keep it free of allocation.
+SUB StampBrushM (m AS _MEM, x AS INTEGER, y AS INTEGER)
+    DIM ix AS INTEGER, iy AS INTEGER, c AS INTEGER
+    DIM ro AS LONG, px AS INTEGER, py AS INTEGER
+
+    IF brValid = 0 THEN EXIT SUB
+
+    '  Whole stamp off-canvas: PutPixM would reject every pixel anyway.
+    IF x - brHX >= SCRW OR y - brHY >= SCRH THEN EXIT SUB
+    IF x - brHX + brW < 0 OR y - brHY + brH < 0 THEN EXIT SUB
+
+    FOR iy = 0 TO brH - 1
+        ro = CLNG(iy) * brW
+        py = y - brHY + iy
+        FOR ix = 0 TO brW - 1
+            c = brPix(ro + ix)
+            px = x - brHX + ix
+            SELECT CASE paintMode
+                CASE PM_Matte
+                    IF c <> curbgcol THEN PutPixM m, px, py, c
+                CASE PM_Color
+                    IF c <> curbgcol THEN PutPixM m, px, py, curcol
+                CASE ELSE
+                    PutPixM m, px, py, c
+            END SELECT
+        NEXT
+    NEXT
+END SUB
+
+'--- transforms --------------------------------------------------------
+'  All of these build the result in brTmp and copy back. Working in
+'  place would need a scratch copy anyway, so there is nothing to save
+'  by it -- and brTmp is already allocated, so there is nothing to
+'  allocate or free either.
+
+'  Copy the first n bytes of brTmp back over brPix. Takes the count
+'  explicitly because BrRot90 and BrScale change the dimensions, so
+'  brW * brH is the wrong number at the point it is needed.
+SUB CopyBrTmp (n AS LONG)
+    DIM i AS LONG
+    FOR i = 0 TO n - 1
+        brPix(i) = brTmp(i)
+    NEXT
+END SUB
+
+SUB BrFlipX
+    DIM ix AS INTEGER, iy AS INTEGER
+    DIM ro AS LONG
+    IF brValid = 0 THEN EXIT SUB
+    FOR iy = 0 TO brH - 1
+        ro = CLNG(iy) * brW
+        FOR ix = 0 TO brW - 1
+            brTmp(ro + (brW - 1 - ix)) = brPix(ro + ix)
+        NEXT
+    NEXT
+    CopyBrTmp CLNG(brW) * brH
+    brHX = brW - 1 - brHX
+END SUB
+
+SUB BrFlipY
+    DIM ix AS INTEGER, iy AS INTEGER
+    IF brValid = 0 THEN EXIT SUB
+    FOR iy = 0 TO brH - 1
+        FOR ix = 0 TO brW - 1
+            brTmp(CLNG(brH - 1 - iy) * brW + ix) = brPix(CLNG(iy) * brW + ix)
+        NEXT
+    NEXT
+    CopyBrTmp CLNG(brW) * brH
+    brHY = brH - 1 - brHY
+END SUB
+
+'  Clockwise. Destination is brH wide and brW tall, so the row stride
+'  changes -- that is the whole trick, and the reason it needs its own
+'  sub rather than sharing the flip code.
+SUB BrRot90
+    DIM ix AS INTEGER, iy AS INTEGER, t AS INTEGER
+    DIM nw AS INTEGER, nh AS INTEGER
+    IF brValid = 0 THEN EXIT SUB
+    nw = brH: nh = brW
+    FOR iy = 0 TO brH - 1
+        FOR ix = 0 TO brW - 1
+            brTmp(CLNG(ix) * nw + (brH - 1 - iy)) = brPix(CLNG(iy) * brW + ix)
+        NEXT
+    NEXT
+    CopyBrTmp CLNG(nw) * nh
+    '  The rotation sends (ix,iy) to (brH - 1 - iy, ix), so the new
+    '  handle x is mapped with the OLD height -- which is nw. Do it
+    '  BEFORE the swap below: after it, brH holds the old brW and the
+    '  result is off by brW - brH for any non-square brush.
+    t = brHX
+    brHX = nw - 1 - brHY
+    brHY = t
+    brW = nw: brH = nh
+END SUB
+
+'  Nearest-neighbour resample (stretch.c does this properly with
+'  Bresenham error terms; this is the honest cheap version).
+SUB BrScale (nw AS INTEGER, nh AS INTEGER)
+    DIM ix AS INTEGER, iy AS INTEGER
+    DIM sxp AS INTEGER, syp AS INTEGER
+    DIM w2 AS INTEGER, h2 AS INTEGER
+    IF brValid = 0 THEN EXIT SUB
+
+    '  Clamp rather than bail: BrHalf on a 1-pixel-tall brush asks for
+    '  zero rows, and refusing to halve at all is worse than flooring.
+    w2 = nw: h2 = nh
+    IF w2 < 1 THEN w2 = 1
+    IF h2 < 1 THEN h2 = 1
+    IF w2 > SCRW THEN w2 = SCRW
+    IF h2 > SCRH THEN h2 = SCRH
+
+    FOR iy = 0 TO h2 - 1
+        syp = (CLNG(iy) * brH) \ h2
+        FOR ix = 0 TO w2 - 1
+            sxp = (CLNG(ix) * brW) \ w2
+            brTmp(CLNG(iy) * w2 + ix) = brPix(CLNG(syp) * brW + sxp)
+        NEXT
+    NEXT
+    CopyBrTmp CLNG(w2) * h2
+
+    brHX = (CLNG(brHX) * w2) \ brW
+    brHY = (CLNG(brHY) * h2) \ brH
+    brW = w2: brH = h2
+END SUB
+
+SUB BrHalf
+    BrScale brW \ 2, brH \ 2
+END SUB
+
+SUB BrDubl
+    BrScale brW * 2, brH * 2
+END SUB

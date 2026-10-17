@@ -1,0 +1,385 @@
+'=====================================================================
+' ZWOCam.bm - QBGuide camera helper (code part)
+' One set of calls drives either a real ZWO camera (through
+' libzwoguide.so) or the built-in simulator (index CAM_SIM).
+'=====================================================================
+
+' Seconds since program start, safe across midnight (Timer wraps).
+Function NowSec# ()
+    Static lastT As Double, dayAdd As Double, started As Long
+    Dim tnow As Double
+    tnow = Timer(.001)
+    If started = 0 Then started = -1: lastT = tnow
+    If tnow < lastT - 1 Then dayAdd = dayAdd + 86400#
+    lastT = tnow
+    NowSec# = tnow + dayAdd
+End Function
+
+Function CamCount& ()
+    CamCount& = zg_count
+End Function
+
+' 1 when an original QHY5 is plugged in
+Function QHY5Count& ()
+    QHY5Count& = q5_count
+End Function
+
+' 1 when an Orion StarShoot Autoguider is plugged in
+Function SSAGCount& ()
+    SSAGCount& = sg_count
+End Function
+
+Function CamName$ (idx As Long)
+    Dim buf As String, r As Long, z As Long
+    If idx = CAM_SIM Then CamName$ = "Simulator": Exit Function
+    If idx = CAM_SSAG Then CamName$ = "Orion StarShoot Autoguider": Exit Function
+    If idx = CAM_QHY5 Then CamName$ = "QHY5": Exit Function
+    buf = String$(64, 0)
+    r = zg_name(idx, buf, 64)
+    z = InStr(buf, Chr$(0))
+    If z > 0 Then buf = Left$(buf, z - 1)
+    If r <> 0 Then buf = "(unknown)"
+    CamName$ = buf
+End Function
+
+' Open camera idx (or CAM_SIM). Returns 0 when ok.
+Function CamOpen& (idx As Long, bin As Long)
+    Dim r As Long
+    CamClose
+    Cam.isSim = 0
+    Cam.isSSAG = 0
+    Cam.isQHY5 = 0
+    If idx = CAM_QHY5 Then
+        r = q5_open
+        If r <> 0 Then CamOpen& = r: Exit Function
+        Cam.isQHY5 = -1
+        Cam.camName = "QHY5"
+        Cam.maxW = q5_frame_w: Cam.maxH = q5_frame_h
+        Cam.pixelUm = 5.2
+        Cam.maxBin = 1
+        Cam.hasST4 = -1
+        Cam.gainMin = 0: Cam.gainMax = 100: Cam.gainBest = 80
+        Cam.isOpen = -1
+        r = CamSetBin(1)
+        CamOpen& = 0
+        Exit Function
+    End If
+    If idx = CAM_SSAG Then
+        ' first plug-in: the driver uploads the firmware (takes a few s)
+        r = sg_open
+        If r <> 0 Then CamOpen& = r: Exit Function
+        Cam.isSSAG = -1
+        Cam.camName = "Orion StarShoot Autoguider"
+        Cam.maxW = sg_frame_w: Cam.maxH = sg_frame_h
+        Cam.pixelUm = 5.2
+        Cam.maxBin = 1
+        Cam.hasST4 = -1
+        Cam.gainMin = 1: Cam.gainMax = 15: Cam.gainBest = 4
+        Cam.isOpen = -1
+        r = CamSetBin(1)
+        CamOpen& = 0
+        Exit Function
+    End If
+    If idx = CAM_SIM Then
+        Cam.isSim = -1
+        Cam.camName = "Simulator"
+        Cam.maxW = 1280: Cam.maxH = 960
+        Cam.pixelUm = 3.75
+        Cam.maxBin = 2
+        Cam.hasST4 = -1
+        Cam.gainMin = 0: Cam.gainMax = 400: Cam.gainBest = 100
+        Cam.isOpen = -1
+        SimMakeStars
+        r = CamSetBin(bin)
+        CamOpen& = 0
+        Exit Function
+    End If
+    r = zg_open(idx)
+    If r <> 0 Then CamOpen& = r: Exit Function
+    Cam.camName = CamName$(idx)
+    Cam.maxW = zg_max_w
+    Cam.maxH = zg_max_h
+    Cam.pixelUm = zg_pixel_um
+    Cam.maxBin = zg_max_bin
+    Cam.hasST4 = (zg_has_st4 <> 0)
+    Cam.gainMin = zg_gain_min
+    Cam.gainMax = zg_gain_max
+    Cam.gainBest = zg_gain_best
+    Cam.isOpen = -1
+    r = CamSetBin(bin)
+    CamOpen& = r
+End Function
+
+Sub CamClose
+    If Cam.isOpen = 0 Then Exit Sub
+    If Cam.isSSAG Then
+        sg_close
+    ElseIf Cam.isQHY5 Then
+        q5_close
+    ElseIf Cam.isSim = 0 Then
+        zg_close
+    End If
+    Cam.isSSAG = 0
+    Cam.isQHY5 = 0
+    Cam.isOpen = 0
+    Sim.exposing = 0
+End Sub
+
+' Change binning; resizes Frame(). Returns 0 when ok.
+Function CamSetBin& (bin As Long)
+    Dim b As Long, r As Long
+    b = bin
+    If b < 1 Then b = 1
+    If b > Cam.maxBin Then b = Cam.maxBin
+    If Cam.isSim Or Cam.isSSAG Or Cam.isQHY5 Then
+        Cam.frameW = Cam.maxW \ b
+        Cam.frameH = Cam.maxH \ b
+        r = 0
+    Else
+        r = zg_set_format(b)
+        Cam.frameW = zg_frame_w
+        Cam.frameH = zg_frame_h
+    End If
+    Cam.bin = b
+    ReDim Frame(0 To Cam.frameW * Cam.frameH - 1) As _Unsigned Integer
+    CamSetBin& = r
+End Function
+
+' Start one exposure. Returns 0 when ok.
+Function CamStart& (expMs As Long, gain As Long)
+    Dim r As Long
+    Cam.expMs = expMs
+    Cam.gain = gain
+    If Cam.isSim Then
+        Sim.expStart = NowSec#
+        Sim.exposing = -1
+        CamStart& = 0
+        Exit Function
+    End If
+    If Cam.isQHY5 Then
+        r = q5_set_gain(gain)
+        CamStart& = q5_start_exposure(expMs)
+        Exit Function
+    End If
+    If Cam.isSSAG Then
+        r = sg_set_gain(gain)
+        CamStart& = sg_start_exposure(expMs)
+        Exit Function
+    End If
+    r = zg_set_exposure_ms(expMs)
+    r = zg_set_gain(gain)
+    CamStart& = zg_start_exposure
+End Function
+
+Function CamStatus& ()
+    If Cam.isSim Then
+        If Sim.exposing = 0 Then CamStatus& = EXP_IDLE: Exit Function
+        If NowSec# - Sim.expStart >= Cam.expMs / 1000# Then
+            CamStatus& = EXP_DONE
+        Else
+            CamStatus& = EXP_WORKING
+        End If
+        Exit Function
+    End If
+    If Cam.isSSAG Then CamStatus& = sg_exp_status: Exit Function
+    If Cam.isQHY5 Then CamStatus& = q5_exp_status: Exit Function
+    CamStatus& = zg_exp_status
+End Function
+
+Sub CamAbort
+    If Cam.isSim Then
+        Sim.exposing = 0
+    ElseIf Cam.isSSAG Then
+        sg_stop_exposure
+    ElseIf Cam.isQHY5 Then
+        q5_stop_exposure
+    Else
+        zg_stop_exposure
+    End If
+End Sub
+
+' Copy the finished exposure into Frame(). Returns 0 when ok.
+Function CamRead& ()
+    If Cam.isSim Then
+        SimRender
+        Sim.exposing = 0
+        CamRead& = 0
+        Exit Function
+    End If
+    If Cam.isSSAG Then CamRead& = sg_read_frame(_Offset(Frame(0))): Exit Function
+    If Cam.isQHY5 Then CamRead& = q5_read_frame(_Offset(Frame(0))): Exit Function
+    CamRead& = zg_read_frame(_Offset(Frame(0)))
+End Function
+
+' Guide pulse on both axes at once (DIR_NONE / 0 ms to skip an axis).
+Function CamPulse& (raDir As Long, raMs As Long, decDir As Long, decMs As Long)
+    Dim longest As Long
+    If Cam.isSim Then
+        SimPulse raDir, raMs
+        SimPulse decDir, decMs
+        longest = raMs
+        If decMs > longest Then longest = decMs
+        Sim.pulseEnd = NowSec# + longest / 1000#
+        CamPulse& = 0
+        Exit Function
+    End If
+    If Cam.isSSAG Then CamPulse& = sg_guide(raDir, raMs, decDir, decMs): Exit Function
+    If Cam.isQHY5 Then CamPulse& = q5_guide(raDir, raMs, decDir, decMs): Exit Function
+    CamPulse& = zg_guide(raDir, raMs, decDir, decMs)
+End Function
+
+Function CamPulseBusy& ()
+    If Cam.isSim Then
+        CamPulseBusy& = (NowSec# < Sim.pulseEnd)
+        Exit Function
+    End If
+    If Cam.isSSAG Then CamPulseBusy& = (sg_guide_busy <> 0): Exit Function
+    If Cam.isQHY5 Then CamPulseBusy& = (q5_guide_busy <> 0): Exit Function
+    CamPulseBusy& = (zg_guide_busy <> 0)
+End Function
+
+Sub CamPulseStop
+    If Cam.isSim Then
+        Sim.pulseEnd = 0
+    ElseIf Cam.isSSAG Then
+        sg_guide_stop
+    ElseIf Cam.isQHY5 Then
+        q5_guide_stop
+    Else
+        zg_guide_stop
+    End If
+End Sub
+
+Function CamTemp# ()
+    If Cam.isSim Then CamTemp# = 15.0: Exit Function
+    If Cam.isSSAG Or Cam.isQHY5 Then CamTemp# = -999: Exit Function
+    CamTemp# = zg_temp_c
+End Function
+
+'---------------------------------------------------------------------
+' Simulator
+'---------------------------------------------------------------------
+
+' Call after settings change: guide focal length (mm), guide rate
+' (x sidereal) and declination (deg) set how far a pulse moves the star.
+Sub SimSetup (focalMm As Double, guideRate As Double, decDeg As Double)
+    Dim scl As Double, cd As Double, fl As Double
+    fl = focalMm
+    If fl < 50 Then fl = 50
+    scl = 206.265 * Cam.pixelUm * Cam.bin / fl
+    cd = Cos(decDeg * 3.14159265358979 / 180#)
+    If cd < 0.05 Then cd = 0.05
+    Sim.raRate = guideRate * 15.0417 * cd / scl / 1000#
+    Sim.decRate = guideRate * 15.0417 / scl / 1000#
+    Sim.angle = 0.6
+    Sim.peAmpPx = 9# / scl
+    Sim.pePeriod = 480#
+    Sim.decDriftPx = (0.4 / 60#) / scl
+    Sim.seeingPx = 0.5 / scl
+    Sim.decBacklashMs = 400
+End Sub
+
+Sub SimMakeStars
+    Dim i As Long
+    Randomize 1234
+    Sim.nStars = 40
+    ReDim SimStarX(1 To Sim.nStars) As Double
+    ReDim SimStarY(1 To Sim.nStars) As Double
+    ReDim SimStarF(1 To Sim.nStars) As Double
+    For i = 1 To Sim.nStars
+        SimStarX(i) = 40 + Rnd * (Cam.maxW - 80)
+        SimStarY(i) = 40 + Rnd * (Cam.maxH - 80)
+        SimStarF(i) = 150 + Rnd * Rnd * 9000
+    Next
+    ' one good guide star near the middle
+    SimStarX(1) = Cam.maxW * 0.55: SimStarY(1) = Cam.maxH * 0.45: SimStarF(1) = 6000
+    ' one saturated star (auto-select should skip it)
+    SimStarX(2) = Cam.maxW * 0.3: SimStarY(2) = Cam.maxH * 0.6: SimStarF(2) = 90000
+    Randomize Timer
+    Sim.raPx = 0: Sim.decPx = 0
+    Sim.decLastDir = DIR_NONE
+    Sim.decBLLeft = 0
+    Sim.t = NowSec#
+End Sub
+
+Sub SimPulse (d As Long, ms As Long)
+    Dim eff As Double
+    If ms <= 0 Or d = DIR_NONE Then Exit Sub
+    Select Case d
+        Case DIR_WEST
+            Sim.raPx = Sim.raPx + ms * Sim.raRate
+        Case DIR_EAST
+            Sim.raPx = Sim.raPx - ms * Sim.raRate
+        Case DIR_NORTH, DIR_SOUTH
+            ' simple Dec backlash: a reversal eats the first part of the pulse
+            If d <> Sim.decLastDir Then Sim.decBLLeft = Sim.decBacklashMs
+            Sim.decLastDir = d
+            eff = ms - Sim.decBLLeft
+            Sim.decBLLeft = Sim.decBLLeft - ms
+            If Sim.decBLLeft < 0 Then Sim.decBLLeft = 0
+            If eff > 0 Then
+                If d = DIR_NORTH Then
+                    Sim.decPx = Sim.decPx + eff * Sim.decRate
+                Else
+                    Sim.decPx = Sim.decPx - eff * Sim.decRate
+                End If
+            End If
+    End Select
+End Sub
+
+Function SimGauss# ()
+    SimGauss# = (Rnd + Rnd + Rnd - 1.5) * 2#
+End Function
+
+Sub SimRender
+    Dim w As Long, h As Long, i As Long, x As Long, y As Long, idx As Long
+    Dim t As Double, ra As Double, de As Double, ca As Double, sa As Double
+    Dim sx As Double, sy As Double, sig As Double, r As Long, v As Double
+    Dim gk As Double, flux As Double, x0 As Long, y0 As Long, x1 As Long, y1 As Long
+    Dim dx As Double, dy As Double, bg As Double, nz As Double, pv As Long
+    w = Cam.frameW: h = Cam.frameH
+    gk = 1# + Cam.gain / 200#
+    bg = 600
+    nz = 25 * gk
+    For idx = 0 To w * h - 1
+        pv = bg + nz * SimGauss#
+        If pv < 0 Then pv = 0
+        Frame(idx) = pv
+    Next
+    ' fixed hot pixels (test for auto-select and darks)
+    For i = 1 To 30
+        x = (i * 7919) Mod w: y = (i * 104729) Mod h
+        Frame(y * w + x) = 12000
+    Next
+
+    t = NowSec# - Sim.t
+    ra = Sim.raPx + Sim.peAmpPx * Sin(6.2831853 * t / Sim.pePeriod) + 0.3 * Sim.peAmpPx * Sin(6.2831853 * t / (Sim.pePeriod / 3#))
+    de = Sim.decPx + Sim.decDriftPx * t
+    ra = ra + Sim.seeingPx * SimGauss#
+    de = de + Sim.seeingPx * SimGauss#
+    ca = Cos(Sim.angle): sa = Sin(Sim.angle)
+
+    sig = 1.6 / Cam.bin
+    If sig < 0.8 Then sig = 0.8
+    r = Int(sig * 4) + 1
+    For i = 1 To Sim.nStars
+        sx = SimStarX(i) / Cam.bin + ra * ca - de * sa
+        sy = SimStarY(i) / Cam.bin + ra * sa + de * ca
+        flux = SimStarF(i) * gk
+        x0 = Int(sx) - r: x1 = Int(sx) + r
+        y0 = Int(sy) - r: y1 = Int(sy) + r
+        If x0 < 0 Then x0 = 0
+        If y0 < 0 Then y0 = 0
+        If x1 > w - 1 Then x1 = w - 1
+        If y1 > h - 1 Then y1 = h - 1
+        For y = y0 To y1
+            dy = y - sy
+            For x = x0 To x1
+                dx = x - sx
+                v = Frame(y * w + x) + flux * Exp(-(dx * dx + dy * dy) / (2 * sig * sig))
+                If v > 65535 Then v = 65535
+                Frame(y * w + x) = v
+            Next
+        Next
+    Next
+End Sub

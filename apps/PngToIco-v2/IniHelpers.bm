@@ -1,0 +1,311 @@
+'=============================================================
+'  IniHelpers.bm  --  Implementation
+'=============================================================
+
+'--- Open (or create) an INI file. Returns a handle, or -1.
+'    Reopening the same path returns the existing handle rather
+'    than loading a second, divergent copy.
+Function IniOpen& (filePath As String)
+    Dim h As Long
+    Dim ok As Integer
+
+    IniOpen& = -1
+
+    h = IniFind&(filePath)
+    If h >= 0 Then
+        IniOpen& = h
+        Exit Function
+    End If
+
+    h = MemBufNew&(1024)
+    If h < 0 Then Exit Function
+
+    ok = MemBufLoadFile%(h, filePath)
+    ' A missing file is fine: we start with an empty buffer and
+    ' the first IniSave% creates it on disk.
+
+    iniPath(h) = filePath
+    IniOpen& = h
+End Function
+
+'--- Look up a live handle by path. Returns -1 if not open.
+Function IniFind& (filePath As String)
+    Dim i As Long
+
+    IniFind& = -1
+    For i = 0 To MEMBUF_MAX - 1
+        If mbUsed(i) Then
+            If UCase$(_Trim$(iniPath(i))) = UCase$(_Trim$(filePath)) Then
+                IniFind& = i
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+Function IniPathOf$ (h As Long)
+    IniPathOf$ = ""
+    If MemBufValid%(h) = 0 Then Exit Function
+    IniPathOf$ = iniPath(h)
+End Function
+
+Sub IniClose (h As Long)
+    If h < 0 Or h > MEMBUF_MAX - 1 Then Exit Sub
+    iniPath(h) = ""
+    MemBufFree h
+End Sub
+
+Function IniSave% (h As Long)
+    IniSave% = 0
+    If MemBufValid%(h) = 0 Then Exit Function
+    If _Trim$(iniPath(h)) = "" Then Exit Function
+    IniSave% = MemBufSaveFile%(h, iniPath(h))
+End Function
+
+Function IniSaveAs% (h As Long, filePath As String)
+    Dim ok As Integer
+
+    IniSaveAs% = 0
+    If MemBufValid%(h) = 0 Then Exit Function
+
+    ok = MemBufSaveFile%(h, filePath)
+    If ok Then iniPath(h) = filePath
+    IniSaveAs% = ok
+End Function
+
+'--- Whole buffer as a string (handy for debugging / previewing).
+Function IniText$ (h As Long)
+    IniText$ = MemBufSlice$(h, 0, MemBufLength&(h))
+End Function
+
+'--- ";" and "#" start a comment line.
+Function IniIsComment% (s As String)
+    Dim c As String
+
+    IniIsComment% = 0
+    c = Left$(_Trim$(s), 1)
+    If c = ";" Or c = "#" Then IniIsComment% = -1
+End Function
+
+Function IniIsHeaderFor% (clean As String, sect As String)
+    IniIsHeaderFor% = 0
+    If UCase$(clean) = "[" + UCase$(_Trim$(sect)) + "]" Then IniIsHeaderFor% = -1
+End Function
+
+'--- True when the buffer is non-empty and lacks a trailing newline.
+Function IniNeedsEol% (h As Long)
+    Dim lastCh As String
+
+    IniNeedsEol% = 0
+    If MemBufLength&(h) = 0 Then Exit Function
+    lastCh = MemBufSlice$(h, MemBufLength&(h) - 1, 1)
+    If lastCh <> Chr$(13) And lastCh <> Chr$(10) Then IniNeedsEol% = -1
+End Function
+
+'--- Fetch a value, or defaultVal when the key is absent.
+Function IniGet$ (h As Long, sect As String, kname As String, defaultVal As String)
+    Dim cursor As Long, lineStart As Long, lineLen As Long, advance As Long
+    Dim lineTxt As String, clean As String, k As String
+    Dim inSect As Integer
+    Dim eqPos As Long
+
+    IniGet$ = defaultVal
+    If MemBufValid%(h) = 0 Then Exit Function
+
+    cursor = 0
+    inSect = 0
+    Do While cursor < MemBufLength&(h)
+        MemBufReadLine h, cursor, lineTxt, lineStart, lineLen, advance
+        If advance = 0 Then Exit Do
+        cursor = cursor + advance
+        clean = _Trim$(lineTxt)
+
+        If Left$(clean, 1) = "[" Then
+            If IniIsHeaderFor%(clean, sect) Then inSect = -1 Else inSect = 0
+        ElseIf inSect Then
+            If IniIsComment%(clean) = 0 Then
+                eqPos = InStr(clean, "=")
+                If eqPos > 0 Then
+                    k = _Trim$(Left$(clean, eqPos - 1))
+                    If UCase$(k) = UCase$(_Trim$(kname)) Then
+                        IniGet$ = _Trim$(Mid$(clean, eqPos + 1))
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Loop
+End Function
+
+Function IniGetLong& (h As Long, sect As String, kname As String, defaultVal As Long)
+    Dim s As String
+
+    s = IniGet$(h, sect, kname, Chr$(0))
+    If s = Chr$(0) Then
+        IniGetLong& = defaultVal
+    Else
+        IniGetLong& = Val(s)
+    End If
+End Function
+
+'--- Presence test that does not collide with any legal value.
+Function IniHas% (h As Long, sect As String, kname As String)
+    Dim probeA As String, probeB As String
+
+    probeA = IniGet$(h, sect, kname, Chr$(1))
+    probeB = IniGet$(h, sect, kname, Chr$(2))
+    If probeA = Chr$(1) And probeB = Chr$(2) Then
+        IniHas% = 0
+    Else
+        IniHas% = -1
+    End If
+End Function
+
+'--- Write a key. Updates in place if present; otherwise inserts
+'    at the END OF ITS OWN SECTION, creating the section if needed.
+Sub IniSet (h As Long, sect As String, kname As String, vvalue As String)
+    Dim cursor As Long, lineStart As Long, lineLen As Long, advance As Long
+    Dim lineTxt As String, clean As String, k As String
+    Dim inSect As Integer, sectFound As Integer
+    Dim insertAt As Long
+    Dim eqPos As Long
+    Dim newLine As String, addStr As String
+
+    If MemBufValid%(h) = 0 Then Exit Sub
+
+    newLine = _Trim$(kname) + "=" + vvalue + Chr$(13) + Chr$(10)
+
+    cursor = 0
+    inSect = 0
+    sectFound = 0
+    insertAt = -1
+
+    Do While cursor < MemBufLength&(h)
+        MemBufReadLine h, cursor, lineTxt, lineStart, lineLen, advance
+        If advance = 0 Then Exit Do
+        clean = _Trim$(lineTxt)
+
+        If Left$(clean, 1) = "[" Then
+            If IniIsHeaderFor%(clean, sect) Then
+                inSect = -1
+                sectFound = -1
+            Else
+                ' leaving the target section: this header is the
+                ' insertion point for any new key
+                If inSect And insertAt < 0 Then insertAt = lineStart
+                inSect = 0
+            End If
+        ElseIf inSect Then
+            If IniIsComment%(clean) = 0 Then
+                eqPos = InStr(clean, "=")
+                If eqPos > 0 Then
+                    k = _Trim$(Left$(clean, eqPos - 1))
+                    If UCase$(k) = UCase$(_Trim$(kname)) Then
+                        MemBufReplace h, lineStart, advance, newLine
+                        Exit Sub
+                    End If
+                End If
+            End If
+        End If
+
+        cursor = cursor + advance
+    Loop
+
+    If sectFound Then
+        If insertAt < 0 Then
+            ' section runs to end of file
+            If IniNeedsEol%(h) Then newLine = Chr$(13) + Chr$(10) + newLine
+            MemBufAppend h, newLine
+        Else
+            MemBufReplace h, insertAt, 0, newLine
+        End If
+    Else
+        addStr = "[" + _Trim$(sect) + "]" + Chr$(13) + Chr$(10) + newLine
+        If IniNeedsEol%(h) Then addStr = Chr$(13) + Chr$(10) + addStr
+        MemBufAppend h, addStr
+    End If
+End Sub
+
+Sub IniSetLong (h As Long, sect As String, kname As String, vvalue As Long)
+    IniSet h, sect, kname, _Trim$(Str$(vvalue))
+End Sub
+
+Sub IniDeleteKey (h As Long, sect As String, kname As String)
+    Dim cursor As Long, lineStart As Long, lineLen As Long, advance As Long
+    Dim lineTxt As String, clean As String, k As String
+    Dim inSect As Integer
+    Dim eqPos As Long
+
+    If MemBufValid%(h) = 0 Then Exit Sub
+
+    cursor = 0
+    inSect = 0
+    Do While cursor < MemBufLength&(h)
+        MemBufReadLine h, cursor, lineTxt, lineStart, lineLen, advance
+        If advance = 0 Then Exit Do
+        clean = _Trim$(lineTxt)
+
+        If Left$(clean, 1) = "[" Then
+            If IniIsHeaderFor%(clean, sect) Then inSect = -1 Else inSect = 0
+        ElseIf inSect Then
+            If IniIsComment%(clean) = 0 Then
+                eqPos = InStr(clean, "=")
+                If eqPos > 0 Then
+                    k = _Trim$(Left$(clean, eqPos - 1))
+                    If UCase$(k) = UCase$(_Trim$(kname)) Then
+                        MemBufReplace h, lineStart, advance, ""
+                        Exit Sub
+                    End If
+                End If
+            End If
+        End If
+
+        cursor = cursor + advance
+    Loop
+End Sub
+
+'--- Remove a section header and every line up to the next header.
+'    Repeats until no further occurrence remains, so duplicate
+'    headers are all cleaned up.
+Sub IniDeleteSection (h As Long, sect As String)
+    Dim cursor As Long, lineStart As Long, lineLen As Long, advance As Long
+    Dim lineTxt As String, clean As String
+    Dim inSect As Integer
+    Dim delStart As Long, delTotal As Long
+    Dim didWork As Integer
+
+    If MemBufValid%(h) = 0 Then Exit Sub
+
+    Do
+        didWork = 0
+        cursor = 0
+        inSect = 0
+        delStart = 0
+        delTotal = 0
+
+        Do While cursor < MemBufLength&(h)
+            MemBufReadLine h, cursor, lineTxt, lineStart, lineLen, advance
+            If advance = 0 Then Exit Do
+            clean = _Trim$(lineTxt)
+
+            If Left$(clean, 1) = "[" Then
+                If IniIsHeaderFor%(clean, sect) Then
+                    inSect = -1
+                    delStart = lineStart
+                    delTotal = advance
+                Else
+                    If inSect Then Exit Do
+                End If
+            ElseIf inSect Then
+                delTotal = delTotal + advance
+            End If
+
+            cursor = cursor + advance
+        Loop
+
+        If delTotal > 0 Then
+            MemBufReplace h, delStart, delTotal, ""
+            didWork = -1
+        End If
+    Loop While didWork
+End Sub

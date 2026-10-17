@@ -1,0 +1,113 @@
+' ============================================================================
+' SERWriteLib.bm  -  Turning QB64 images into a SER file
+'
+' Include at the BOTTOM of SERWrite.bas:
+'     '$INCLUDE:'SERWriteLib.bm'
+'
+'   EmitSample - write one channel value as 8- or 16-bit into a _MEM block
+'   PackFrame$ - one 32-bit BGRA image -> packed SER bytes (MONO/RGB/BGR, 8/16)
+'   WriteSER   - stamp the 178-byte header, then dump every frame
+' ============================================================================
+
+' ---------------------------------------------------------------------------
+' Append one channel value (a 0..255 byte from our source image) to dst at the
+' running byte index 'idx' (passed by reference, so it advances here).
+'   8-bit  : one byte, as-is.
+'   16-bit : scale 0..255 -> 0..65535 with *257 (fills the range evenly), and
+'            store little-endian to match the header's LittleEndian = 1.
+' ---------------------------------------------------------------------------
+Sub EmitSample (m As _MEM, idx As Long, val8 As _UNSIGNED _BYTE, sampleBytes As Long)
+    If sampleBytes = 1 Then
+        _MemPut m, m.OFFSET + idx, val8 AS _UNSIGNED _BYTE
+        idx = idx + 1
+    Else
+        Dim w16 As _UNSIGNED Integer
+        w16 = val8 * 257
+        _MemPut m, m.OFFSET + idx + 0, (w16 And 255) AS _UNSIGNED _BYTE
+        _MemPut m, m.OFFSET + idx + 1, ((w16 \ 256) And 255) AS _UNSIGNED _BYTE
+        idx = idx + 2
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------
+' Convert a 32-bit BGRA image into SER pixel bytes for the requested format.
+'   MONO -> one luma sample per pixel (weights sum to 256: 77+150+29)
+'   RGB  -> R,G,B   (end-swapped from QB64's B,G,R)
+'   BGR  -> B,G,R   (straight through)
+' 'depth' is bits per plane (8 or 16); everything routes through EmitSample.
+' ---------------------------------------------------------------------------
+Function PackFrame$ (img As Long, w As Long, h As Long, colorID As Long, depth As Long)
+    Dim src As _MEM, dst As _MEM
+    Dim p As Long, n As Long, idx As Long
+    Dim planes As Long, sampleBytes As Long, outBytes As Long
+    Dim b As _UNSIGNED _BYTE, g As _UNSIGNED _BYTE, r As _UNSIGNED _BYTE, grey As _UNSIGNED _BYTE
+
+    n = w * h
+    If colorID = SER_RGB Or colorID = SER_BGR Then planes = 3 Else planes = 1
+    If depth <= 8 Then sampleBytes = 1 Else sampleBytes = 2
+    outBytes = n * planes * sampleBytes
+
+    src = _MemImage(img)          ' B,G,R,A  (4 bytes/pixel)
+    dst = _MemNew(outBytes)
+    idx = 0
+
+    For p = 0 To n - 1
+        b = _MemGet(src, src.OFFSET + p * 4 + 0, _UNSIGNED _BYTE)
+        g = _MemGet(src, src.OFFSET + p * 4 + 1, _UNSIGNED _BYTE)
+        r = _MemGet(src, src.OFFSET + p * 4 + 2, _UNSIGNED _BYTE)
+        Select Case colorID
+            Case SER_RGB
+                EmitSample dst, idx, r, sampleBytes
+                EmitSample dst, idx, g, sampleBytes
+                EmitSample dst, idx, b, sampleBytes
+            Case SER_BGR
+                EmitSample dst, idx, b, sampleBytes
+                EmitSample dst, idx, g, sampleBytes
+                EmitSample dst, idx, r, sampleBytes
+            Case Else
+                grey = (77 * r + 150 * g + 29 * b) \ 256
+                EmitSample dst, idx, grey, sampleBytes
+        End Select
+    Next p
+
+    Dim outStr As String
+    outStr = Space$(outBytes)
+    _MemGet dst, dst.OFFSET, outStr   ' bulk copy mem -> string
+    _MemFree dst
+    _MemFree src
+    PackFrame$ = outStr
+End Function
+
+' ---------------------------------------------------------------------------
+' Write the whole file: header first, then the frames verbatim.
+' (Assigning a short string to a fixed-length field auto-pads with spaces.)
+' ---------------------------------------------------------------------------
+Sub WriteSER (fileName As String, Frames() As String, w As Long, h As Long, numFrames As Long, colorID As Long, depth As Long)
+    Dim f As Integer
+    If _FileExists(fileName) Then Kill fileName
+    f = FreeFile
+    Open fileName For Binary As #f
+
+    Dim hdr As SERHeader
+    hdr.FileID = "LUCAM-RECORDER"
+    hdr.LuID = 0
+    hdr.ColorID = colorID
+    hdr.LittleEndian = 1        ' we write 16-bit samples little-endian
+    hdr.ImageWidth = w
+    hdr.ImageHeight = h
+    hdr.PixelDepth = depth
+    hdr.FrameCount = numFrames
+    hdr.Observer = "QB64 SER Writer"
+    hdr.Instrument = ""
+    hdr.Telescope = ""
+    hdr.DateTime = 0
+    hdr.DateTimeUTC = 0
+    Put #f, 1, hdr
+
+    Dim i As Long
+    For i = 1 To numFrames
+        Put #f, , Frames(i)     ' raw bytes, no length prefix, no padding
+    Next i
+
+    Close #f
+End Sub

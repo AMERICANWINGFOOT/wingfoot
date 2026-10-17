@@ -1,0 +1,172 @@
+' ============================================================================
+' SERPlayLib.bm  -  Reading a SER file and putting it on screen
+'
+' Include at the BOTTOM of SERPlay.bas:
+'     '$INCLUDE:'SERPlayLib.bm'
+'
+'   ReadHeader   - one Get fills every g_* value we need
+'   FormatName$  - SharpCap-style label (RGB24 / MONO16 / RAW8 ...) for the title
+'   FrameToImage - packed SER pixels -> a 32-bit BGRA image
+'                  handles MONO/RGB/BGR at 8- OR 16-bit
+'   PlaySER      - wall-clock paced playback (SER carries no frame rate)
+' ============================================================================
+
+' ---------------------------------------------------------------------------
+' The entire "parser". One Get, a little arithmetic, done.
+'
+' Bytes-per-sample follows the SER rule: 1 byte when the depth is 8 or fewer
+' bits, 2 bytes when it's 9..16. So MONO16, RGB48 and RAW16 all land on 2.
+' ---------------------------------------------------------------------------
+Sub ReadHeader
+    Dim hdr As SERHeader
+    Get #g_fnum, 1, hdr
+
+    If hdr.FileID <> "LUCAM-RECORDER" Then
+        Print "Not a SER file (bad FileID)."
+        Close #g_fnum
+        End
+    End If
+
+    g_w = hdr.ImageWidth
+    g_h = hdr.ImageHeight
+    g_colorID = hdr.ColorID
+    g_depth = hdr.PixelDepth
+    g_frameCount = hdr.FrameCount
+    g_littleEndian = hdr.LittleEndian
+
+    If g_colorID = SER_RGB Or g_colorID = SER_BGR Then g_planes = 3 Else g_planes = 1
+    If g_depth <= 8 Then g_sampleBytes = 1 Else g_sampleBytes = 2
+    ' SER LittleEndian flag is unreliable; real 16-bit SER is little-endian.
+    If g_sampleBytes = 2 Then g_littleEndian = 1
+
+    g_frameBytes = g_w * g_h * g_planes * g_sampleBytes
+    g_dataStart = SER_HEADER_SIZE + 1   ' first frame byte (1-based) = 179
+End Sub
+
+' ---------------------------------------------------------------------------
+' Name the format the way SharpCap's dropdown does, for the window title.
+' Colour depth is per-plane, so a 16-bit RGB frame is "RGB48" (3 x 16).
+' ---------------------------------------------------------------------------
+Function FormatName$ (colorID As Long, depth As Long)
+    Dim bbase As String
+    Select Case colorID
+        Case SER_MONO: bbase = "MONO"
+        Case SER_RGB: bbase = "RGB"
+        Case SER_BGR: bbase = "BGR"
+        Case Else: bbase = "RAW"     ' Bayer patterns 8..19
+    End Select
+    If colorID = SER_RGB Or colorID = SER_BGR Then
+        FormatName$ = bbase + _Trim$(Str$(depth * 3))
+    Else
+        FormatName$ = bbase + _Trim$(Str$(depth))
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+' Expand one frame's SER bytes into QB64's B,G,R,A image memory.
+'
+' The screen is 8-bit-per-channel, so a 16-bit source is shown by its high
+' byte (a straight >>8). WHICH byte is the high one is the whole endian saga:
+'   little-endian data -> high byte is the 2nd of the pair (msbOff = 1)
+'   big-endian data    -> high byte is the 1st          (msbOff = 0)
+' We honour the header's LittleEndian flag. In the wild, though, nearly every
+' 16-bit SER is little-endian regardless of what the flag says -- so if a
+' 16-bit file plays as noise or looks wrong, force msbOff = 1 and move on.
+'
+' No auto-stretch is applied, so faint 16-bit data (top bits near zero) will
+' look dark -- that's a levels choice, not a bug.
+' ---------------------------------------------------------------------------
+Sub FrameToImage (buf As String, img As Long)
+    Dim src As _MEM, dst As _MEM
+    Dim p As Long, n As Long, pixBytes As Long, baseOff As _Offset, msbOff As Long
+    Dim r As _UNSIGNED _BYTE, g As _UNSIGNED _BYTE, b As _UNSIGNED _BYTE, grey As _UNSIGNED _BYTE
+    Dim c0 As _UNSIGNED _BYTE, c1 As _UNSIGNED _BYTE, c2 As _UNSIGNED _BYTE
+
+    n = g_w * g_h
+    src = _MemNew(Len(buf))
+    _MemPut src, src.OFFSET, buf         ' bulk copy string -> mem
+    dst = _MemImage(img)                 ' B,G,R,A target
+
+    If g_sampleBytes = 2 And g_littleEndian <> 0 Then msbOff = 1 Else msbOff = 0
+
+    If g_colorID = SER_RGB Or g_colorID = SER_BGR Then
+        pixBytes = 3 * g_sampleBytes
+        For p = 0 To n - 1
+            baseOff = src.OFFSET + p * pixBytes + msbOff
+            c0 = _MemGet(src, baseOff + 0 * g_sampleBytes, _UNSIGNED _BYTE)
+            c1 = _MemGet(src, baseOff + 1 * g_sampleBytes, _UNSIGNED _BYTE)
+            c2 = _MemGet(src, baseOff + 2 * g_sampleBytes, _UNSIGNED _BYTE)
+            If g_colorID = SER_RGB Then
+                r = c0: g = c1: b = c2
+            Else
+                b = c0: g = c1: r = c2
+            End If
+            _MemPut dst, dst.OFFSET + p * 4 + 0, b AS _UNSIGNED _BYTE
+            _MemPut dst, dst.OFFSET + p * 4 + 1, g AS _UNSIGNED _BYTE
+            _MemPut dst, dst.OFFSET + p * 4 + 2, r AS _UNSIGNED _BYTE
+            _MemPut dst, dst.OFFSET + p * 4 + 3, 255 AS _UNSIGNED _BYTE
+        Next p
+    Else
+        ' MONO / Bayer-as-grey: one sample per pixel
+        pixBytes = g_sampleBytes
+        For p = 0 To n - 1
+            grey = _MemGet(src, src.OFFSET + p * pixBytes + msbOff, _UNSIGNED _BYTE)
+            _MemPut dst, dst.OFFSET + p * 4 + 0, grey AS _UNSIGNED _BYTE
+            _MemPut dst, dst.OFFSET + p * 4 + 1, grey AS _UNSIGNED _BYTE
+            _MemPut dst, dst.OFFSET + p * 4 + 2, grey AS _UNSIGNED _BYTE
+            _MemPut dst, dst.OFFSET + p * 4 + 3, 255 AS _UNSIGNED _BYTE
+        Next p
+    End If
+
+    _MemFree dst
+    _MemFree src
+End Sub
+
+' ---------------------------------------------------------------------------
+' Playback. SER has no frame rate of its own, so PLAY_FPS (set in SERPlay.bas)
+' drives a wall clock -- the same path the AVI player uses when a clip is
+' silent. Any frame's file offset is pure arithmetic. ESC or close quits.
+' ---------------------------------------------------------------------------
+Sub PlaySER
+    Dim scr As Long
+    scr = _NewImage(g_w, g_h, 32)
+    Screen scr
+    _Title "SER Player  -  " + _Trim$(Str$(g_w)) + "x" + _Trim$(Str$(g_h)) + "  " + FormatName$(g_colorID, g_depth) + " @ " + _Trim$(Str$(PLAY_FPS)) + "fps"
+    _ScreenMove _Middle
+
+    Dim fimg As Long
+    fimg = _NewImage(g_w, g_h, 32)
+
+    Dim shownFrame As Long, targetFrame As Long, quitFlag As Integer
+    Dim playT As Single, startT As Double
+    Dim s As String
+    shownFrame = 0: quitFlag = 0
+    startT = Timer(0.001)
+
+    Do
+        playT = Timer(0.001) - startT
+        If playT < 0 Then playT = 0
+
+        targetFrame = Int(playT * PLAY_FPS) + 1
+        If targetFrame > g_frameCount Then targetFrame = g_frameCount
+        If targetFrame < 1 Then targetFrame = 1
+
+        If targetFrame <> shownFrame Then
+            shownFrame = targetFrame
+            s = Space$(g_frameBytes)
+            Get #g_fnum, g_dataStart + (shownFrame - 1) * g_frameBytes, s
+            FrameToImage s, fimg
+            _PutImage (0, 0), fimg
+            _Display
+        End If
+
+        If _KeyHit = 27 Then quitFlag = -1
+        If _Exit Then quitFlag = -1
+
+        _Limit 240
+
+        If shownFrame >= g_frameCount Then quitFlag = -1
+    Loop Until quitFlag
+
+    _FreeImage fimg
+End Sub

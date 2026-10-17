@@ -1,0 +1,38 @@
+QBCap - moving it to another computer
+=====================================
+
+QBCap keeps everything in its own folder, so moving it is a copy:
+
+1. Copy the whole QBCap folder (a USB stick or the My Book is fine).
+   Put it in a path with no spaces (e.g. ~/Desktop/QBCap) if you will
+   recompile there - QB64-PE can't compile in a path with a space.
+
+2. In a terminal, inside the copied folder:
+
+       sh qbcap_setup.sh
+
+   It checks the program, libraries, plate solver, index files and USB
+   rules, and offers to fix what it can (the USB rules ask for your
+   password once per computer). "sh qbcap_setup.sh check" only reports.
+
+3. Run QBCap. The Plate Solve panel shows the index folder and solver.
+
+What travels with the folder
+- QBCap, libqbcap.so, libqbgpu.so, libqhyccd.so, the ZWO .so files
+- the "astrometry" folder: QBCap's own copy of solve-field, so the new
+  computer needs no astrometry.net install (Linux Mint 22 / Ubuntu 24.04
+  or newer). Rebuild it with: sh build_astrometry.sh
+- settings: QBCap_solve.txt, QBCap_site.txt, QBCap_mount.txt,
+  QBCap_filters.txt (paths inside the QBCap folder are saved relative,
+  so they still work after the move)
+- the "index" folder, if the index files are kept in it
+
+What has to be done once on each computer (qbcap_setup.sh does it)
+- USB rules for the ZWO camera / filter wheel and the PoleMaster
+- PoleMaster firmware (install_polemaster.sh)
+
+Index files
+- A small computer only needs the index files for the fields you shoot:
+  the C8's field needs the small-quad files, the PoleMaster's 11 degree
+  field the wide ones. Keep them in QBCap/index, or anywhere and point
+  Plate Solve > Index folder... at them.

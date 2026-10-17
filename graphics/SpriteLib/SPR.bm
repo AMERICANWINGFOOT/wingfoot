@@ -1,0 +1,1444 @@
+'=================================================================================================
+' SPR.bm - 2D Sprite Helper for QB64-PE 4.5.0, implementation
+' Include this file at the BOTTOM of your program. See SPR.bi for the overview.
+'=================================================================================================
+
+'-------------------------------------------------------------------------------------------------
+' Housekeeping
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRInit ()
+
+    Dim i%
+
+    For i% = 1 To SPR_MAXSHEET
+        sprSheets(i%).inuse = 0
+        sprSheets(i%).gen = 0
+        sprSheets(i%).img = 0
+    Next i%
+    For i% = 1 To SPR_MAXSPRITE
+        sprItems(i%).inuse = 0
+        sprItems(i%).gen = 0
+    Next i%
+    For i% = 1 To SPR_MAXCELL
+        sprCells(i%) = 0
+    Next i%
+    sprCellTop = 0
+    sprLiveCount = 0
+    sprLastError = ""
+    sprReady = -1
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRReset ()
+
+    Dim i%
+    Dim h&
+
+    For i% = 1 To SPR_MAXSPRITE
+        sprItems(i%).inuse = 0
+    Next i%
+    sprLiveCount = 0
+    For i% = 1 To SPR_MAXSHEET
+        If sprSheets(i%).inuse Then
+            h& = i% + sprSheets(i%).gen * 1024
+            SPRSheetFree h&
+        End If
+    Next i%
+    sprCellTop = 0
+    sprLastError = ""
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRError$ ()
+
+    SPRError$ = sprLastError
+    sprLastError = ""
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRCount% ()
+
+    SPRCount% = sprLiveCount
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRFail (msg$)
+
+    sprLastError = msg$
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Handle resolution. A handle is  index + generation * 1024, so a handle left over from a freed
+' sprite fails cleanly instead of pointing at whatever was created in its place.
+'-------------------------------------------------------------------------------------------------
+
+Function SPRIdx% (handle&)
+
+    Dim i%, g%
+
+    SPRIdx% = 0
+    If handle& <= 0 Then Exit Function
+    i% = handle& And SPR_HANDLEMASK
+    If i% < 1 Or i% > SPR_MAXSPRITE Then Exit Function
+    If sprItems(i%).inuse = 0 Then Exit Function
+    g% = handle& \ 1024
+    If sprItems(i%).gen <> g% Then Exit Function
+    SPRIdx% = i%
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRSheetIdx% (sheet&)
+
+    Dim i%, g%
+
+    SPRSheetIdx% = 0
+    If sheet& <= 0 Then Exit Function
+    i% = sheet& And SPR_HANDLEMASK
+    If i% < 1 Or i% > SPR_MAXSHEET Then Exit Function
+    If sprSheets(i%).inuse = 0 Then Exit Function
+    g% = sheet& \ 1024
+    If sprSheets(i%).gen <> g% Then Exit Function
+    SPRSheetIdx% = i%
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRValid% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRValid% = -1 Else SPRValid% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Sprite sheets
+'-------------------------------------------------------------------------------------------------
+
+Function SPRSheetLoad& (fileName$, cellW%, cellH%)
+
+    Dim img&, sh&
+
+    SPRSheetLoad& = SPR_NOHANDLE
+    If sprReady = 0 Then SPRFail "SPRSheetLoad: SPRInit has not been called.": Exit Function
+    If _FileExists(fileName$) = 0 Then
+        SPRFail "SPRSheetLoad: file not found - " + fileName$
+        Exit Function
+    End If
+    img& = _LoadImage(fileName$, 32)
+    If img& = -1 Or img& = 0 Then
+        SPRFail "SPRSheetLoad: could not decode - " + fileName$
+        Exit Function
+    End If
+    sh& = SPRSheetFromImage&(img&, cellW%, cellH%, -1)
+    If sh& = SPR_NOHANDLE Then _FreeImage img&
+    SPRSheetLoad& = sh&
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' adopt% = -1 : the sheet takes ownership and will free img& when the sheet is freed
+' adopt% =  0 : the caller keeps ownership of img&
+'-------------------------------------------------------------------------------------------------
+
+Function SPRSheetFromImage& (img&, cellW%, cellH%, adopt%)
+
+    Dim i%, r%, c%, n%, ci&
+    Dim sw%, sh%, cols%, rows%, total%
+
+    SPRSheetFromImage& = SPR_NOHANDLE
+    If sprReady = 0 Then SPRFail "SPRSheetFromImage: SPRInit has not been called.": Exit Function
+    If cellW% < 1 Or cellH% < 1 Then
+        SPRFail "SPRSheetFromImage: cell size must be at least 1x1."
+        Exit Function
+    End If
+    If img& = 0 Or img& = -1 Then
+        SPRFail "SPRSheetFromImage: invalid source image."
+        Exit Function
+    End If
+    sw% = _Width(img&)
+    sh% = _Height(img&)
+    If sw% < cellW% Or sh% < cellH% Then
+        SPRFail "SPRSheetFromImage: image is smaller than one cell."
+        Exit Function
+    End If
+    cols% = sw% \ cellW%
+    rows% = sh% \ cellH%
+    total% = cols% * rows%
+
+    n% = 0
+    For i% = 1 To SPR_MAXSHEET
+        If sprSheets(i%).inuse = 0 Then n% = i%: Exit For
+    Next i%
+    If n% = 0 Then
+        SPRFail "SPRSheetFromImage: sheet pool is full."
+        Exit Function
+    End If
+    If sprCellTop + total% > SPR_MAXCELL Then
+        SPRFail "SPRSheetFromImage: cell pool is full, raise SPR_MAXCELL."
+        Exit Function
+    End If
+
+    sprSheets(n%).firstCell = sprCellTop + 1
+    '-- blending OFF while cutting, so each cell receives the source alpha byte for byte
+    '-- rather than compositing it against the new image's transparent black
+    _DontBlend img&
+    For r% = 0 To rows% - 1
+        For c% = 0 To cols% - 1
+            ci& = _NewImage(cellW%, cellH%, 32)
+            _DontBlend ci&
+            _PutImage (0, 0)-(cellW% - 1, cellH% - 1), img&, ci&, (c% * cellW%, r% * cellH%)-(c% * cellW% + cellW% - 1, r% * cellH% + cellH% - 1)
+            '-- blending back ON, otherwise every transparent pixel draws as opaque black
+            '-- when the cell is later used as a _PutImage or _MapTriangle source
+            _Blend ci&
+            sprCellTop = sprCellTop + 1
+            sprCells(sprCellTop) = ci&
+        Next c%
+    Next r%
+    _Blend img&
+
+    sprSheets(n%).inuse = -1
+    sprSheets(n%).gen = sprSheets(n%).gen + 1
+    sprSheets(n%).img = img&
+    If adopt% Then sprSheets(n%).owns = -1 Else sprSheets(n%).owns = 0
+    sprSheets(n%).sheetW = sw%
+    sprSheets(n%).sheetH = sh%
+    sprSheets(n%).cellW = cellW%
+    sprSheets(n%).cellH = cellH%
+    sprSheets(n%).cols = cols%
+    sprSheets(n%).rows = rows%
+    sprSheets(n%).cellCount = total%
+
+    SPRSheetFromImage& = n% + sprSheets(n%).gen * 1024
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSheetFree (sheet&)
+
+    Dim s%, i%, lastCell%
+
+    s% = SPRSheetIdx%(sheet&)
+    If s% = 0 Then SPRFail "SPRSheetFree: no such sheet.": Exit Sub
+
+    lastCell% = sprSheets(s%).firstCell + sprSheets(s%).cellCount - 1
+    For i% = sprSheets(s%).firstCell To lastCell%
+        If sprCells(i%) <> 0 Then _FreeImage sprCells(i%)
+        sprCells(i%) = 0
+    Next i%
+    '-- reclaim pool space only when this sheet's cells sit on top of the stack
+    If lastCell% = sprCellTop Then sprCellTop = sprSheets(s%).firstCell - 1
+
+    If sprSheets(s%).owns Then
+        If sprSheets(s%).img <> 0 Then _FreeImage sprSheets(s%).img
+    End If
+    sprSheets(s%).img = 0
+    sprSheets(s%).inuse = 0
+    sprSheets(s%).cellCount = 0
+
+    '-- orphan any sprite that was using this sheet
+    For i% = 1 To SPR_MAXSPRITE
+        If sprItems(i%).inuse Then
+            If sprItems(i%).sheetIdx = s% Then
+                sprItems(i%).inuse = 0
+                sprLiveCount = sprLiveCount - 1
+            End If
+        End If
+    Next i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRSheetCells% (sheet&)
+
+    Dim s%
+
+    s% = SPRSheetIdx%(sheet&)
+    If s% Then SPRSheetCells% = sprSheets(s%).cellCount Else SPRSheetCells% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRSheetCellW% (sheet&)
+
+    Dim s%
+
+    s% = SPRSheetIdx%(sheet&)
+    If s% Then SPRSheetCellW% = sprSheets(s%).cellW Else SPRSheetCellW% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRSheetCellH% (sheet&)
+
+    Dim s%
+
+    s% = SPRSheetIdx%(sheet&)
+    If s% Then SPRSheetCellH% = sprSheets(s%).cellH Else SPRSheetCellH% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRSheetCols% (sheet&)
+
+    Dim s%
+
+    s% = SPRSheetIdx%(sheet&)
+    If s% Then SPRSheetCols% = sprSheets(s%).cols Else SPRSheetCols% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRSheetImage& (sheet&)
+
+    Dim s%
+
+    s% = SPRSheetIdx%(sheet&)
+    If s% Then SPRSheetImage& = sprSheets(s%).img Else SPRSheetImage& = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Sprite lifecycle
+'-------------------------------------------------------------------------------------------------
+
+Function SPRNew& (sheet&, cell%)
+
+    Dim s%, i%, n%
+
+    SPRNew& = SPR_NOHANDLE
+    s% = SPRSheetIdx%(sheet&)
+    If s% = 0 Then SPRFail "SPRNew: no such sheet.": Exit Function
+    If cell% < 0 Or cell% >= sprSheets(s%).cellCount Then
+        SPRFail "SPRNew: cell out of range for this sheet."
+        Exit Function
+    End If
+
+    n% = 0
+    For i% = 1 To SPR_MAXSPRITE
+        If sprItems(i%).inuse = 0 Then n% = i%: Exit For
+    Next i%
+    If n% = 0 Then SPRFail "SPRNew: sprite pool is full.": Exit Function
+
+    sprItems(n%).inuse = -1
+    sprItems(n%).gen = sprItems(n%).gen + 1
+    sprItems(n%).sheet = sheet&
+    sprItems(n%).sheetIdx = s%
+    sprItems(n%).cell = cell%
+    sprItems(n%).x = 0
+    sprItems(n%).y = 0
+    sprItems(n%).vx = 0
+    sprItems(n%).vy = 0
+    sprItems(n%).visible = -1
+    sprItems(n%).layer = 0
+    sprItems(n%).flip = SPR_NOFLIP
+    sprItems(n%).scaleX = 1
+    sprItems(n%).scaleY = 1
+    sprItems(n%).angle = 0
+    sprItems(n%).originX = .5
+    sprItems(n%).originY = .5
+    sprItems(n%).animOn = 0
+    sprItems(n%).animStyle = SPR_FORWARD
+    sprItems(n%).animStart = cell%
+    sprItems(n%).animEnd = cell%
+    sprItems(n%).animDir = 1
+    sprItems(n%).animRate = 10
+    sprItems(n%).animAccum = 0
+    sprItems(n%).animDone = 0
+    sprItems(n%).detect = SPR_NODETECT
+    sprItems(n%).userVal = 0
+    sprItems(n%).userVal2 = 0
+    SPRBox n%
+
+    sprLiveCount = sprLiveCount + 1
+    SPRNew& = n% + sprItems(n%).gen * 1024
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRClone& (handle&)
+
+    Dim i%, n%, g%, j%
+
+    SPRClone& = SPR_NOHANDLE
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRClone: no such sprite.": Exit Function
+
+    n% = 0
+    For j% = 1 To SPR_MAXSPRITE
+        If sprItems(j%).inuse = 0 Then n% = j%: Exit For
+    Next j%
+    If n% = 0 Then SPRFail "SPRClone: sprite pool is full.": Exit Function
+
+    g% = sprItems(n%).gen + 1
+    sprItems(n%) = sprItems(i%)
+    sprItems(n%).gen = g%
+    sprLiveCount = sprLiveCount + 1
+    SPRClone& = n% + g% * 1024
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRFree (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRFree: no such sprite.": Exit Sub
+    sprItems(i%).inuse = 0
+    sprLiveCount = sprLiveCount - 1
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Position and motion
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRMove (handle&, x!, y!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRMove: no such sprite.": Exit Sub
+    sprItems(i%).x = x!
+    sprItems(i%).y = y!
+    SPRBox i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRMoveBy (handle&, dx!, dy!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRMoveBy: no such sprite.": Exit Sub
+    sprItems(i%).x = sprItems(i%).x + dx!
+    sprItems(i%).y = sprItems(i%).y + dy!
+    SPRBox i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetVel (handle&, vx!, vy!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetVel: no such sprite.": Exit Sub
+    sprItems(i%).vx = vx!
+    sprItems(i%).vy = vy!
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Origin is normalized. 0,0 is the top left of the cell, .5,.5 the center (the default),
+' 1,1 the bottom right. The sprite's x,y is always this point.
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetOrigin (handle&, ox!, oy!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetOrigin: no such sprite.": Exit Sub
+    sprItems(i%).originX = ox!
+    sprItems(i%).originY = oy!
+    SPRBox i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRX! (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRX! = sprItems(i%).x Else SPRX! = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRY! (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRY! = sprItems(i%).y Else SPRY! = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRVX! (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRVX! = sprItems(i%).vx Else SPRVX! = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRVY! (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRVY! = sprItems(i%).vy Else SPRVY! = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Appearance
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetCell (handle&, cell%)
+
+    Dim i%, s%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetCell: no such sprite.": Exit Sub
+    s% = sprItems(i%).sheetIdx
+    If cell% < 0 Or cell% >= sprSheets(s%).cellCount Then
+        SPRFail "SPRSetCell: cell out of range for this sheet."
+        Exit Sub
+    End If
+    sprItems(i%).cell = cell%
+    SPRBox i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetAngle (handle&, degrees!)
+
+    Dim i%
+    Dim a!
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetAngle: no such sprite.": Exit Sub
+    a! = degrees! - Int(degrees! / 360) * 360
+    sprItems(i%).angle = a!
+    SPRBox i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRTurn (handle&, degrees!)
+
+    Dim i%
+    Dim a!
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRTurn: no such sprite.": Exit Sub
+    a! = sprItems(i%).angle + degrees!
+    a! = a! - Int(a! / 360) * 360
+    sprItems(i%).angle = a!
+    SPRBox i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetZoom (handle&, percent!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetZoom: no such sprite.": Exit Sub
+    If percent! <= 0 Then SPRFail "SPRSetZoom: zoom must be greater than zero.": Exit Sub
+    sprItems(i%).scaleX = percent! / 100
+    sprItems(i%).scaleY = percent! / 100
+    SPRBox i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetScale (handle&, sx!, sy!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetScale: no such sprite.": Exit Sub
+    If sx! = 0 Or sy! = 0 Then SPRFail "SPRSetScale: scale cannot be zero.": Exit Sub
+    sprItems(i%).scaleX = sx!
+    sprItems(i%).scaleY = sy!
+    SPRBox i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetFlip (handle&, mode%)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetFlip: no such sprite.": Exit Sub
+    If mode% < SPR_NOFLIP Or mode% > SPR_FLIPHV Then
+        SPRFail "SPRSetFlip: invalid flip mode."
+        Exit Sub
+    End If
+    sprItems(i%).flip = mode%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetLayer (handle&, layer%)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetLayer: no such sprite.": Exit Sub
+    sprItems(i%).layer = _Clamp(layer%, 0, SPR_MAXLAYER)
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRShow (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRShow: no such sprite.": Exit Sub
+    sprItems(i%).visible = -1
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRHide (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRHide: no such sprite.": Exit Sub
+    sprItems(i%).visible = 0
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRCellOf% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRCellOf% = sprItems(i%).cell Else SPRCellOf% = -1
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRAngleOf! (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRAngleOf! = sprItems(i%).angle Else SPRAngleOf! = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRVisible% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRVisible% = sprItems(i%).visible Else SPRVisible% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRLayerOf% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRLayerOf% = sprItems(i%).layer Else SPRLayerOf% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Animation
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRAnimSet (handle&, startCell%, endCell%, cellsPerSec!, style%)
+
+    Dim i%, s%, lo%, hi%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRAnimSet: no such sprite.": Exit Sub
+    s% = sprItems(i%).sheetIdx
+    lo% = startCell%: hi% = endCell%
+    If hi% < lo% Then Swap lo%, hi%
+    If lo% < 0 Or hi% >= sprSheets(s%).cellCount Then
+        SPRFail "SPRAnimSet: animation range falls outside the sheet."
+        Exit Sub
+    End If
+    sprItems(i%).animStart = lo%
+    sprItems(i%).animEnd = hi%
+    sprItems(i%).animRate = cellsPerSec!
+    sprItems(i%).animStyle = style%
+    sprItems(i%).animAccum = 0
+    sprItems(i%).animDone = 0
+    sprItems(i%).animDir = 1
+    If style% = SPR_BACKWARD Then sprItems(i%).cell = hi% Else sprItems(i%).cell = lo%
+    SPRBox i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRAnimOn (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRAnimOn: no such sprite.": Exit Sub
+    sprItems(i%).animOn = -1
+    sprItems(i%).animDone = 0
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRAnimOff (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRAnimOff: no such sprite.": Exit Sub
+    sprItems(i%).animOn = 0
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRAnimDone% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRAnimDone% = sprItems(i%).animDone Else SPRAnimDone% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRAnimNext (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRAnimNext: no such sprite.": Exit Sub
+    SPRStepAnim i%, 1
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRAnimPrev (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRAnimPrev: no such sprite.": Exit Sub
+    SPRStepAnim i%, -1
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' adv% is 1 for a forward step or -1 for a backward step. The animation style decides what
+' "forward" actually means, so SPRAnimPrev simply asks for a step of -1.
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRStepAnim (idx%, adv%)
+
+    Dim lo%, hi%, c%
+
+    lo% = sprItems(idx%).animStart
+    hi% = sprItems(idx%).animEnd
+    If hi% <= lo% Then Exit Sub
+    c% = sprItems(idx%).cell
+    If c% < lo% Or c% > hi% Then c% = lo%
+
+    Select Case sprItems(idx%).animStyle
+
+        Case SPR_FORWARD
+            c% = c% + adv%
+            If c% > hi% Then c% = lo%
+            If c% < lo% Then c% = hi%
+
+        Case SPR_BACKWARD
+            c% = c% - adv%
+            If c% > hi% Then c% = lo%
+            If c% < lo% Then c% = hi%
+
+        Case SPR_PINGPONG
+            If sprItems(idx%).animDir = 0 Then sprItems(idx%).animDir = 1
+            c% = c% + sprItems(idx%).animDir * adv%
+            If c% > hi% Then
+                c% = hi% - 1
+                sprItems(idx%).animDir = -sprItems(idx%).animDir
+            ElseIf c% < lo% Then
+                c% = lo% + 1
+                sprItems(idx%).animDir = -sprItems(idx%).animDir
+            End If
+
+        Case SPR_ONCE
+            If sprItems(idx%).animDone Then Exit Sub
+            c% = c% + adv%
+            If c% >= hi% Then
+                c% = hi%
+                sprItems(idx%).animDone = -1
+                sprItems(idx%).animOn = 0
+            End If
+            If c% < lo% Then c% = lo%
+
+    End Select
+
+    If c% < lo% Then c% = lo%
+    If c% > hi% Then c% = hi%
+    sprItems(idx%).cell = c%
+    SPRBox idx%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Per frame step. Pass the elapsed seconds since the previous call, so motion and animation
+' run at the same speed no matter what frame rate the game manages.
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRUpdate (dt!)
+
+    Dim i%, guard%
+
+    For i% = 1 To SPR_MAXSPRITE
+        If sprItems(i%).inuse Then
+            If sprItems(i%).vx <> 0 Or sprItems(i%).vy <> 0 Then
+                sprItems(i%).x = sprItems(i%).x + sprItems(i%).vx * dt!
+                sprItems(i%).y = sprItems(i%).y + sprItems(i%).vy * dt!
+                SPRBox i%
+            End If
+            If sprItems(i%).animOn Then
+                If sprItems(i%).animRate > 0 Then
+                    sprItems(i%).animAccum = sprItems(i%).animAccum + dt! * sprItems(i%).animRate
+                    guard% = 0
+                    Do While sprItems(i%).animAccum >= 1 And guard% < 64
+                        sprItems(i%).animAccum = sprItems(i%).animAccum - 1
+                        SPRStepAnim i%, 1
+                        guard% = guard% + 1
+                    Loop
+                    If sprItems(i%).animAccum >= 1 Then sprItems(i%).animAccum = 0
+                End If
+            End If
+        End If
+    Next i%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Geometry
+'-------------------------------------------------------------------------------------------------
+
+Function SPRCellImg& (idx%)
+
+    Dim s%, c%
+
+    SPRCellImg& = 0
+    s% = sprItems(idx%).sheetIdx
+    If s% < 1 Or s% > SPR_MAXSHEET Then Exit Function
+    If sprSheets(s%).inuse = 0 Then Exit Function
+    c% = sprItems(idx%).cell
+    If c% < 0 Or c% >= sprSheets(s%).cellCount Then Exit Function
+    SPRCellImg& = sprCells(sprSheets(s%).firstCell + c%)
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Fills px() and py() (both dimensioned 0 To 3) with the four corner offsets of the sprite
+' relative to its own x,y, in the order top left, bottom left, bottom right, top right,
+' after flipping, scaling and rotation have been applied.
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRCorners (idx%, px!(), py!())
+
+    Dim ci&, cw%, ch%, i%
+    Dim w!, h!, lf!, tp!, rt!, bt!
+    Dim sinr!, cosr!, x2!, y2!
+
+    For i% = 0 To 3
+        px!(i%) = 0
+        py!(i%) = 0
+    Next i%
+    ci& = SPRCellImg&(idx%)
+    If ci& = 0 Then Exit Sub
+    cw% = _Width(ci&)
+    ch% = _Height(ci&)
+    w! = cw% * sprItems(idx%).scaleX
+    h! = ch% * sprItems(idx%).scaleY
+    lf! = -sprItems(idx%).originX * w!
+    tp! = -sprItems(idx%).originY * h!
+    rt! = lf! + w!
+    bt! = tp! + h!
+
+    px!(0) = lf!: py!(0) = tp!
+    px!(1) = lf!: py!(1) = bt!
+    px!(2) = rt!: py!(2) = bt!
+    px!(3) = rt!: py!(3) = tp!
+
+    If (sprItems(idx%).flip And SPR_FLIPH) Then
+        Swap px!(0), px!(3): Swap py!(0), py!(3)
+        Swap px!(1), px!(2): Swap py!(1), py!(2)
+    End If
+    If (sprItems(idx%).flip And SPR_FLIPV) Then
+        Swap px!(0), px!(1): Swap py!(0), py!(1)
+        Swap px!(3), px!(2): Swap py!(3), py!(2)
+    End If
+
+    If sprItems(idx%).angle <> 0 Then
+        sinr! = Sin(-sprItems(idx%).angle / 57.2957795131)
+        cosr! = Cos(-sprItems(idx%).angle / 57.2957795131)
+        For i% = 0 To 3
+            x2! = px!(i%) * cosr! + sinr! * py!(i%)
+            y2! = py!(i%) * cosr! - px!(i%) * sinr!
+            px!(i%) = x2!
+            py!(i%) = y2!
+        Next i%
+    End If
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRBox (idx%)
+
+    Dim px!(0 To 3), py!(0 To 3)
+    Dim i%, minx!, maxx!, miny!, maxy!
+
+    SPRCorners idx%, px!(), py!()
+    minx! = px!(0): maxx! = px!(0)
+    miny! = py!(0): maxy! = py!(0)
+    For i% = 1 To 3
+        If px!(i%) < minx! Then minx! = px!(i%)
+        If px!(i%) > maxx! Then maxx! = px!(i%)
+        If py!(i%) < miny! Then miny! = py!(i%)
+        If py!(i%) > maxy! Then maxy! = py!(i%)
+    Next i%
+    sprItems(idx%).boxX1 = Int(sprItems(idx%).x + minx!)
+    sprItems(idx%).boxY1 = Int(sprItems(idx%).y + miny!)
+    sprItems(idx%).boxX2 = Int(sprItems(idx%).x + maxx!) - 1
+    sprItems(idx%).boxY2 = Int(sprItems(idx%).y + maxy!) - 1
+    If sprItems(idx%).boxX2 < sprItems(idx%).boxX1 Then sprItems(idx%).boxX2 = sprItems(idx%).boxX1
+    If sprItems(idx%).boxY2 < sprItems(idx%).boxY1 Then sprItems(idx%).boxY2 = sprItems(idx%).boxY1
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRLeft% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRLeft% = sprItems(i%).boxX1 Else SPRLeft% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRTop% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRTop% = sprItems(i%).boxY1 Else SPRTop% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRRight% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRRight% = sprItems(i%).boxX2 Else SPRRight% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRBottom% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRBottom% = sprItems(i%).boxY2 Else SPRBottom% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRWidth% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRWidth% = sprItems(i%).boxX2 - sprItems(i%).boxX1 + 1 Else SPRWidth% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRHeight% (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRHeight% = sprItems(i%).boxY2 - sprItems(i%).boxY1 + 1 Else SPRHeight% = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Drawing
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRRender (idx%, atX!, atY!)
+
+    Dim ci&, cw%, ch%
+    Dim w!, h!, lf!, tp!, rt!, bt!
+    Dim px!(0 To 3), py!(0 To 3)
+
+    ci& = SPRCellImg&(idx%)
+    If ci& = 0 Then Exit Sub
+    cw% = _Width(ci&)
+    ch% = _Height(ci&)
+
+    If sprItems(idx%).angle = 0 Then
+        w! = cw% * sprItems(idx%).scaleX
+        h! = ch% * sprItems(idx%).scaleY
+        lf! = atX! - sprItems(idx%).originX * w!
+        tp! = atY! - sprItems(idx%).originY * h!
+        rt! = lf! + w! - 1
+        bt! = tp! + h! - 1
+        If (sprItems(idx%).flip And SPR_FLIPH) Then Swap lf!, rt!
+        If (sprItems(idx%).flip And SPR_FLIPV) Then Swap tp!, bt!
+        _PutImage (lf!, tp!)-(rt!, bt!), ci&
+    Else
+        SPRCorners idx%, px!(), py!()
+        _MapTriangle (0, 0)-(0, ch% - 1)-(cw% - 1, ch% - 1), ci& To(atX! + px!(0), atY! + py!(0))-(atX! + px!(1), atY! + py!(1))-(atX! + px!(2), atY! + py!(2))
+        _MapTriangle (0, 0)-(cw% - 1, 0)-(cw% - 1, ch% - 1), ci& To(atX! + px!(0), atY! + py!(0))-(atX! + px!(3), atY! + py!(3))-(atX! + px!(2), atY! + py!(2))
+    End If
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRDraw (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRDraw: no such sprite.": Exit Sub
+    If sprItems(i%).visible = 0 Then Exit Sub
+    SPRRender i%, sprItems(i%).x, sprItems(i%).y
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Draws every visible sprite, lowest layer first. Within a layer, creation order wins.
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRDrawAll ()
+
+    Dim i%, lay%, lo%, hi%, seen%
+
+    lo% = SPR_MAXLAYER
+    hi% = 0
+    seen% = 0
+    For i% = 1 To SPR_MAXSPRITE
+        If sprItems(i%).inuse And sprItems(i%).visible Then
+            If sprItems(i%).layer < lo% Then lo% = sprItems(i%).layer
+            If sprItems(i%).layer > hi% Then hi% = sprItems(i%).layer
+            seen% = -1
+        End If
+    Next i%
+    If seen% = 0 Then Exit Sub
+
+    For lay% = lo% To hi%
+        For i% = 1 To SPR_MAXSPRITE
+            If sprItems(i%).inuse And sprItems(i%).visible Then
+                If sprItems(i%).layer = lay% Then SPRRender i%, sprItems(i%).x, sprItems(i%).y
+            End If
+        Next i%
+    Next lay%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Draws the sprite at an arbitrary spot without disturbing its own position. Handy for HUD
+' elements, tiled backgrounds, or the "stamp onto the scenery" trick.
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRStamp (handle&, x!, y!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRStamp: no such sprite.": Exit Sub
+    SPRRender i%, x!, y!
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Move and draw in one call, the frame driven counterpart to SPRUpdate. If the sprite has
+' animation switched on this advances it by ONE cell per call, so a sprite animates once per
+' rendered frame. Use SPRPut or SPRUpdate on a given sprite, not both, or it steps twice.
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRPut (handle&, x!, y!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRPut: no such sprite.": Exit Sub
+    sprItems(i%).x = x!
+    sprItems(i%).y = y!
+    SPRBox i%
+    If sprItems(i%).visible = 0 Then Exit Sub
+    If sprItems(i%).animOn Then SPRStepAnim i%, 1
+    SPRRender i%, x!, y!
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Collision
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetDetect (handle&, mode%)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetDetect: no such sprite.": Exit Sub
+    If mode% < SPR_NODETECT Or mode% > SPR_PIXELDETECT Then
+        SPRFail "SPRSetDetect: invalid detection mode."
+        Exit Sub
+    End If
+    sprItems(i%).detect = mode%
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+' Returns -1 when the two sprites overlap. Box test first. If BOTH sprites are set to
+' SPR_PIXELDETECT the overlapping rectangle is then walked pixel by pixel, inverse transforming
+' each screen point back into cell space so that rotation and scaling are respected without
+' building any temporary images.
+'-------------------------------------------------------------------------------------------------
+
+Function SPRHit% (handleA&, handleB&)
+
+    Dim ia%, ib%
+    Dim x1%, y1%, x2%, y2%, px%, py%
+    Dim ca&, cb&, wa%, ha%, wb%, hb%
+    Dim ma As _MEM, mb As _MEM
+    Dim gotHit%
+
+    SPRHit% = 0
+    ia% = SPRIdx%(handleA&)
+    ib% = SPRIdx%(handleB&)
+    If ia% = 0 Or ib% = 0 Then SPRFail "SPRHit: no such sprite.": Exit Function
+    If ia% = ib% Then Exit Function
+    If sprItems(ia%).detect = SPR_NODETECT Then Exit Function
+    If sprItems(ib%).detect = SPR_NODETECT Then Exit Function
+    If sprItems(ia%).visible = 0 Or sprItems(ib%).visible = 0 Then Exit Function
+    If sprItems(ia%).layer <> sprItems(ib%).layer Then Exit Function
+
+    x1% = sprItems(ia%).boxX1
+    If sprItems(ib%).boxX1 > x1% Then x1% = sprItems(ib%).boxX1
+    y1% = sprItems(ia%).boxY1
+    If sprItems(ib%).boxY1 > y1% Then y1% = sprItems(ib%).boxY1
+    x2% = sprItems(ia%).boxX2
+    If sprItems(ib%).boxX2 < x2% Then x2% = sprItems(ib%).boxX2
+    y2% = sprItems(ia%).boxY2
+    If sprItems(ib%).boxY2 < y2% Then y2% = sprItems(ib%).boxY2
+    If x1% > x2% Or y1% > y2% Then Exit Function
+
+    If sprItems(ia%).detect <> SPR_PIXELDETECT Or sprItems(ib%).detect <> SPR_PIXELDETECT Then
+        SPRHit% = -1
+        Exit Function
+    End If
+
+    ca& = SPRCellImg&(ia%)
+    cb& = SPRCellImg&(ib%)
+    If ca& = 0 Or cb& = 0 Then SPRHit% = -1: Exit Function
+    wa% = _Width(ca&): ha% = _Height(ca&)
+    wb% = _Width(cb&): hb% = _Height(cb&)
+    ma = _MemImage(ca&)
+    mb = _MemImage(cb&)
+
+    gotHit% = 0
+    For py% = y1% To y2%
+        For px% = x1% To x2%
+            If SPRAlphaAt%(ia%, ma, wa%, ha%, px%, py%) Then
+                If SPRAlphaAt%(ib%, mb, wb%, hb%, px%, py%) Then
+                    gotHit% = -1
+                    Exit For
+                End If
+            End If
+        Next px%
+        If gotHit% Then Exit For
+    Next py%
+
+    _MemFree ma
+    _MemFree mb
+    SPRHit% = gotHit%
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Reports whether the sprite covers screen point px,py with a non transparent pixel.
+' The caller supplies the already opened _MEM block so the image is not re-mapped per pixel.
+'-------------------------------------------------------------------------------------------------
+
+Function SPRAlphaAt% (idx%, m As _MEM, imgW%, imgH%, px%, py%)
+
+    Dim dx!, dy!, lx!, ly!, sinr!, cosr!
+    Dim cx%, cy%
+    Dim ofs As Long
+    Dim a As _Unsigned _Byte
+
+    SPRAlphaAt% = 0
+    If sprItems(idx%).scaleX = 0 Or sprItems(idx%).scaleY = 0 Then Exit Function
+
+    dx! = px% - sprItems(idx%).x
+    dy! = py% - sprItems(idx%).y
+    If sprItems(idx%).angle <> 0 Then
+        sinr! = Sin(-sprItems(idx%).angle / 57.2957795131)
+        cosr! = Cos(-sprItems(idx%).angle / 57.2957795131)
+        lx! = dx! * cosr! - sinr! * dy!
+        ly! = dy! * cosr! + dx! * sinr!
+    Else
+        lx! = dx!
+        ly! = dy!
+    End If
+    lx! = lx! / sprItems(idx%).scaleX
+    ly! = ly! / sprItems(idx%).scaleY
+    cx% = Int(lx! + sprItems(idx%).originX * imgW%)
+    cy% = Int(ly! + sprItems(idx%).originY * imgH%)
+    If (sprItems(idx%).flip And SPR_FLIPH) Then cx% = imgW% - 1 - cx%
+    If (sprItems(idx%).flip And SPR_FLIPV) Then cy% = imgH% - 1 - cy%
+    If cx% < 0 Or cy% < 0 Or cx% >= imgW% Or cy% >= imgH% Then Exit Function
+
+    ofs = (CLng(cy%) * imgW% + cx%) * 4 + 3
+    a = _MemGet(m, m.OFFSET + ofs, _Unsigned _Byte)
+    If a > 0 Then SPRAlphaAt% = -1
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Returns the handle of the first sprite found colliding with this one, or 0 for none.
+'-------------------------------------------------------------------------------------------------
+
+Function SPRHitAny& (handle&)
+
+    Dim i%, me%
+    Dim other&, res%
+
+    SPRHitAny& = SPR_NOHANDLE
+    me% = SPRIdx%(handle&)
+    If me% = 0 Then SPRFail "SPRHitAny: no such sprite.": Exit Function
+    If sprItems(me%).detect = SPR_NODETECT Then Exit Function
+
+    For i% = 1 To SPR_MAXSPRITE
+        If i% <> me% Then
+            If sprItems(i%).inuse Then
+                other& = i% + sprItems(i%).gen * 1024
+                res% = SPRHit%(handle&, other&)
+                If res% Then
+                    SPRHitAny& = other&
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i%
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Fills result&() with every sprite colliding with this one and returns how many were found.
+' Unlike the 2011 library this does not stop at the first hit. result&() should be dimensioned
+' by the caller, extra collisions past its upper bound are discarded.
+'-------------------------------------------------------------------------------------------------
+
+Function SPRHitList% (handle&, result&())
+
+    Dim i%, me%, n%, cap%
+    Dim other&, res%
+
+    SPRHitList% = 0
+    me% = SPRIdx%(handle&)
+    If me% = 0 Then SPRFail "SPRHitList: no such sprite.": Exit Function
+    If sprItems(me%).detect = SPR_NODETECT Then Exit Function
+
+    cap% = UBound(result&)
+    n% = 0
+    For i% = 1 To SPR_MAXSPRITE
+        If i% <> me% Then
+            If sprItems(i%).inuse Then
+                other& = i% + sprItems(i%).gen * 1024
+                res% = SPRHit%(handle&, other&)
+                If res% Then
+                    n% = n% + 1
+                    If n% <= cap% Then result&(n%) = other&
+                End If
+            End If
+        End If
+    Next i%
+    If n% > cap% Then n% = cap%
+    SPRHitList% = n%
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRDistance! (handleA&, handleB&)
+
+    Dim ia%, ib%
+    Dim dx!, dy!
+
+    SPRDistance! = 0
+    ia% = SPRIdx%(handleA&)
+    ib% = SPRIdx%(handleB&)
+    If ia% = 0 Or ib% = 0 Then SPRFail "SPRDistance: no such sprite.": Exit Function
+    dx! = sprItems(ib%).x - sprItems(ia%).x
+    dy! = sprItems(ib%).y - sprItems(ia%).y
+    SPRDistance! = Sqr(dx! * dx! + dy! * dy!)
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Angle from sprite A to sprite B, degrees, 0 = up, clockwise. Feed it straight to SPRSetAngle
+' to point one sprite at another.
+'-------------------------------------------------------------------------------------------------
+
+Function SPRAngleTo! (handleA&, handleB&)
+
+    Dim ia%, ib%
+    Dim dx!, dy!, a!
+
+    SPRAngleTo! = 0
+    ia% = SPRIdx%(handleA&)
+    ib% = SPRIdx%(handleB&)
+    If ia% = 0 Or ib% = 0 Then SPRFail "SPRAngleTo: no such sprite.": Exit Function
+    dx! = sprItems(ib%).x - sprItems(ia%).x
+    dy! = sprItems(ib%).y - sprItems(ia%).y
+    If dx! = 0 And dy! = 0 Then Exit Function
+    a! = _Atan2(dx!, -dy!) * 57.2957795131
+    If a! < 0 Then a! = a! + 360
+    SPRAngleTo! = a!
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRMouseOver% (handle&)
+
+    Dim i%, mx%, my%
+
+    SPRMouseOver% = 0
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRMouseOver: no such sprite.": Exit Function
+    If sprItems(i%).visible = 0 Then Exit Function
+    mx% = _MouseX
+    my% = _MouseY
+    If mx% < sprItems(i%).boxX1 Or mx% > sprItems(i%).boxX2 Then Exit Function
+    If my% < sprItems(i%).boxY1 Or my% > sprItems(i%).boxY2 Then Exit Function
+    SPRMouseOver% = -1
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+' Two general purpose numeric slots per sprite. The 2011 library called the first one "score"
+' and the Invaders demo leaned on it as an active/inactive flag, which is exactly the point.
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetVal (handle&, value!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetVal: no such sprite.": Exit Sub
+    sprItems(i%).userVal = value!
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Sub SPRSetVal2 (handle&, value!)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% = 0 Then SPRFail "SPRSetVal2: no such sprite.": Exit Sub
+    sprItems(i%).userVal2 = value!
+
+End Sub
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRVal! (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRVal! = sprItems(i%).userVal Else SPRVal! = 0
+
+End Function
+
+'-------------------------------------------------------------------------------------------------
+
+Function SPRVal2! (handle&)
+
+    Dim i%
+
+    i% = SPRIdx%(handle&)
+    If i% Then SPRVal2! = sprItems(i%).userVal2 Else SPRVal2! = 0
+
+End Function

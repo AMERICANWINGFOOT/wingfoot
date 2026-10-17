@@ -1,0 +1,136 @@
+'=========================================================
+' TextHelpers.bm - QB64Starter Text Helpers
+'
+' Font-aware text alignment and effects for graphics
+' screens. Everything is measured with _PrintWidth and
+' _FontHeight, so all helpers work with ANY active font -
+' including variable-width TTFs loaded via _LoadFont - and
+' they read _Width/_Height from the current _Dest image,
+' so they center on offscreen images and HUD layers too.
+'
+' Effect helpers (ShadowText / OutlineText) save and
+' restore both the current Color and _PrintMode, so they
+' leave the caller's state untouched.
+'
+' Requires a graphics screen (_NewImage). _PrintMode is
+' not available in SCREEN 0.
+'=========================================================
+
+Sub CenterText (py As Long, s$)
+    ' Horizontally centered at pixel row py, current color.
+    _PrintString ((_Width - _PrintWidth(s$)) \ 2, py), s$
+End Sub
+
+Sub CenterTextRow (rowNum As Long, s$)
+    ' Horizontally centered on text row rowNum (row 1 = top),
+    ' for when you think in rows instead of pixels.
+    _PrintString ((_Width - _PrintWidth(s$)) \ 2, (rowNum - 1) * _FontHeight), s$
+End Sub
+
+Sub CenterTextMid (s$)
+    ' Dead center of the image, both axes. Title cards, "PAUSED", etc.
+    _PrintString ((_Width - _PrintWidth(s$)) \ 2, (_Height - _FontHeight) \ 2), s$
+End Sub
+
+Sub RightText (px As Long, py As Long, s$)
+    ' Right-aligned: the text ENDS at pixel column px.
+    ' Pass _Width - margin to align against the right edge.
+    _PrintString (px - _PrintWidth(s$), py), s$
+End Sub
+
+Sub ShadowText (px As Long, py As Long, s$, fgColor As _Unsigned Long, shadowColor As _Unsigned Long)
+    ' Drop-shadowed text. Shadow offset scales with font size.
+    Dim oldColor As _Unsigned Long, pMode As Long, ofs As Long
+    oldColor = _DefaultColor
+    pMode = _PrintMode
+    _PrintMode _KeepBackground
+    ofs = _FontHeight \ 8
+    If ofs < 1 Then ofs = 1
+    Color shadowColor
+    _PrintString (px + ofs, py + ofs), s$
+    Color fgColor
+    _PrintString (px, py), s$
+    Color oldColor
+    RestorePrintMode pMode
+End Sub
+
+Sub CenterShadow (py As Long, s$, fgColor As _Unsigned Long, shadowColor As _Unsigned Long)
+    ' Centered + shadowed in one call - the title-screen special.
+    ShadowText (_Width - _PrintWidth(s$)) \ 2, py, s$, fgColor, shadowColor
+End Sub
+
+Sub OutlineText (px As Long, py As Long, s$, fgColor As _Unsigned Long, outlineColor As _Unsigned Long)
+    ' 1-pixel outline in all 8 directions - readable over any background.
+    Dim oldColor As _Unsigned Long, pMode As Long
+    Dim dx As Long, dy As Long
+    oldColor = _DefaultColor
+    pMode = _PrintMode
+    _PrintMode _KeepBackground
+    Color outlineColor
+    For dx = -1 To 1
+        For dy = -1 To 1
+            If dx <> 0 Or dy <> 0 Then _PrintString (px + dx, py + dy), s$
+        Next
+    Next
+    Color fgColor
+    _PrintString (px, py), s$
+    Color oldColor
+    RestorePrintMode pMode
+End Sub
+
+Sub RestorePrintMode (pMode As Long)
+    ' _PrintMode function return codes (QB64-PE wiki):
+    ' 1 = _KeepBackground, 2 = _OnlyBackground, 3 = _FillBackground (default)
+    Select Case pMode
+        Case 1: _PrintMode _KeepBackground
+        Case 2: _PrintMode _OnlyBackground
+        Case Else: _PrintMode _FillBackground
+    End Select
+End Sub
+
+Function PrintWrapped& (px As Long, py As Long, wrapW As Long, s$)
+    ' Greedy word-wrap. Prints s$ starting at (px, py), breaking at
+    ' spaces so no line exceeds wrapW pixels (font-aware). Embedded
+    ' Chr$(10) forces a line break. A single word wider than wrapW
+    ' is printed anyway rather than lost.
+    ' Returns the pixel y of the NEXT free line, so you can chain:
+    '   cy = PrintWrapped&(px, cy, w, para1$)
+    '   cy = PrintWrapped&(px, cy, w, para2$)
+    Dim remain$, para$
+    Dim cy As Long, nlPos As Long, idx As Long, cut As Long
+    remain$ = s$
+    cy = py
+    Do While Len(remain$) > 0
+        nlPos = InStr(remain$, Chr$(10))
+        If nlPos > 0 Then
+            para$ = Left$(remain$, nlPos - 1)
+            remain$ = Mid$(remain$, nlPos + 1)
+        Else
+            para$ = remain$
+            remain$ = ""
+        End If
+        Do
+            If _PrintWidth(para$) <= wrapW Or InStr(para$, " ") = 0 Then
+                _PrintString (px, cy), para$
+                cy = cy + _FontHeight
+                Exit Do
+            End If
+            ' Find the last space that still fits inside wrapW
+            cut = 0
+            idx = InStr(para$, " ")
+            Do While idx > 0
+                If _PrintWidth(Left$(para$, idx - 1)) <= wrapW Then
+                    cut = idx
+                    idx = InStr(idx + 1, para$, " ")
+                Else
+                    Exit Do
+                End If
+            Loop
+            If cut = 0 Then cut = InStr(para$, " ") ' overlong first word
+            _PrintString (px, cy), Left$(para$, cut - 1)
+            cy = cy + _FontHeight
+            para$ = Mid$(para$, cut + 1)
+        Loop
+    Loop
+    PrintWrapped& = cy
+End Function

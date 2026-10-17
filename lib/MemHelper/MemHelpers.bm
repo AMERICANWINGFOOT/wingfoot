@@ -1,0 +1,276 @@
+'=============================================================
+'  MemHelpers.bm  --  Implementation
+'=============================================================
+
+'--- Allocate a new buffer. Returns a handle, or -1 on failure.
+Function MemBufNew& (initialCap As Long)
+    Dim i As Long
+    Dim c As Long
+
+    MemBufNew& = -1
+
+    c = initialCap
+    If c < MEMBUF_MINCAP Then c = MEMBUF_MINCAP
+
+    For i = 0 To MEMBUF_MAX - 1
+        If mbUsed(i) = 0 Then
+            mbMem(i) = _MemNew(c)
+            If mbMem(i).SIZE = 0 Then Exit Function
+            _MemFill mbMem(i), mbMem(i).OFFSET, c, 0 As _Unsigned _Byte
+            mbCap(i) = c
+            mbLngth(i) = 0
+            mbUsed(i) = 1
+            MemBufNew& = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+'--- Release a buffer and return its handle to the pool.
+Sub MemBufFree (h As Long)
+    If h < 0 Or h > MEMBUF_MAX - 1 Then Exit Sub
+    If mbUsed(h) = 0 Then Exit Sub
+    If mbMem(h).SIZE > 0 Then _MemFree mbMem(h)
+    mbUsed(h) = 0
+    mbCap(h) = 0
+    mbLngth(h) = 0
+End Sub
+
+'--- Release every outstanding buffer (call before SYSTEM).
+Sub MemBufFreeAll ()
+    Dim i As Long
+    For i = 0 To MEMBUF_MAX - 1
+        If mbUsed(i) Then MemBufFree i
+    Next i
+End Sub
+
+'--- A handle is valid only if it is in range, live, and backed.
+Function MemBufValid% (h As Long)
+    MemBufValid% = 0
+    If h < 0 Or h > MEMBUF_MAX - 1 Then Exit Function
+    If mbUsed(h) = 0 Then Exit Function
+    If mbMem(h).SIZE = 0 Then Exit Function
+    MemBufValid% = -1
+End Function
+
+Function MemBufLength& (h As Long)
+    MemBufLength& = 0
+    If MemBufValid%(h) = 0 Then Exit Function
+    MemBufLength& = mbLngth(h)
+End Function
+
+Function MemBufCapacity& (h As Long)
+    MemBufCapacity& = 0
+    If MemBufValid%(h) = 0 Then Exit Function
+    MemBufCapacity& = mbCap(h)
+End Function
+
+'--- Logical truncation. Capacity is retained for reuse.
+Sub MemBufClear (h As Long)
+    If MemBufValid%(h) = 0 Then Exit Sub
+    mbLngth(h) = 0
+End Sub
+
+'--- Grow capacity to at least 'needed' bytes, doubling each step.
+'    Existing content is preserved; new space is zeroed.
+Sub MemBufReserve (h As Long, needed As Long)
+    Dim newCap As Long
+    Dim nm As _MEM
+
+    If MemBufValid%(h) = 0 Then Exit Sub
+    If needed <= mbCap(h) Then Exit Sub
+
+    newCap = mbCap(h)
+    If newCap < MEMBUF_MINCAP Then newCap = MEMBUF_MINCAP
+    Do While newCap < needed
+        If newCap > 1073741823 Then Exit Sub ' would overflow Long
+        newCap = newCap * 2
+    Loop
+
+    nm = _MemNew(newCap)
+    If nm.SIZE = 0 Then Exit Sub
+    _MemFill nm, nm.OFFSET, newCap, 0 As _Unsigned _Byte
+
+    If mbLngth(h) > 0 Then
+        _MemCopy mbMem(h), mbMem(h).OFFSET, mbLngth(h) To nm, nm.OFFSET
+    End If
+
+    _MemFree mbMem(h)
+    mbMem(h) = nm
+    mbCap(h) = newCap
+End Sub
+
+'--- Append a string to the end of the buffer.
+Sub MemBufAppend (h As Long, s As String)
+    Dim n As Long
+
+    If MemBufValid%(h) = 0 Then Exit Sub
+    n = Len(s)
+    If n = 0 Then Exit Sub
+
+    MemBufReserve h, mbLngth(h) + n
+    If mbCap(h) < mbLngth(h) + n Then Exit Sub
+
+    _MemPut mbMem(h), mbMem(h).OFFSET + mbLngth(h), s
+    mbLngth(h) = mbLngth(h) + n
+End Sub
+
+'--- Replace oldLen bytes at bpos with s. Pass oldLen = 0 to insert,
+'    pass s = "" to delete. The tail is staged through a string so
+'    the move is overlap-safe regardless of _MemCopy semantics.
+Sub MemBufReplace (h As Long, bpos As Long, oldLen As Long, s As String)
+    Dim oLen As Long
+    Dim newLen As Long
+    Dim tailLen As Long
+    Dim finalLen As Long
+    Dim tail As String
+
+    If MemBufValid%(h) = 0 Then Exit Sub
+    If bpos < 0 Or bpos > mbLngth(h) Then Exit Sub
+
+    oLen = oldLen
+    If oLen < 0 Then oLen = 0
+    If bpos + oLen > mbLngth(h) Then oLen = mbLngth(h) - bpos
+
+    newLen = Len(s)
+    tailLen = mbLngth(h) - (bpos + oLen)
+    finalLen = mbLngth(h) - oLen + newLen
+
+    If tailLen > 0 And newLen <> oLen Then
+        tail = Space$(tailLen)
+        _MemGet mbMem(h), mbMem(h).OFFSET + bpos + oLen, tail
+    End If
+
+    MemBufReserve h, finalLen
+    If mbCap(h) < finalLen Then Exit Sub
+
+    If newLen > 0 Then
+        _MemPut mbMem(h), mbMem(h).OFFSET + bpos, s
+    End If
+
+    If tailLen > 0 And newLen <> oLen Then
+        _MemPut mbMem(h), mbMem(h).OFFSET + bpos + newLen, tail
+    End If
+
+    mbLngth(h) = finalLen
+End Sub
+
+'--- Read 'count' bytes starting at bpos. Clamped to the used length.
+Function MemBufSlice$ (h As Long, bpos As Long, count As Long)
+    Dim n As Long
+    Dim s As String
+
+    MemBufSlice$ = ""
+    If MemBufValid%(h) = 0 Then Exit Function
+    If bpos < 0 Or bpos >= mbLngth(h) Then Exit Function
+
+    n = count
+    If bpos + n > mbLngth(h) Then n = mbLngth(h) - bpos
+    If n <= 0 Then Exit Function
+
+    s = Space$(n)
+    _MemGet mbMem(h), mbMem(h).OFFSET + bpos, s
+    MemBufSlice$ = s
+End Function
+
+'--- Read one line at 'cursor'. Handles CRLF, bare CR, and bare LF.
+'    lineStart/lineLen describe the text; advance includes the
+'    terminator, so cursor = cursor + advance walks the buffer.
+Sub MemBufReadLine (h As Long, cursor As Long, lineTxt As String, lineStart As Long, lineLen As Long, advance As Long)
+    Dim b As _Unsigned _Byte
+    Dim i As Long
+
+    lineTxt = ""
+    lineStart = cursor
+    lineLen = 0
+    advance = 0
+
+    If MemBufValid%(h) = 0 Then Exit Sub
+    If cursor < 0 Or cursor >= mbLngth(h) Then Exit Sub
+
+    i = cursor
+    Do While i < mbLngth(h)
+        _MemGet mbMem(h), mbMem(h).OFFSET + i, b
+        If b = 13 Or b = 10 Then Exit Do
+        i = i + 1
+    Loop
+
+    lineLen = i - cursor
+    If lineLen > 0 Then
+        lineTxt = Space$(lineLen)
+        _MemGet mbMem(h), mbMem(h).OFFSET + cursor, lineTxt
+    End If
+
+    advance = lineLen
+    If i < mbLngth(h) Then
+        _MemGet mbMem(h), mbMem(h).OFFSET + i, b
+        If b = 13 Then
+            advance = advance + 1
+            i = i + 1
+            If i < mbLngth(h) Then
+                _MemGet mbMem(h), mbMem(h).OFFSET + i, b
+                If b = 10 Then advance = advance + 1
+            End If
+        ElseIf b = 10 Then
+            advance = advance + 1
+        End If
+    End If
+End Sub
+
+'--- Load a whole file into the buffer. Returns 0 on failure.
+'    A missing file is not an error state for the buffer itself;
+'    it simply reports 0 and leaves the buffer empty.
+Function MemBufLoadFile% (h As Long, filePath As String)
+    Dim fileNum As Integer
+    Dim fsize As Long
+    Dim s As String
+
+    MemBufLoadFile% = 0
+    If MemBufValid%(h) = 0 Then Exit Function
+
+    mbLngth(h) = 0
+    If _FileExists(filePath) = 0 Then Exit Function
+
+    fileNum = FreeFile
+    Open filePath For Binary As #fileNum
+    fsize = LOF(fileNum)
+
+    If fsize > 0 Then
+        MemBufReserve h, fsize
+        If mbCap(h) < fsize Then
+            Close #fileNum
+            Exit Function
+        End If
+        s = Space$(fsize)
+        Get #fileNum, 1, s
+        _MemPut mbMem(h), mbMem(h).OFFSET, s
+        mbLngth(h) = fsize
+    End If
+
+    Close #fileNum
+    MemBufLoadFile% = -1
+End Function
+
+'--- Write the used portion (never the padding) out to a file.
+Function MemBufSaveFile% (h As Long, filePath As String)
+    Dim fileNum As Integer
+    Dim s As String
+
+    MemBufSaveFile% = 0
+    If MemBufValid%(h) = 0 Then Exit Function
+
+    fileNum = FreeFile
+    Open filePath For Output As #fileNum
+    Close #fileNum ' truncate any existing contents
+
+    If mbLngth(h) > 0 Then
+        fileNum = FreeFile
+        Open filePath For Binary As #fileNum
+        s = Space$(mbLngth(h))
+        _MemGet mbMem(h), mbMem(h).OFFSET, s
+        Put #fileNum, 1, s
+        Close #fileNum
+    End If
+
+    MemBufSaveFile% = -1
+End Function

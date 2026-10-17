@@ -1,0 +1,440 @@
+' ============================================================================
+' SERDiag.bm  -  One-pass image diagnostics (v1.1)
+'
+' Include at the BOTTOM of a program that already includes SERStars.bm
+' (this reuses BrightAt& for format-agnostic brightness, so it works on
+'  MONO/RAW and RGB/BGR at 8- or 16-bit without special-casing):
+'     '$INCLUDE:'SERStars.bm'
+'     '$INCLUDE:'SERDiag.bm'
+'
+' The idea: don't write a separate tool per problem. Measure a few primitives
+' once, then read the PATTERN of those numbers across the frame to name the
+' cause. Same symptom (non-round stars) has several causes; the fingerprint is
+' WHERE in the frame the defect lives, and which way it points.
+'
+' Public entries:
+'   RunDiagnostics m, w, h, sampleBytes, le, report(), nLines, _
+'                  sxOut(), syOut(), seOut(), saOut(), sszOut(), nOut
+'       Fills report(1..nLines) with findings AND returns the detected stars
+'       (position, elongation, angle, size) so they can be drawn. Caller
+'       supplies ReDim'd arrays sized to at least DIAG_MAXSTARS.
+'
+'   DrawDiagOverlay img, sxOut(), syOut(), seOut(), saOut(), nOut
+'       Draws each star onto a 32-bit image: a coloured dot (green=round ->
+'       red=bad) plus a tick along its long axis whose LENGTH grows with
+'       elongation. The tick field IS the fingerprint you read by eye.
+'
+' What v1 checks:
+'   * Star roundness + the shape pattern (tracking / coma / tilt / curvature)
+'   * Background gradient (light pollution) vs vignetting
+'   * Hot pixels / isolated outliers
+'
+' Deliberately NOT in v1 (each needs an extra axis of data, noted at the end):
+'   * Astigmatism  - elongation flips through focus (needs a focus sweep)
+'   * Pinched optics - triangular stars (needs 3rd moments, not a 2-axis ellipse)
+'   * Chromatic aberration / atmospheric dispersion (needs per-channel measures)
+' ============================================================================
+
+Const DIAG_THRMULT = 4 ' star threshold = frame mean * this
+Const DIAG_WIN = 5 ' half-window (px) for the per-star shape measurement
+Const DIAG_MINSEP = 10 ' min separation (px) so one star isn't counted twice
+Const DIAG_MAXSTARS = 400 ' cap on stars measured (plenty for a diagnosis)
+
+' ---------------------------------------------------------------------------
+' Two-decimal string, no leading space, for tidy report lines.
+' ---------------------------------------------------------------------------
+Function F2$ (x As Double)
+    Dim n As Long
+    n = Int(x * 100 + 0.5)
+    F2$ = _Trim$(Str$(n \ 100)) + "." + Right$("0" + _Trim$(Str$(n Mod 100)), 2)
+End Function
+
+' ---------------------------------------------------------------------------
+' Subsampled frame mean (every 4th pixel) -> auto threshold source.
+' ---------------------------------------------------------------------------
+Function DiagMean# (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long)
+    Dim x As Long, y As Long
+    Dim sumv As Double, cnt As Double
+    For y = 0 To h - 1 Step 4
+        For x = 0 To w - 1 Step 4
+            sumv = sumv + BrightAt&(m, y * w + x, sampleBytes, le)
+            cnt = cnt + 1
+        Next x
+    Next y
+    If cnt < 1 Then cnt = 1
+    DiagMean# = sumv / cnt
+End Function
+
+' ---------------------------------------------------------------------------
+' Detect stars and measure each one's ellipse. For every accepted star we fill:
+'   sx,sy   - centroid (px)
+'   se      - elongation = long axis / short axis   (1.0 = perfectly round)
+'   sa      - long-axis angle in RADIANS (orientation, only meaningful mod pi)
+'   ssz     - size = mean gaussian sigma (sqrt of averaged axis variance)
+'
+' Method: a pixel is a seed if it's above threshold and a local peak; we then
+' take intensity-weighted 1st + 2nd moments in a small window (weights are
+' brightness above the threshold floor). The 2x2 covariance
+'     [ mxx  mxy ]
+'     [ mxy  myy ]
+' has eigenvalues l1>=l2 (the squared semi-axes) and an eigenvector angle.
+' This is literally CentroidMono's first moments plus three more sums.
+' ---------------------------------------------------------------------------
+Sub DetectStars (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, thr As Long, sx() As Double, sy() As Double, se() As Double, sa() As Double, ssz() As Double, maxN As Long, nFound As Long)
+    Dim x As Long, y As Long, v As Long, i As Long, tooClose As Integer
+    Dim dx As Long, dy As Long, px As Long, py As Long, wt As Double
+    Dim sw As Double, sX As Double, sY As Double
+    Dim sXX As Double, sYY As Double, sXY As Double
+    Dim cx As Double, cy As Double, mxx As Double, myy As Double, mxy As Double
+    Dim tr As Double, det As Double, disc As Double, l1 As Double, l2 As Double
+    nFound = 0
+
+    For y = DIAG_WIN To h - 1 - DIAG_WIN
+        For x = DIAG_WIN To w - 1 - DIAG_WIN
+            v = BrightAt&(m, y * w + x, sampleBytes, le)
+            If v >= thr Then
+                ' cheap local-peak test (brighter than neighbours 2px out)
+                If v >= BrightAt&(m, y * w + (x - 2), sampleBytes, le) Then
+                    If v >= BrightAt&(m, y * w + (x + 2), sampleBytes, le) Then
+                        If v >= BrightAt&(m, (y - 2) * w + x, sampleBytes, le) Then
+                            If v >= BrightAt&(m, (y + 2) * w + x, sampleBytes, le) Then
+                                ' reject if within MINSEP of a star we already have
+                                tooClose = 0
+                                For i = 1 To nFound
+                                    If Abs(sx(i) - x) < DIAG_MINSEP And Abs(sy(i) - y) < DIAG_MINSEP Then tooClose = -1: Exit For
+                                Next i
+                                If Not tooClose Then
+                                    ' --- weighted 1st + 2nd moments in the window ---
+                                    sw = 0: sX = 0: sY = 0: sXX = 0: sYY = 0: sXY = 0
+                                    For dy = -DIAG_WIN To DIAG_WIN
+                                        For dx = -DIAG_WIN To DIAG_WIN
+                                            px = x + dx: py = y + dy
+                                            wt = BrightAt&(m, py * w + px, sampleBytes, le) - thr
+                                            If wt > 0 Then
+                                                sw = sw + wt
+                                                sX = sX + wt * px: sY = sY + wt * py
+                                                sXX = sXX + wt * px * px
+                                                sYY = sYY + wt * py * py
+                                                sXY = sXY + wt * px * py
+                                            End If
+                                        Next dx
+                                    Next dy
+                                    If sw > 0 Then
+                                        cx = sX / sw: cy = sY / sw
+                                        mxx = sXX / sw - cx * cx
+                                        myy = sYY / sw - cy * cy
+                                        mxy = sXY / sw - cx * cy
+                                        tr = mxx + myy: det = mxx * myy - mxy * mxy
+                                        disc = (tr * tr) / 4 - det
+                                        If disc < 0 Then disc = 0
+                                        disc = Sqr(disc)
+                                        l1 = tr / 2 + disc ' major variance
+                                        l2 = tr / 2 - disc ' minor variance
+                                        If l2 < 0.0001 Then l2 = 0.0001
+                                        If nFound < maxN Then
+                                            nFound = nFound + 1
+                                            sx(nFound) = cx: sy(nFound) = cy
+                                            se(nFound) = Sqr(l1 / l2)
+                                            sa(nFound) = 0.5 * _Atan2(2 * mxy, mxx - myy)
+                                            ssz(nFound) = Sqr((l1 + l2) / 2)
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Next x
+    Next y
+End Sub
+
+' ---------------------------------------------------------------------------
+' Background: sample an 8x6 grid of cell-minimums (robust to stars sitting in a
+' cell), fit a plane bg = a*x + b*y + c by least squares over cell centres, and
+' also measure corner-vs-centre darkening. A strong DIRECTIONAL plane = light
+' pollution gradient; symmetric corner darkening with a weak plane = vignetting.
+' Returns gradient drop and vignette drop as PERCENT of the mean level.
+' ---------------------------------------------------------------------------
+Sub MeasureBackground (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, meanv As Double, gradPct As Double, vigPct As Double)
+    Const GW = 8, GH = 6
+    Dim gx As Long, gy As Long, x As Long, y As Long, x0 As Long, y0 As Long, x1 As Long, y1 As Long
+    Dim cellMin As Double, v As Double
+    Dim cxc As Double, cyc As Double
+    Dim n As Double, Sx As Double, Sy As Double, Sz As Double
+    Dim Sxx As Double, Syy As Double, Sxy As Double, Sxz As Double, Syz As Double
+    Dim cornerSum As Double, cornerCnt As Double, centreSum As Double, centreCnt As Double
+    Dim bg(1 To GW, 1 To GH) As Double
+
+    For gy = 1 To GH
+        y0 = Int((gy - 1) * h / GH): y1 = Int(gy * h / GH) - 1
+        For gx = 1 To GW
+            x0 = Int((gx - 1) * w / GW): x1 = Int(gx * w / GW) - 1
+            cellMin = 1E15
+            For y = y0 To y1 Step 3
+                For x = x0 To x1 Step 3
+                    v = BrightAt&(m, y * w + x, sampleBytes, le)
+                    If v < cellMin Then cellMin = v
+                Next x
+            Next y
+            bg(gx, gy) = cellMin
+            cxc = (x0 + x1) / 2: cyc = (y0 + y1) / 2
+            n = n + 1: Sx = Sx + cxc: Sy = Sy + cyc: Sz = Sz + cellMin
+            Sxx = Sxx + cxc * cxc: Syy = Syy + cyc * cyc: Sxy = Sxy + cxc * cyc
+            Sxz = Sxz + cxc * cellMin: Syz = Syz + cyc * cellMin
+            ' corners vs centre for the vignette test
+            If (gx <= 2 Or gx >= GW - 1) And (gy <= 2 Or gy >= GH - 1) Then
+                cornerSum = cornerSum + cellMin: cornerCnt = cornerCnt + 1
+            ElseIf (gx >= 3 And gx <= GW - 2) And (gy >= 2 And gy <= GH - 1) Then
+                centreSum = centreSum + cellMin: centreCnt = centreCnt + 1
+            End If
+        Next gx
+    Next gy
+
+    ' least-squares plane (solve the 3x3 normal equations by elimination)
+    Dim a As Double, b As Double
+    SolvePlane n, Sx, Sy, Sxx, Syy, Sxy, Sz, Sxz, Syz, a, b
+    Dim drop As Double
+    drop = Sqr((a * w) * (a * w) + (b * h) * (b * h)) ' total level change corner-to-corner
+    If meanv < 1 Then meanv = 1
+    gradPct = drop / meanv * 100
+
+    If cornerCnt > 0 And centreCnt > 0 Then
+        vigPct = (centreSum / centreCnt - cornerSum / cornerCnt) / meanv * 100
+        If vigPct < 0 Then vigPct = 0
+    Else
+        vigPct = 0
+    End If
+End Sub
+
+' Solve the 3x3 normal equations for a least-squares plane z = a*x + b*y + c.
+' Returns a, b (c isn't needed by the caller). Gaussian elimination, tiny.
+Sub SolvePlane (n As Double, Sx As Double, Sy As Double, Sxx As Double, Syy As Double, Sxy As Double, Sz As Double, Sxz As Double, Syz As Double, a As Double, b As Double)
+    Dim M(1 To 3, 1 To 4) As Double, i As Long, j As Long, k As Long
+    Dim piv As Double, f As Double
+    M(1, 1) = Sxx: M(1, 2) = Sxy: M(1, 3) = Sx: M(1, 4) = Sxz
+    M(2, 1) = Sxy: M(2, 2) = Syy: M(2, 3) = Sy: M(2, 4) = Syz
+    M(3, 1) = Sx: M(3, 2) = Sy: M(3, 3) = n: M(3, 4) = Sz
+    For k = 1 To 3
+        piv = M(k, k)
+        If Abs(piv) < 0.0000001 Then a = 0: b = 0: Exit Sub
+        For j = k To 4: M(k, j) = M(k, j) / piv: Next j
+        For i = 1 To 3
+            If i <> k Then
+                f = M(i, k)
+                For j = k To 4: M(i, j) = M(i, j) - f * M(k, j): Next j
+            End If
+        Next i
+    Next k
+    a = M(1, 4): b = M(2, 4)
+End Sub
+
+' ---------------------------------------------------------------------------
+' Count isolated bright outliers (hot pixels / amp-glow speckle): a pixel far
+' above the mean whose 4-neighbours are all near background -> not a real star.
+' ---------------------------------------------------------------------------
+Function HotPixelCount& (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, meanv As Double)
+    Dim x As Long, y As Long, v As Long, hotThr As Long, nbThr As Long, c As Long
+    hotThr = Int(meanv * 8): If hotThr < 1 Then hotThr = 1
+    nbThr = Int(meanv * 2) + 1
+    c = 0
+    For y = 1 To h - 2 Step 2
+        For x = 1 To w - 2 Step 2
+            v = BrightAt&(m, y * w + x, sampleBytes, le)
+            If v > hotThr Then
+                If BrightAt&(m, y * w + (x - 1), sampleBytes, le) < nbThr Then
+                    If BrightAt&(m, y * w + (x + 1), sampleBytes, le) < nbThr Then
+                        If BrightAt&(m, (y - 1) * w + x, sampleBytes, le) < nbThr Then
+                            If BrightAt&(m, (y + 1) * w + x, sampleBytes, le) < nbThr Then
+                                c = c + 1
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Next x
+    Next y
+    HotPixelCount& = c
+End Function
+
+' ---------------------------------------------------------------------------
+' The orchestrator: measure everything once, then apply the rules and write the
+' report. Also hands the detected stars back to the caller (sxOut..nOut) so the
+' overlay can draw them. Caller supplies ReDim'd arrays (>= DIAG_MAXSTARS).
+' ---------------------------------------------------------------------------
+Sub RunDiagnostics (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, report() As String, nLines As Long, sxOut() As Double, syOut() As Double, seOut() As Double, saOut() As Double, sszOut() As Double, nOut As Long)
+    Dim thr As Long, meanv As Double
+    meanv = DiagMean#(m, w, h, sampleBytes, le)
+    thr = Int(meanv * DIAG_THRMULT)
+    If thr < 1 Then thr = 1
+
+    ReDim sx(1 To DIAG_MAXSTARS) As Double, sy(1 To DIAG_MAXSTARS) As Double
+    ReDim se(1 To DIAG_MAXSTARS) As Double, sa(1 To DIAG_MAXSTARS) As Double
+    ReDim ssz(1 To DIAG_MAXSTARS) As Double
+    Dim nst As Long
+    DetectStars m, w, h, sampleBytes, le, thr, sx(), sy(), se(), sa(), ssz(), DIAG_MAXSTARS, nst
+
+    ' hand the stars back to the caller for the overlay
+    Dim ci As Long
+    nOut = nst
+    For ci = 1 To nst
+        sxOut(ci) = sx(ci): syOut(ci) = sy(ci)
+        seOut(ci) = se(ci): saOut(ci) = sa(ci): sszOut(ci) = ssz(ci)
+    Next ci
+
+    nLines = 0
+    AddLine report(), nLines, "=== SER Diagnostics (v1) ==="
+    AddLine report(), nLines, "Stars measured:" + Str$(nst)
+
+    ' ---- Background + hot pixels (always reported) ----
+    Dim gradPct As Double, vigPct As Double, hot As Long
+    MeasureBackground m, w, h, sampleBytes, le, meanv, gradPct, vigPct
+    hot = HotPixelCount&(m, w, h, sampleBytes, le, meanv)
+
+    ' ---- Star-shape aggregates ----
+    Dim i As Long, cxF As Double, cyF As Double, halfDiag As Double
+    cxF = (w - 1) / 2: cyF = (h - 1) / 2
+    halfDiag = Sqr(cxF * cxF + cyF * cyF)
+
+    Dim meanElong As Double, meanRad As Double, meanSize As Double
+    Dim sumC As Double, sumS As Double, sumWt As Double
+    Dim radialNum As Double, radialDen As Double
+    Dim bx As Double, by As Double, bden As Double
+    Dim covER As Double, edgeSize As Double, edgeCnt As Double, coreSize As Double, coreCnt As Double
+    Dim rad As Double, phi As Double, e As Double
+
+    If nst >= 8 Then
+        For i = 1 To nst
+            meanElong = meanElong + se(i)
+            meanSize = meanSize + ssz(i)
+            rad = Sqr((sx(i) - cxF) * (sx(i) - cxF) + (sy(i) - cyF) * (sy(i) - cyF))
+            meanRad = meanRad + rad
+        Next i
+        meanElong = meanElong / nst: meanSize = meanSize / nst: meanRad = meanRad / nst
+
+        For i = 1 To nst
+            e = se(i)
+            rad = Sqr((sx(i) - cxF) * (sx(i) - cxF) + (sy(i) - cyF) * (sy(i) - cyF))
+            phi = _Atan2(sy(i) - cyF, sx(i) - cxF)
+            ' uniform-direction vector (doubled angle, weighted by elongation)
+            sumC = sumC + (e - 1) * Cos(2 * sa(i))
+            sumS = sumS + (e - 1) * Sin(2 * sa(i))
+            sumWt = sumWt + (e - 1)
+            ' radial (coma) alignment, weighted by elongation * radius
+            radialNum = radialNum + (e - 1) * rad * Cos(2 * (sa(i) - phi))
+            radialDen = radialDen + (e - 1) * rad
+            ' asymmetry: centroid of "badness"
+            bx = bx + (e - 1) * sx(i): by = by + (e - 1) * sy(i): bden = bden + (e - 1)
+            ' elongation-vs-radius covariance
+            covER = covER + (e - meanElong) * (rad - meanRad)
+            ' size at edge vs core
+            If rad > 0.6 * halfDiag Then
+                edgeSize = edgeSize + ssz(i): edgeCnt = edgeCnt + 1
+            ElseIf rad < 0.3 * halfDiag Then
+                coreSize = coreSize + ssz(i): coreCnt = coreCnt + 1
+            End If
+        Next i
+
+        Dim conc As Double, domAngDeg As Double, radialScore As Double, asymFrac As Double, sizeGrow As Double
+        If sumWt > 0 Then conc = Sqr(sumC * sumC + sumS * sumS) / sumWt Else conc = 0
+        domAngDeg = 0.5 * _Atan2(sumS, sumC) * 180 / 3.14159265
+        If domAngDeg < 0 Then domAngDeg = domAngDeg + 180
+        If radialDen > 0 Then radialScore = radialNum / radialDen Else radialScore = 0
+        If bden > 0 Then
+            bx = bx / bden: by = by / bden
+            asymFrac = Sqr((bx - cxF) * (bx - cxF) + (by - cyF) * (by - cyF)) / halfDiag
+        End If
+        If edgeCnt > 0 And coreCnt > 0 Then sizeGrow = (edgeSize / edgeCnt) / (coreSize / coreCnt)
+
+        AddLine report(), nLines, "Median elongation: " + F2$(meanElong) + "  (1.00 = round)"
+
+        ' -------- the rules --------
+        If meanElong < 1.12 Then
+            AddLine report(), nLines, "STARS: round. No significant shape fault."
+        ElseIf conc > 0.55 And conc > Abs(radialScore) Then
+            AddLine report(), nLines, "STARS: elongated one direction (~" + _Trim$(Str$(Int(domAngDeg))) + " deg)."
+            AddLine report(), nLines, "  Likely: tracking / guiding error, flexure, or wind."
+            AddLine report(), nLines, "  Check: guiding (RA vs Dec), polar align, cable snag, balance."
+        ElseIf radialScore > 0.35 And asymFrac < 0.25 And covER > 0 Then
+            AddLine report(), nLines, "STARS: point radially, worse toward edges (coma)."
+            AddLine report(), nLines, "  Likely: coma corrector spacing or collimation."
+            AddLine report(), nLines, "  Check: corrector backspacing, primary collimation."
+        ElseIf asymFrac >= 0.25 Then
+            AddLine report(), nLines, "STARS: worse toward one side of the frame (tilt)."
+            AddLine report(), nLines, "  Likely: sensor tilt / camera not square to the optical axis."
+            AddLine report(), nLines, "  Check: tilt adjuster, adapters, filter drawer seating."
+        ElseIf sizeGrow > 1.4 Then
+            AddLine report(), nLines, "STARS: round but bloated at the edges (field curvature)."
+            AddLine report(), nLines, "  Likely: backfocus distance / no field flattener."
+            AddLine report(), nLines, "  Check: flattener spacing (often ~55mm)."
+        Else
+            AddLine report(), nLines, "STARS: non-round, pattern mixed / unclear."
+            AddLine report(), nLines, "  Could be several causes at once. If stars look TRIANGULAR,"
+            AddLine report(), nLines, "  suspect pinched optics (over-tight mirror/lens clamps)."
+        End If
+    Else
+        AddLine report(), nLines, "STARS: too few detected for a shape diagnosis."
+        AddLine report(), nLines, "  Raise exposure/gain, or lower DIAG_THRMULT."
+    End If
+
+    ' ---- background verdicts ----
+    If gradPct > 12 And gradPct > vigPct Then
+        AddLine report(), nLines, "BACKGROUND: gradient ~" + _Trim$(Str$(Int(gradPct))) + "% across frame."
+        AddLine report(), nLines, "  Likely: light pollution / moon / sky glow. Fixable in post."
+    ElseIf vigPct > 10 Then
+        AddLine report(), nLines, "BACKGROUND: corners ~" + _Trim$(Str$(Int(vigPct))) + "% darker (vignetting)."
+        AddLine report(), nLines, "  Fix with flat frames."
+    Else
+        AddLine report(), nLines, "BACKGROUND: reasonably even."
+    End If
+
+    ' ---- hot pixels ----
+    If hot > 30 Then
+        AddLine report(), nLines, "HOT PIXELS:" + Str$(hot) + " isolated outliers."
+        AddLine report(), nLines, "  Fix with dark frames + dithering."
+    Else
+        AddLine report(), nLines, "HOT PIXELS: few (" + _Trim$(Str$(hot)) + ")."
+    End If
+
+    AddLine report(), nLines, "--- note: v1 does not yet detect astigmatism,"
+    AddLine report(), nLines, "    pinched optics, or colour dispersion (see header). ---"
+End Sub
+
+' ---------------------------------------------------------------------------
+' Draw the measured stars onto a 32-bit image. Dot colour = severity
+' (green round -> amber -> red), and a tick along the long axis whose length
+' grows with elongation. Round stars show only a small green dot; the direction
+' field of the ticks is the pattern you read to confirm the report's verdict.
+' Draw this on the full-res preview image, THEN scale it to the window.
+' ---------------------------------------------------------------------------
+Sub DrawDiagOverlay (img As Long, sxOut() As Double, syOut() As Double, seOut() As Double, saOut() As Double, nOut As Long)
+    Dim prev As Long, i As Long, e As Double, ln As Double, dx As Double, dy As Double
+    Dim col As _Unsigned Long
+    prev = _Dest
+    _Dest img
+    For i = 1 To nOut
+        e = seOut(i)
+        If e < 1.12 Then
+            col = _RGB32(80, 230, 90)
+        ElseIf e < 1.3 Then
+            col = _RGB32(240, 210, 60)
+        Else
+            col = _RGB32(240, 70, 60)
+        End If
+        Circle (sxOut(i), syOut(i)), 3, col
+        If e > 1.08 Then
+            ln = 5 + (e - 1) * 22 ' longer tick = more elongated
+            dx = Cos(saOut(i)) * ln: dy = Sin(saOut(i)) * ln
+            Line (sxOut(i) - dx, syOut(i) - dy)-(sxOut(i) + dx, syOut(i) + dy), col
+        End If
+    Next i
+    _Dest prev
+End Sub
+
+' Append one line to the report array (grows the count).
+Sub AddLine (report() As String, nLines As Long, s As String)
+    If nLines < UBound(report) Then
+        nLines = nLines + 1
+        report(nLines) = s
+    End If
+End Sub

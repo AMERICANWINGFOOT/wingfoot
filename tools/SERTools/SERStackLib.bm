@@ -1,0 +1,129 @@
+' ============================================================================
+' SERStackLib.bm  -  Frame quality-ranking + averaging for 1-sample formats
+'                    (MONO8/16, RAW8/16). The stacking counterpart to the
+'                    centroid work in SERFmtMono.bm.
+'
+' Include at the BOTTOM of a program that stacks:
+'     '$INCLUDE:'SERStackLib.bm'
+'
+'   SampleMono&  - read one pixel's full value (8- or 16-bit, endian-aware)
+'   QualityMono# - sharpness score for a frame (higher = crisper)
+'   AccumMono    - add a frame's pixels into a Double accumulator
+'   FinalizeMono - divide the accumulator by the count -> averaged frame bytes
+'   SortDescD    - sort a Double array high-to-low (to find the keep cutoff)
+'
+' Stacking assumes the frames are already aligned (i.e. run through SERCenter);
+' there's no sub-pixel registration here -- just rank, select, average.
+' ============================================================================
+
+' ---------------------------------------------------------------------------
+' Full-precision read of one sample. 16-bit uses the whole value (not the
+' display byte) -- the average needs every bit.
+' ---------------------------------------------------------------------------
+Function SampleMono& (m As _MEM, idx As Long, sampleBytes As Long, le As Long)
+    Dim lo As _UNSIGNED _BYTE, hi As _UNSIGNED _BYTE
+    If sampleBytes = 1 Then
+        SampleMono& = _MemGet(m, m.OFFSET + idx, _UNSIGNED _BYTE)
+    Else
+        lo = _MemGet(m, m.OFFSET + idx * 2 + 0, _UNSIGNED _BYTE)
+        hi = _MemGet(m, m.OFFSET + idx * 2 + 1, _UNSIGNED _BYTE)
+        If le <> 0 Then SampleMono& = lo + hi * 256 Else SampleMono& = hi + lo * 256
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+' Sharpness = gradient energy: sum of squared differences to the right and
+' downward neighbours, subsampled (every 2nd pixel) for speed. A frame the
+' atmosphere blurred has little high-frequency detail, so it scores low; a
+' crisp frame scores high. Relative order is all that matters for ranking.
+' ---------------------------------------------------------------------------
+Function QualityMono# (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long)
+    Dim x As Long, y As Long, v As Long, vr As Long, vd As Long
+    Dim gx As Double, gy As Double, s As Double
+    Const ST = 2
+    s = 0
+    For y = 0 To h - 1 - ST Step ST
+        For x = 0 To w - 1 - ST Step ST
+            v = SampleMono&(m, y * w + x, sampleBytes, le)
+            vr = SampleMono&(m, y * w + (x + ST), sampleBytes, le)
+            vd = SampleMono&(m, (y + ST) * w + x, sampleBytes, le)
+            gx = vr - v
+            gy = vd - v
+            s = s + gx * gx + gy * gy
+        Next x
+    Next y
+    QualityMono# = s
+End Function
+
+' ---------------------------------------------------------------------------
+' Add every pixel of this frame into the running Double sum buffer.
+' ---------------------------------------------------------------------------
+Sub AccumMono (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, accum() As Double)
+    Dim p As Long, n As Long, v As Long
+    Dim lo As _UNSIGNED _BYTE, hi As _UNSIGNED _BYTE
+    Dim ooff As _Offset
+    n = w * h
+    ooff = m.OFFSET
+    For p = 0 To n - 1
+        If sampleBytes = 1 Then
+            v = _MemGet(m, ooff, _UNSIGNED _BYTE)
+            ooff = ooff + 1
+        Else
+            lo = _MemGet(m, ooff + 0, _UNSIGNED _BYTE)
+            hi = _MemGet(m, ooff + 1, _UNSIGNED _BYTE)
+            If le <> 0 Then v = lo + hi * 256 Else v = hi + lo * 256
+            ooff = ooff + 2
+        End If
+        accum(p) = accum(p) + v
+    Next p
+End Sub
+
+' ---------------------------------------------------------------------------
+' Turn the accumulator into an averaged output frame, written back in the SAME
+' format/endianness as the input so it drops into a normal SER.
+' ---------------------------------------------------------------------------
+Sub FinalizeMono (accum() As Double, cnt As Long, w As Long, h As Long, sampleBytes As Long, le As Long, outM As _MEM)
+    Dim p As Long, n As Long, avg As Long
+    Dim ooff As _Offset
+    n = w * h
+    ooff = outM.OFFSET
+    For p = 0 To n - 1
+        avg = Int(accum(p) / cnt + 0.5)
+        If sampleBytes = 1 Then
+            If avg > 255 Then avg = 255
+            _MemPut outM, ooff, avg AS _UNSIGNED _BYTE
+            ooff = ooff + 1
+        Else
+            If avg > 65535 Then avg = 65535
+            If le <> 0 Then
+                _MemPut outM, ooff + 0, (avg And 255) AS _UNSIGNED _BYTE
+                _MemPut outM, ooff + 1, ((avg \ 256) And 255) AS _UNSIGNED _BYTE
+            Else
+                _MemPut outM, ooff + 0, ((avg \ 256) And 255) AS _UNSIGNED _BYTE
+                _MemPut outM, ooff + 1, (avg And 255) AS _UNSIGNED _BYTE
+            End If
+            ooff = ooff + 2
+        End If
+    Next p
+End Sub
+
+' ---------------------------------------------------------------------------
+' Comb sort, descending. Used on a copy of the scores so the K-th entry is the
+' quality cutoff for "keep the best K frames".
+' ---------------------------------------------------------------------------
+Sub SortDescD (a() As Double, n As Long)
+    Dim gap As Long, i As Long, swapped As Integer
+    Dim t As Double
+    gap = n
+    Do
+        gap = Int(gap / 1.3)
+        If gap < 1 Then gap = 1
+        swapped = 0
+        For i = 1 To n - gap
+            If a(i) < a(i + gap) Then
+                t = a(i): a(i) = a(i + gap): a(i + gap) = t
+                swapped = -1
+            End If
+        Next i
+    Loop Until gap = 1 And swapped = 0
+End Sub

@@ -1,0 +1,5 @@
+# indoor test of the sequencer (cap on, no wheel, no mount)
+cooler = off
+end = leave
+row = SeqTest | - | RED | 2s | 100 | 3 | 1
+row = SeqTest | - | Green | 1s | 100 | 3 | 2

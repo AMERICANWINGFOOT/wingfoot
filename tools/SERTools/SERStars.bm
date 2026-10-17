@@ -1,0 +1,74 @@
+' ============================================================================
+' SERStars.bm  -  Local star centroiding for 3-star DSO alignment
+'
+' Include at the BOTTOM of a program that already includes SERFmtRGB.bm
+' (BrightAt# dispatches to LumaRGB& for colour):
+'     '$INCLUDE:'SERStars.bm'
+'
+' The engine half of star registration. The user picks 3 stars on a reference
+' frame; for every frame these routines re-find each star as the brightness
+' centroid inside a small search box, and the caller averages the three
+' displacements into ONE shift (translation only -- no rotation in this build).
+'
+'   BrightAt&     - one pixel's brightness (mono sample, or RGB/BGR luma)
+'   StarCentroid  - sub-pixel centroid of the blob inside a box around a guess
+' ============================================================================
+
+' --- Brightness at a pixel, format-dispatched (order-independent for colour) ---
+Function BrightAt& (m As _MEM, idx As Long, sampleBytes As Long, le As Long)
+    Dim lo As _UNSIGNED _BYTE, hi As _UNSIGNED _BYTE
+    If g_planes = 3 Then
+        BrightAt& = LumaRGB&(m, idx, sampleBytes, le)   ' from SERFmtRGB.bm
+    ElseIf sampleBytes = 1 Then
+        BrightAt& = _MemGet(m, m.OFFSET + idx, _UNSIGNED _BYTE)
+    Else
+        lo = _MemGet(m, m.OFFSET + idx * 2 + 0, _UNSIGNED _BYTE)
+        hi = _MemGet(m, m.OFFSET + idx * 2 + 1, _UNSIGNED _BYTE)
+        If le <> 0 Then BrightAt& = lo + hi * 256 Else BrightAt& = hi + lo * 256
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+' Find a star's centre near (gx,gy). Box of +/-boxR is clamped to the frame;
+' the box mean is used as a local floor so only the star's own light (pixels
+' above the local background) is weighted. Returns sub-pixel (ox,oy) and ok=-1
+' when a blob was found, or ok=0 (falls back to the guess) when the box is flat.
+' ---------------------------------------------------------------------------
+Sub StarCentroid (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, gx As Long, gy As Long, boxR As Long, ox As Double, oy As Double, ok As Integer)
+    Dim x0 As Long, x1 As Long, y0 As Long, y1 As Long
+    x0 = gx - boxR: If x0 < 0 Then x0 = 0
+    x1 = gx + boxR: If x1 > w - 1 Then x1 = w - 1
+    y0 = gy - boxR: If y0 < 0 Then y0 = 0
+    y1 = gy + boxR: If y1 > h - 1 Then y1 = h - 1
+
+    Dim xx As Long, yy As Long
+    Dim sumv As Double, cnt As Double, meanv As Double
+    sumv = 0: cnt = 0
+    For yy = y0 To y1
+        For xx = x0 To x1
+            sumv = sumv + BrightAt&(m, yy * w + xx, sampleBytes, le)
+            cnt = cnt + 1
+        Next xx
+    Next yy
+    If cnt < 1 Then ox = gx: oy = gy: ok = 0: Exit Sub
+    meanv = sumv / cnt
+
+    Dim sumW As Double, sumX As Double, sumY As Double, wt As Double
+    sumW = 0: sumX = 0: sumY = 0
+    For yy = y0 To y1
+        For xx = x0 To x1
+            wt = BrightAt&(m, yy * w + xx, sampleBytes, le) - meanv
+            If wt > 0 Then
+                sumW = sumW + wt
+                sumX = sumX + wt * xx
+                sumY = sumY + wt * yy
+            End If
+        Next xx
+    Next yy
+
+    If sumW > 0 Then
+        ox = sumX / sumW: oy = sumY / sumW: ok = -1
+    Else
+        ox = gx: oy = gy: ok = 0
+    End If
+End Sub

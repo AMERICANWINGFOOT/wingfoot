@@ -1,0 +1,140 @@
+'=======================================================================
+' ButtonUI.bm  -  QB64Starter Button & Mouse Helper (implementation)
+'
+' FUNCTION INDEX
+'   MouseInit                                  set default theme colors
+'   PollMouse                                  refresh mouse state (once per frame)
+'   PtInRect%   (px, py, x, y, w, h)      -> -1 if point is inside rect
+'   Button%     (x, y, w, h, caption$)    -> -1 if clicked this frame
+'   ButtonEx%   (x, y, w, h, caption$, on) -> like Button% but honors an enabled flag
+'
+' TYPICAL FRAME:
+'     Do
+'         _Limit 60
+'         PollMouse
+'         Cls
+'         If Button%(20, 20, 120, 32, "OK")   Then ...do thing...
+'         If Button%(20, 60, 120, 32, "Quit") Then System
+'         _Display
+'     Loop
+'=======================================================================
+
+
+Sub MouseInit
+    ' A calm slate-blue theme; override any uiXXXX var after calling this.
+    uiFace = _RGB32(70, 82, 104)
+    uiFaceHover = _RGB32(92, 106, 132)
+    uiFaceDown = _RGB32(52, 62, 80)
+    uiText = _RGB32(240, 242, 248)
+    uiLight = _RGB32(120, 134, 162)
+    uiDark = _RGB32(34, 40, 52)
+    uiDisFace = _RGB32(60, 64, 72)
+    uiDisText = _RGB32(120, 124, 132)
+End Sub
+
+
+Sub PollMouse
+    ' Drain the event queue so _MouseX/_MouseY/_MouseButton are current.
+    Do While _MouseInput
+    Loop
+    gMouse.prevHeld = gMouse.held
+    gMouse.mx = _MouseX
+    gMouse.my = _MouseY
+    If _MouseButton(1) Then gMouse.held = -1 Else gMouse.held = 0
+    ' A click is registered on release: was held last frame, up now.
+    If gMouse.prevHeld And Not gMouse.held Then
+        gMouse.clicked = -1
+    Else
+        gMouse.clicked = 0
+    End If
+End Sub
+
+
+Function PtInRect% (ppx As Integer, ppy As Integer, x As Integer, y As Integer, w As Integer, h As Integer)
+    If ppx >= x And ppx <= x + w And ppy >= y And ppy <= y + h Then
+        PtInRect% = -1
+    Else
+        PtInRect% = 0
+    End If
+End Function
+
+
+Function Button% (x As Integer, y As Integer, w As Integer, h As Integer, caption As String)
+    Button% = ButtonEx%(x, y, w, h, caption, -1)
+End Function
+
+
+Function ButtonEx% (x As Integer, y As Integer, w As Integer, h As Integer, caption As String, onFlag As Integer)
+    Dim over As Integer, st As Integer
+    over = PtInRect%(gMouse.mx, gMouse.my, x, y, w, h)
+
+    If Not onFlag Then
+        st = 3 ' disabled
+    ElseIf over And gMouse.held Then
+        st = 2 ' pressed
+    ElseIf over Then
+        st = 1 ' hover
+    Else
+        st = 0 ' normal
+    End If
+
+    DrawBevel x, y, w, h, caption, st
+
+    ' Click only counts if enabled and pointer released over the button.
+    If onFlag And over And gMouse.clicked Then
+        ButtonEx% = -1
+    Else
+        ButtonEx% = 0
+    End If
+End Function
+
+
+Sub DrawBevel (x As Integer, y As Integer, w As Integer, h As Integer, caption As String, st As Integer)
+    Dim faceCol As _Unsigned Long, txtCol As _Unsigned Long
+    Dim topLeft As _Unsigned Long, botRight As _Unsigned Long
+    Dim tx As Integer, ty As Integer, ooff As Integer
+
+    Select Case st
+        Case 3 ' disabled
+            faceCol = uiDisFace: txtCol = uiDisText
+            topLeft = uiDark: botRight = uiDark: ooff = 0
+        Case 2 ' pressed (sunken bevel + 1px text shift)
+            faceCol = uiFaceDown: txtCol = uiText
+            topLeft = uiDark: botRight = uiLight: ooff = 1
+        Case 1 ' hover
+            faceCol = uiFaceHover: txtCol = uiText
+            topLeft = uiLight: botRight = uiDark: ooff = 0
+        Case Else ' normal
+            faceCol = uiFace: txtCol = uiText
+            topLeft = uiLight: botRight = uiDark: ooff = 0
+    End Select
+
+    ' Face
+    Line (x, y)-(x + w, y + h), faceCol, BF
+    ' Bevel: two-pixel highlight/shadow for a soft raised look
+    Line (x, y)-(x + w, y), topLeft
+    Line (x, y)-(x, y + h), topLeft
+    Line (x + 1, y + 1)-(x + w - 1, y + 1), topLeft
+    Line (x + 1, y + 1)-(x + 1, y + h - 1), topLeft
+    Line (x, y + h)-(x + w, y + h), botRight
+    Line (x + w, y)-(x + w, y + h), botRight
+    Line (x + 1, y + h - 1)-(x + w - 1, y + h - 1), botRight
+    Line (x + w - 1, y + 1)-(x + w - 1, y + h - 1), botRight
+
+    ' Centered caption (built-in 8x16 font). Print transparent so no
+    ' background box stamps over the face, then restore caller's mode.
+    Dim pm As Integer
+    pm = _PrintMode
+    _PrintMode _KeepBackground
+    tx = x + (w - 8 * Len(caption)) \ 2 + ooff
+    ty = y + (h - 16) \ 2 + ooff
+    Color txtCol
+    _PrintString (tx, ty), caption
+    ' _PrintMode function codes (QB64-PE wiki):
+    '   1 = _KeepBackground, 2 = _OnlyBackground, 3 = _FillBackground
+    Select Case pm
+        Case 1: _PrintMode _KeepBackground
+        Case 2: _PrintMode _OnlyBackground
+        Case Else: _PrintMode _FillBackground
+    End Select
+End Sub

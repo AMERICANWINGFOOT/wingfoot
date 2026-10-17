@@ -1,0 +1,670 @@
+'=======================================================================
+' RFS.bm  -  Russell File System (implementation)
+'
+' PUBLIC API  (each returns -1 on success, 0 on failure + rfsError)
+'   RFSInit                              call once at startup
+'   RFSFormat%  (volPath, label, capBytes)  create a new empty volume
+'   RFSMount%   (volPath)                open an existing volume
+'   RFSUnmount                           close it
+'   RFSPutFile% (hostPath, storeName)    add / replace a file
+'   RFSGetFile% (storeName, hostPath)    extract a file
+'   RFSDelete%  (storeName)              remove a file
+'   RFSDropEntry idx + RFSCommit%        remove several, one commit
+'   RFSCompareFile% (storeName, hostPath) byte-compare with a disk file
+'   RFSCommit%                           write catalog + superblock
+'   RFSCheckFile% (idx)                  verify every chunk CRC of one file
+'   RFSCompact% (newVolPath)             copy live files to a fresh volume
+'   RFSFind&    (storeName)              catalog index or -1
+'   RFSLiveBytes&&                       bytes the live files occupy
+'
+' rfsVerbose = -1 prints a progress line (console); 2 draws a bar at
+' rfsBarX/rfsBarY/rfsBarW labelled rfsBarText (graphics screens).
+'=======================================================================
+
+
+' Error trap for RFSOpen% / RFSKill%. It has to sit at module level;
+' RFS.bm is included after the program's last line, so it is only
+' ever reached through ON ERROR.
+RFSIOFail:
+rfsIOErr = Err
+Resume Next
+
+
+Sub RFSInit
+    Dim i As Long, j As Integer, c As _Unsigned Long
+    For i = 0 To 255
+        c = i
+        For j = 1 To 8
+            If c And 1 Then c = _SHR(c, 1) Xor &HEDB88320~& Else c = _SHR(c, 1)
+        Next
+        rfsCrcTab(i) = c
+    Next
+    rfsMounted = 0
+    rfsCount = 0
+End Sub
+
+
+' Standard CRC-32 (same as zip / PNG). "123456789" -> &HCBF43926
+Function RFSCrc32~& (s As String)
+    Dim c As _Unsigned Long, i As Long, n As Long
+    c = &HFFFFFFFF~&
+    n = Len(s)
+    For i = 1 To n
+        c = rfsCrcTab((c Xor Asc(s, i)) And 255) Xor _SHR(c, 8)
+    Next
+    RFSCrc32~& = c Xor &HFFFFFFFF~&
+End Function
+
+
+Function RFSPad$ (s As String, n As Integer)
+    RFSPad$ = Left$(s + String$(n, 0), n)
+End Function
+
+Function RFSStripZ$ (s As String)
+    Dim i As Long
+    i = InStr(s, Chr$(0))
+    If i > 0 Then RFSStripZ$ = Left$(s, i - 1) Else RFSStripZ$ = s
+End Function
+
+
+'-----------------------------------------------------------------------
+' Safe file access: failures become rfsError text instead of a crash.
+'-----------------------------------------------------------------------
+
+Function RFSParentDir$ (p As String)
+    Dim i As Long
+    For i = Len(p) To 1 Step -1
+        If Mid$(p, i, 1) = "/" Or Mid$(p, i, 1) = "\" Then RFSParentDir$ = Left$(p, i - 1): Exit Function
+    Next
+    RFSParentDir$ = "."
+End Function
+
+Function RFSIOReason$ (p As String)
+    Dim d As String
+    d = RFSParentDir$(p)
+    If Len(d) > 0 And Not _DirExists(d) Then RFSIOReason$ = "folder not found: " + d + "  (check the spelling)": Exit Function
+    Select Case rfsIOErr
+        ' On Linux QB64-PE reports "permission denied" as 64 (Bad file
+        ' name); with the folder confirmed present, that's the usual cause.
+        Case 64, 70, 75: RFSIOReason$ = "permission denied - is the folder yours? (sudo chown $USER " + Chr$(34) + d + Chr$(34) + ")"
+        Case 53, 76: RFSIOReason$ = "file not found"
+        Case Else: RFSIOReason$ = "error" + Str$(rfsIOErr)
+    End Select
+End Function
+
+' Open for Binary. readOnly = -1 opens with Access Read, so files you
+' can read but don't own can still be stored.
+Function RFSOpen% (fh As Integer, p As String, readOnly As Integer)
+    rfsIOErr = 0
+    On Error GoTo RFSIOFail
+    If readOnly Then
+        Open p For Binary Access Read As #fh
+    Else
+        Open p For Binary As #fh
+    End If
+    On Error GoTo 0
+    If rfsIOErr Then rfsError = "Can't open " + p + " - " + RFSIOReason$(p): Exit Function
+    RFSOpen% = -1
+End Function
+
+Function RFSKill% (p As String)
+    rfsIOErr = 0
+    On Error GoTo RFSIOFail
+    Kill p
+    On Error GoTo 0
+    If rfsIOErr Then rfsError = "Can't replace " + p + " - " + RFSIOReason$(p): Exit Function
+    RFSKill% = -1
+End Function
+
+
+' Best-effort delete when cleaning up after a failure.
+Sub RFSTryKill (p As String)
+    Dim ignored As Integer
+    ignored = RFSKill%(p)
+End Sub
+
+
+'-----------------------------------------------------------------------
+' Records
+'-----------------------------------------------------------------------
+
+' Write header + payload at ofs on handle fh. Returns bytes written.
+Function RFSWriteRecord&& (fh As Integer, ofs As _Integer64, magic As String, payload As String, rawLen As Long, flg As Long)
+    Dim h As String
+    h = magic + _MK$(Long, flg) + _MK$(Long, rawLen) + _MK$(Long, Len(payload))
+    h = h + _MK$(_Unsigned Long, RFSCrc32~&(payload)) + String$(8, 0)
+    h = h + _MK$(_Unsigned Long, RFSCrc32~&(h))
+    Put #fh, ofs + 1, h
+    Put #fh, , payload
+    RFSWriteRecord&& = RFS_HDR_LEN + Len(payload)
+End Function
+
+' Read the record at ofs. payload gets the STORED bytes (still
+' deflated if flg And 1). Returns 0 = ok, 1 = header damaged,
+' 2 = wrong record type, 3 = payload damaged.
+Function RFSReadRecord% (fh As Integer, ofs As _Integer64, magic As String, payload As String, rawLen As Long, flg As Long)
+    Dim h As String, stLen As Long, dcrc As _Unsigned Long
+    h = Space$(RFS_HDR_LEN)
+    Get #fh, ofs + 1, h
+    If _CV(_Unsigned Long, Mid$(h, 29, 4)) <> RFSCrc32~&(Left$(h, 28)) Then RFSReadRecord% = 1: Exit Function
+    If Left$(h, 4) <> magic Then RFSReadRecord% = 2: Exit Function
+    flg = _CV(Long, Mid$(h, 5, 4))
+    rawLen = _CV(Long, Mid$(h, 9, 4))
+    stLen = _CV(Long, Mid$(h, 13, 4))
+    dcrc = _CV(_Unsigned Long, Mid$(h, 17, 4))
+    payload = Space$(stLen)
+    Get #fh, , payload
+    If RFSCrc32~&(payload) <> dcrc Then RFSReadRecord% = 3: Exit Function
+    RFSReadRecord% = 0
+End Function
+
+Function RFSRecordErr$ (code As Integer)
+    Select Case code
+        Case 1: RFSRecordErr$ = "header CRC mismatch"
+        Case 2: RFSRecordErr$ = "unexpected record type"
+        Case 3: RFSRecordErr$ = "data CRC mismatch"
+        Case Else: RFSRecordErr$ = "ok"
+    End Select
+End Function
+
+
+'-----------------------------------------------------------------------
+' Superblocks
+'-----------------------------------------------------------------------
+
+Function RFSBuildSuper$ (seqNo As _Integer64, catOfs As _Integer64, catLen As Long, tailOfs As _Integer64, capBytes As _Integer64, lbl As String)
+    Dim s As String
+    s = "RFS1" + _MK$(Integer, RFS_VERSION) + _MK$(Integer, 0)
+    s = s + _MK$(_Integer64, seqNo) + _MK$(_Integer64, catOfs) + _MK$(Long, catLen) + String$(4, 0)
+    s = s + _MK$(_Integer64, tailOfs) + _MK$(_Integer64, capBytes) + RFSPad$(lbl, 32)
+    s = s + String$(124 - Len(s), 0)
+    RFSBuildSuper$ = s + _MK$(_Unsigned Long, RFSCrc32~&(s))
+End Function
+
+' Validate one superblock; on success copy it into the volume state.
+Function RFSUseSuper% (s As String)
+    If Len(s) <> RFS_SUPER_LEN Then Exit Function
+    If Left$(s, 4) <> "RFS1" Then Exit Function
+    If _CV(_Unsigned Long, Right$(s, 4)) <> RFSCrc32~&(Left$(s, 124)) Then Exit Function
+    rfsSeq = _CV(_Integer64, Mid$(s, 9, 8))
+    rfsCatOfs = _CV(_Integer64, Mid$(s, 17, 8))
+    rfsCatLen = _CV(Long, Mid$(s, 25, 4))
+    rfsTail = _CV(_Integer64, Mid$(s, 33, 8))
+    rfsVolSize = _CV(_Integer64, Mid$(s, 41, 8))
+    rfsLabel = RFSStripZ$(Mid$(s, 49, 32))
+    RFSUseSuper% = -1
+End Function
+
+Function RFSSuperSeq&& (s As String)
+    RFSSuperSeq&& = _CV(_Integer64, Mid$(s, 9, 8))
+End Function
+
+
+'-----------------------------------------------------------------------
+' Catalog
+'-----------------------------------------------------------------------
+
+Sub RFSEnsureCap (n As Long)
+    Dim c As Long
+    c = UBound(rfsName) + 1
+    If n <= c Then Exit Sub
+    Do While c < n: c = c * 2: Loop
+    ReDim _Preserve rfsName(0 To c - 1) As String
+    ReDim _Preserve rfsSize(0 To c - 1) As _Integer64
+    ReDim _Preserve rfsStored(0 To c - 1) As _Integer64
+    ReDim _Preserve rfsFirst(0 To c - 1) As _Integer64
+    ReDim _Preserve rfsChunks(0 To c - 1) As Long
+    ReDim _Preserve rfsStamp(0 To c - 1) As String
+End Sub
+
+Function RFSCatalogBlob$
+    Dim i As Long, b As String
+    b = _MK$(Long, rfsCount)
+    For i = 0 To rfsCount - 1
+        b = b + _MK$(Integer, Len(rfsName(i))) + rfsName(i)
+        b = b + _MK$(_Integer64, rfsSize(i)) + _MK$(_Integer64, rfsStored(i))
+        b = b + _MK$(_Integer64, rfsFirst(i)) + _MK$(Long, rfsChunks(i)) + RFSPad$(rfsStamp(i), 19)
+    Next
+    RFSCatalogBlob$ = b
+End Function
+
+Function RFSParseCatalog% (b As String)
+    Dim p As Long, n As Long, i As Long, nl As Integer
+    If Len(b) < 4 Then Exit Function
+    n = _CV(Long, Left$(b, 4))
+    p = 5
+    RFSEnsureCap n
+    For i = 0 To n - 1
+        nl = _CV(Integer, Mid$(b, p, 2)): p = p + 2
+        rfsName(i) = Mid$(b, p, nl): p = p + nl
+        rfsSize(i) = _CV(_Integer64, Mid$(b, p, 8)): p = p + 8
+        rfsStored(i) = _CV(_Integer64, Mid$(b, p, 8)): p = p + 8
+        rfsFirst(i) = _CV(_Integer64, Mid$(b, p, 8)): p = p + 8
+        rfsChunks(i) = _CV(Long, Mid$(b, p, 4)): p = p + 4
+        rfsStamp(i) = Mid$(b, p, 19): p = p + 19
+    Next
+    If p - 1 <> Len(b) Then Exit Function
+    rfsCount = n
+    RFSParseCatalog% = -1
+End Function
+
+' Load the catalog the current superblock points at.
+Function RFSLoadCatalog%
+    Dim pay As String, rawLen As Long, flg As Long, b As String
+    If RFSReadRecord%(rfsFh, rfsCatOfs, "RCAT", pay, rawLen, flg) <> 0 Then Exit Function
+    If flg And 1 Then b = _Inflate$(pay, rawLen) Else b = pay
+    If Len(b) <> rawLen Then Exit Function
+    RFSLoadCatalog% = RFSParseCatalog%(b)
+End Function
+
+Function RFSFind& (storeName As String)
+    Dim i As Long
+    For i = 0 To rfsCount - 1
+        If rfsName(i) = storeName Then RFSFind& = i: Exit Function
+    Next
+    RFSFind& = -1
+End Function
+
+Function RFSLiveBytes&&
+    Dim i As Long, t As _Integer64
+    For i = 0 To rfsCount - 1
+        t = t + rfsStored(i)
+    Next
+    RFSLiveBytes&& = t
+End Function
+
+
+'-----------------------------------------------------------------------
+' Commit: append the catalog, flush, then write the superblock into
+' the slot NOT holding the current one, and flush again. Until that
+' superblock lands, the volume still mounts as the previous state.
+'-----------------------------------------------------------------------
+
+' Close + OS sync + reopen, so written data really reaches the stick
+' before the superblock that points at it is written.
+Sub RFSFlush
+    Close #rfsFh
+    $If LINUX Or MAC Then
+        Shell _Hide "sync"
+    $End If
+    rfsFh = FreeFile
+    If Not RFSOpen%(rfsFh, rfsVolPath, 0) Then rfsMounted = 0
+End Sub
+
+Function RFSCommit%
+    Dim b As String, pay As String, catOfs As _Integer64, used As Long, sup As String, slot As _Integer64
+    b = RFSCatalogBlob$
+    pay = _Deflate$(b)
+    catOfs = rfsTail
+    If catOfs + RFS_HDR_LEN + Len(pay) > rfsVolSize Then rfsError = "Volume full (no room for catalog)": Exit Function
+
+    used = RFSWriteRecord&&(rfsFh, catOfs, "RCAT", pay, Len(b), 1)
+    RFSFlush
+
+    rfsSeq = rfsSeq + 1
+    sup = RFSBuildSuper$(rfsSeq, catOfs, used, catOfs + used, rfsVolSize, rfsLabel)
+    If rfsSeq Mod 2 = 0 Then slot = RFS_SUPER_A Else slot = RFS_SUPER_B
+    Put #rfsFh, slot + 1, sup
+    RFSFlush
+
+    rfsCatOfs = catOfs
+    rfsCatLen = used
+    rfsTail = catOfs + used
+    RFSCommit% = -1
+End Function
+
+
+'-----------------------------------------------------------------------
+' Volume
+'-----------------------------------------------------------------------
+
+Function RFSFormat% (volPath As String, lbl As String, capBytes As _Integer64)
+    Dim z As String, ok As Integer
+    rfsError = ""
+    If rfsMounted Then RFSUnmount
+    If capBytes < RFS_DATA_START * 2 Then rfsError = "Volume size too small": Exit Function
+
+    If _FileExists(volPath) Then
+        If Not RFSKill%(volPath) Then Exit Function
+    End If
+    rfsVolPath = volPath
+    rfsFh = FreeFile
+    If Not RFSOpen%(rfsFh, volPath, 0) Then Exit Function
+    z = String$(RFS_DATA_START, 0)
+    Put #rfsFh, 1, z
+
+    rfsLabel = Left$(lbl, 32)
+    rfsVolSize = capBytes
+    rfsSeq = -1 ' first commit makes it 0 -> superblock A
+    rfsTail = RFS_DATA_START
+    rfsCount = 0
+    rfsMounted = -1
+
+    ' Commit twice so BOTH superblocks start out valid; a fresh volume
+    ' then has a fallback like any other.
+    ok = RFSCommit%
+    If ok Then ok = RFSCommit%
+    If Not ok Then RFSUnmount
+    RFSFormat% = ok
+End Function
+
+' Mount: try the newest valid superblock; if its catalog is damaged,
+' fall back to the older one (the previous commit).
+Function RFSMount% (volPath As String)
+    Dim a As String, b As String, first As String, second As String
+    rfsError = ""
+    If rfsMounted Then RFSUnmount
+    If Not _FileExists(volPath) Then rfsError = "No such file: " + volPath: Exit Function
+
+    rfsVolPath = volPath
+    rfsFh = FreeFile
+    If Not RFSOpen%(rfsFh, volPath, 0) Then Exit Function
+    a = Space$(RFS_SUPER_LEN): Get #rfsFh, RFS_SUPER_A + 1, a
+    b = Space$(RFS_SUPER_LEN): Get #rfsFh, RFS_SUPER_B + 1, b
+
+    If RFSSuperSeq&&(b) > RFSSuperSeq&&(a) Then first = b: second = a Else first = a: second = b
+
+    If RFSUseSuper%(first) Then
+        If RFSLoadCatalog% Then rfsMounted = -1: RFSMount% = -1: Exit Function
+    End If
+    If RFSUseSuper%(second) Then
+        If RFSLoadCatalog% Then
+            rfsMounted = -1
+            rfsError = "Newest commit was damaged; mounted the previous one"
+            RFSMount% = -1
+            Exit Function
+        End If
+    End If
+
+    Close #rfsFh
+    rfsError = "Not an RFS volume, or both superblocks are damaged"
+End Function
+
+Sub RFSUnmount
+    If rfsMounted Then Close #rfsFh
+    rfsMounted = 0
+    rfsCount = 0
+End Sub
+
+
+'-----------------------------------------------------------------------
+' Files
+'-----------------------------------------------------------------------
+
+Sub RFSProgress (done As _Integer64, total As _Integer64)
+    Dim fillW As Long, pm As Integer
+    Select Case rfsVerbose
+        Case -1
+            If total < 8 * RFS_CHUNK_RAW Then Exit Sub
+            Locate CsrLin, 1
+            Print "  "; LTrim$(Str$(done \ 1048576)); " / "; LTrim$(Str$(total \ 1048576)); " MiB  ("; LTrim$(Str$(Int(done * 100 / total))); "%)   ";
+        Case 2
+            If rfsBarW <= 0 Then Exit Sub
+            Do While _MouseInput: Loop
+            Line (rfsBarX, rfsBarY)-(rfsBarX + rfsBarW, rfsBarY + 18), _RGB32(40, 44, 54), BF
+            If total > 0 Then fillW = rfsBarW * done \ total Else fillW = rfsBarW
+            If fillW > 0 Then Line (rfsBarX, rfsBarY)-(rfsBarX + fillW, rfsBarY + 18), _RGB32(56, 120, 80), BF
+            pm = _PrintMode
+            _PrintMode _KeepBackground
+            Color _RGB32(240, 242, 248)
+            _PrintString (rfsBarX + 8, rfsBarY + 2), rfsBarText + "   " + LTrim$(Str$(done \ 1048576)) + " / " + LTrim$(Str$(total \ 1048576)) + " MiB"
+            If pm = 3 Then _PrintMode _FillBackground
+            _Display
+    End Select
+End Sub
+
+' Finish the progress display after a transfer.
+Sub RFSProgressEnd (total As _Integer64)
+    If rfsVerbose = -1 And total >= 8 * RFS_CHUNK_RAW Then RFSProgress total, total: Print
+    If rfsVerbose = 2 Then RFSProgress total, total
+End Sub
+
+Function RFSPutFile% (hostPath As String, storeName As String)
+    Dim hf As Integer, total As _Integer64, done As _Integer64, n As _Integer64
+    Dim raw As String, pay As String, flg As Long, w As _Integer64
+    Dim first As _Integer64, chunks As Long, stored As _Integer64, idx As Long, need As _Integer64
+
+    rfsError = ""
+    If Not rfsMounted Then rfsError = "No volume mounted": Exit Function
+    If Len(storeName) = 0 Or Len(storeName) > 1024 Then rfsError = "Bad name": Exit Function
+    If Not _FileExists(hostPath) Then rfsError = "No such file: " + hostPath: Exit Function
+
+    hf = FreeFile
+    If Not RFSOpen%(hf, hostPath, -1) Then Exit Function
+    total = LOF(hf)
+
+    ' worst case: nothing compresses
+    need = total + (total \ RFS_CHUNK_RAW + 1) * RFS_HDR_LEN + Len(RFSCatalogBlob$) + Len(storeName) + 4096
+    If rfsTail + need > rfsVolSize Then
+        Close #hf
+        rfsError = "Not enough room on the volume"
+        Exit Function
+    End If
+
+    first = rfsTail
+    Do While done < total
+        n = total - done
+        If n > RFS_CHUNK_RAW Then n = RFS_CHUNK_RAW
+        raw = Space$(n)
+        Get #hf, done + 1, raw
+        ' Probe the first 64 KB: if it won't shrink (JPEG, zip, video...)
+        ' store the chunk raw instead of deflating a megabyte for nothing.
+        flg = 0
+        pay = raw
+        If n <= 65536 Or Len(_Deflate$(Left$(raw, 65536))) < 63000 Then
+            pay = _Deflate$(raw)
+            If Len(pay) < Len(raw) Then flg = 1 Else pay = raw
+        End If
+        w = RFSWriteRecord&&(rfsFh, rfsTail, "RCHK", pay, Len(raw), flg)
+        rfsTail = rfsTail + w
+        stored = stored + w
+        chunks = chunks + 1
+        done = done + n
+        If chunks Mod 8 = 0 Or rfsVerbose = 2 Then RFSProgress done, total
+    Loop
+    Close #hf
+    RFSProgressEnd total
+
+    idx = RFSFind&(storeName)
+    If idx < 0 Then
+        RFSEnsureCap rfsCount + 1
+        idx = rfsCount
+        rfsCount = rfsCount + 1
+    End If
+    rfsName(idx) = storeName
+    rfsSize(idx) = total
+    rfsStored(idx) = stored
+    rfsFirst(idx) = first
+    rfsChunks(idx) = chunks
+    rfsStamp(idx) = Date$ + " " + Time$
+
+    RFSPutFile% = RFSCommit%
+End Function
+
+Function RFSGetFile% (storeName As String, hostPath As String)
+    Dim idx As Long, hf As Integer, c As Long, r As Integer
+    Dim ofs As _Integer64, done As _Integer64, pay As String, raw As String, rawLen As Long, flg As Long
+
+    rfsError = ""
+    If Not rfsMounted Then rfsError = "No volume mounted": Exit Function
+    idx = RFSFind&(storeName)
+    If idx < 0 Then rfsError = "Not on volume: " + storeName: Exit Function
+
+    If _FileExists(hostPath) Then
+        If Not RFSKill%(hostPath) Then Exit Function
+    End If
+    hf = FreeFile
+    If Not RFSOpen%(hf, hostPath, 0) Then Exit Function
+
+    ofs = rfsFirst(idx)
+    For c = 1 To rfsChunks(idx)
+        r = RFSReadRecord%(rfsFh, ofs, "RCHK", pay, rawLen, flg)
+        If r = 0 Then
+            If flg And 1 Then raw = _Inflate$(pay, rawLen) Else raw = pay
+            If Len(raw) <> rawLen Then r = 4
+        End If
+        If r <> 0 Then
+            Close #hf
+            RFSTryKill hostPath
+            If r = 4 Then rfsError = "inflate failed" Else rfsError = RFSRecordErr$(r)
+            rfsError = "Chunk" + Str$(c) + " of" + Str$(rfsChunks(idx)) + " damaged: " + rfsError
+            Exit Function
+        End If
+        Put #hf, done + 1, raw
+        done = done + rawLen
+        ofs = ofs + RFS_HDR_LEN + Len(pay)
+        If c Mod 8 = 0 Or rfsVerbose = 2 Then RFSProgress done, rfsSize(idx)
+    Next
+    Close #hf
+    RFSProgressEnd rfsSize(idx)
+
+    If done <> rfsSize(idx) Then rfsError = "Size mismatch after extract": Exit Function
+    RFSGetFile% = -1
+End Function
+
+Function RFSDelete% (storeName As String)
+    Dim idx As Long
+    rfsError = ""
+    If Not rfsMounted Then rfsError = "No volume mounted": Exit Function
+    idx = RFSFind&(storeName)
+    If idx < 0 Then rfsError = "Not on volume: " + storeName: Exit Function
+    RFSDropEntry idx
+    RFSDelete% = RFSCommit%
+End Function
+
+' Remove a catalog entry in memory only. Call RFSCommit% afterwards
+' (lets a GUI delete many files with a single commit).
+Sub RFSDropEntry (idx As Long)
+    Dim i As Long
+    If idx < 0 Or idx >= rfsCount Then Exit Sub
+    For i = idx To rfsCount - 2
+        rfsName(i) = rfsName(i + 1)
+        rfsSize(i) = rfsSize(i + 1)
+        rfsStored(i) = rfsStored(i + 1)
+        rfsFirst(i) = rfsFirst(i + 1)
+        rfsChunks(i) = rfsChunks(i + 1)
+        rfsStamp(i) = rfsStamp(i + 1)
+    Next
+    rfsCount = rfsCount - 1
+End Sub
+
+' Compare a stored file with a file on disk, byte for byte.
+' Returns -1 if identical; otherwise rfsError says where they differ.
+Function RFSCompareFile% (storeName As String, hostPath As String)
+    Dim idx As Long, hf As Integer, c As Long, r As Integer, i As Long
+    Dim ofs As _Integer64, done As _Integer64, pay As String, raw As String, disk As String
+    Dim rawLen As Long, flg As Long
+
+    rfsError = ""
+    If Not rfsMounted Then rfsError = "No volume mounted": Exit Function
+    idx = RFSFind&(storeName)
+    If idx < 0 Then rfsError = "Not on volume: " + storeName: Exit Function
+    If Not _FileExists(hostPath) Then rfsError = "No such file: " + hostPath: Exit Function
+    hf = FreeFile
+    If Not RFSOpen%(hf, hostPath, -1) Then Exit Function
+    If LOF(hf) <> rfsSize(idx) Then
+        rfsError = "Sizes differ: volume" + Str$(rfsSize(idx)) + ", disk" + Str$(LOF(hf))
+        Close #hf
+        Exit Function
+    End If
+
+    ofs = rfsFirst(idx)
+    For c = 1 To rfsChunks(idx)
+        r = RFSReadRecord%(rfsFh, ofs, "RCHK", pay, rawLen, flg)
+        If r <> 0 Then rfsError = "Chunk" + Str$(c) + " damaged: " + RFSRecordErr$(r): Close #hf: Exit Function
+        If flg And 1 Then raw = _Inflate$(pay, rawLen) Else raw = pay
+        disk = Space$(Len(raw))
+        Get #hf, done + 1, disk
+        If disk <> raw Then
+            For i = 1 To Len(raw)
+                If Asc(raw, i) <> Asc(disk, i) Then Exit For
+            Next
+            rfsError = "First difference at byte" + Str$(done + i - 1)
+            Close #hf
+            Exit Function
+        End If
+        done = done + Len(raw)
+        ofs = ofs + RFS_HDR_LEN + Len(pay)
+    Next
+    Close #hf
+    RFSCompareFile% = -1
+End Function
+
+' Walk every chunk of one file checking CRCs and lengths.
+Function RFSCheckFile% (idx As Long)
+    Dim c As Long, r As Integer, ofs As _Integer64, total As _Integer64
+    Dim pay As String, rawLen As Long, flg As Long
+
+    rfsError = ""
+    ofs = rfsFirst(idx)
+    For c = 1 To rfsChunks(idx)
+        r = RFSReadRecord%(rfsFh, ofs, "RCHK", pay, rawLen, flg)
+        If r <> 0 Then
+            rfsError = "chunk" + Str$(c) + " @" + Str$(ofs) + ": " + RFSRecordErr$(r)
+            Exit Function
+        End If
+        total = total + rawLen
+        ofs = ofs + RFS_HDR_LEN + Len(pay)
+    Next
+    If total <> rfsSize(idx) Then rfsError = "chunk sizes add to" + Str$(total) + ", catalog says" + Str$(rfsSize(idx)): Exit Function
+    RFSCheckFile% = -1
+End Function
+
+' Copy every live file (as stored, no recompression) into a fresh
+' volume at newVolPath, then switch to it. The old volume is left as
+' it was; delete it yourself once you're happy.
+Function RFSCompact% (newVolPath As String)
+    Dim nf As Integer, z As String, tl As _Integer64, i As Long, c As Long, r As Integer
+    Dim ofs As _Integer64, pay As String, rawLen As Long, flg As Long, w As _Integer64
+    Dim sumStored As _Integer64
+
+    rfsError = ""
+    If Not rfsMounted Then rfsError = "No volume mounted": Exit Function
+    If newVolPath = rfsVolPath Then rfsError = "Compact needs a different file name": Exit Function
+
+    ReDim newFirst(0 To rfsCount) As _Integer64
+    ReDim newStored(0 To rfsCount) As _Integer64
+
+    If _FileExists(newVolPath) Then
+        If Not RFSKill%(newVolPath) Then Exit Function
+    End If
+    nf = FreeFile
+    If Not RFSOpen%(nf, newVolPath, 0) Then Exit Function
+    z = String$(RFS_DATA_START, 0)
+    Put #nf, 1, z
+    tl = RFS_DATA_START
+
+    For i = 0 To rfsCount - 1
+        newFirst(i) = tl
+        sumStored = 0
+        ofs = rfsFirst(i)
+        For c = 1 To rfsChunks(i)
+            r = RFSReadRecord%(rfsFh, ofs, "RCHK", pay, rawLen, flg)
+            If r <> 0 Then
+                Close #nf
+                RFSTryKill newVolPath
+                rfsError = "Compact stopped - " + rfsName(i) + " chunk" + Str$(c) + ": " + RFSRecordErr$(r)
+                Exit Function
+            End If
+            w = RFSWriteRecord&&(nf, tl, "RCHK", pay, rawLen, flg)
+            tl = tl + w
+            sumStored = sumStored + w
+            ofs = ofs + RFS_HDR_LEN + Len(pay)
+        Next
+        newStored(i) = sumStored
+    Next
+    Close #nf
+
+    ' switch over and commit on the new volume
+    Close #rfsFh
+    rfsVolPath = newVolPath
+    rfsFh = FreeFile
+    If Not RFSOpen%(rfsFh, rfsVolPath, 0) Then rfsMounted = 0: Exit Function
+    For i = 0 To rfsCount - 1
+        rfsFirst(i) = newFirst(i)
+        rfsStored(i) = newStored(i)
+    Next
+    rfsTail = tl
+    rfsSeq = -1
+    If RFSCommit% Then RFSCompact% = RFSCommit%
+End Function

@@ -1,0 +1,120 @@
+' ============================================================
+' BookReader.bm
+' Implementation for BookReader.bi
+' Manifest format (books.ini, one line per book, pipe-delimited):
+'   Title|Author|FileName|UnitLabel|SubLabel|UnitCount
+' Book text file format (one line per verse/paragraph/etc.):
+'   SECT:SUB|text with &^@ markup&
+'   SECT|text with no sub-numbering&      (SubLabel = "" case)
+' ============================================================
+
+Sub BRLoadManifest (path As String)
+    Dim inln As String, f As Integer
+    Dim p1 As Long, p2 As Long, p3 As Long, p4 As Long, p5 As Long
+    f = FreeFile
+    Open path For Input As #f
+    BRBookCount = 0
+    Do While Not EOF(f)
+        Line Input #f, inln
+        If Len(_Trim$(inln)) > 0 Then
+            BRBookCount = BRBookCount + 1
+            p1 = InStr(inln, "|")
+            p2 = InStr(p1 + 1, inln, "|")
+            p3 = InStr(p2 + 1, inln, "|")
+            p4 = InStr(p3 + 1, inln, "|")
+            p5 = InStr(p4 + 1, inln, "|")
+
+                BRBook(BRBookCount).Title = Left$(inln, p1 - 1)
+                BRBook(BRBookCount).Author = Mid$(inln, p1 + 1, p2 - p1 - 1)
+                BRBook(BRBookCount).FileName = Mid$(inln, p2 + 1, p3 - p2 - 1)
+                BRBook(BRBookCount).UnitLabel = Mid$(inln, p3 + 1, p4 - p3 - 1)
+                BRBook(BRBookCount).SubLabel = Mid$(inln, p4 + 1, p5 - p4 - 1)
+                BRBook(BRBookCount).UnitCount = Val(Mid$(inln, p5 + 1))
+            End if
+        End If
+    Loop
+    Close #f
+End Sub
+
+Sub BRLoadBook (fileName As String)
+    Dim inln As String, f As Integer
+    Dim barpos As Long, colonpos As Long
+    Dim head As String
+    Dim lastSect As Integer, curSect As Integer, curSub As Integer
+    Dim ub As Integer
+
+    f = FreeFile
+    Open fileName For Input As #f
+    BRLineCount = 0
+    BRUnitCount = 0
+    lastSect = -1
+
+    Do While Not EOF(f)
+        Line Input #f, inln
+        If Len(inln) > 0 Then
+            barpos = InStr(inln, "|")
+            If barpos > 0 Then
+                head = Left$(inln, barpos - 1)
+                colonpos = InStr(head, ":")
+                If colonpos > 0 Then
+                    curSect = Val(Left$(head, colonpos - 1))
+                    curSub = Val(Mid$(head, colonpos + 1))
+                Else
+                    curSect = Val(head)
+                    curSub = 0
+                End If
+
+                BRLineCount = BRLineCount + 1
+                BRSect(BRLineCount) = curSect
+                BRSubSect(BRLineCount) = curSub
+                BRLineText(BRLineCount) = Mid$(inln, barpos + 1)
+
+                If curSect <> lastSect Then
+                    BRUnitCount = BRUnitCount + 1
+                    BRIndex(BRUnitCount).StartLine = BRLineCount
+                    If BRUnitCount > 1 Then BRIndex(BRUnitCount - 1).EndLine = BRLineCount - 1
+                    BRIndex(BRUnitCount).MaxSub = curSub
+                    lastSect = curSect
+                Else
+                    If curSub > BRIndex(BRUnitCount).MaxSub Then BRIndex(BRUnitCount).MaxSub = curSub
+                End If
+            End If
+        End If
+    Loop
+    Close #f
+
+    If BRUnitCount > 0 Then BRIndex(BRUnitCount).EndLine = BRLineCount
+End Sub
+
+Function BRFindUnit% (sect As Integer)
+    Dim i As Integer
+    For i = 1 To BRUnitCount
+        If BRSect(BRIndex(i).StartLine) = sect Then
+            BRFindUnit% = i
+            Exit Function
+        End If
+    Next i
+    BRFindUnit% = 0
+End Function
+
+Sub BRGetBounds (sect As Integer, startLine As Long, endLine As Long)
+    Dim u As Integer
+    u = BRFindUnit%(sect)
+    If u > 0 Then
+        startLine = BRIndex(u).StartLine
+        endLine = BRIndex(u).EndLine
+    Else
+        startLine = 0
+        endLine = 0
+    End If
+End Sub
+
+Function BRMaxSubOf% (sect As Integer)
+    Dim u As Integer
+    u = BRFindUnit%(sect)
+    If u > 0 Then
+        BRMaxSubOf% = BRIndex(u).MaxSub
+    Else
+        BRMaxSubOf% = 0
+    End If
+End Function

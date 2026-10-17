@@ -1,0 +1,568 @@
+'==================================================================
+'  QBCapSeq.bm  -  the sequencer (autopilot)
+'
+'  A list of rows, each:  target | GoTo first? | filter | exposure | gain | count | bin
+'  Start turns the rows into remote commands and puts them in the remote
+'  queue (QBCapRemote.bm), so the sequencer and remote control share one engine:
+'     SEQBEGIN, SAVEAS FITS, LIVE ON, [COOLTEMP / COOLER ON / WAIT COOL]
+'     per row: SEQROW n, [GOTO target, WAIT GOTO], OBJECT target, BIN, GAIN,
+'              EXP, [FILTER, WAIT FILTER], FRESH, CAPTURE count, WAIT CAPTURE
+'     SEQEND (stop tracking / leave the mount / shut down)
+'  FRESH restarts the camera so the first saved frame is a whole new exposure
+'  (not one that was half done while the filter or mount was moving).
+'  Any failed step (ERR) stops the sequence - frames already saved stay saved.
+'  Saved in QBCap_seq.txt (plain text - it can also be edited by hand):
+'     cooler = on | off        end = stop | leave | quit
+'     row = M57 | goto | Red | 2min | 100 | 20 | 1
+'==================================================================
+
+Sub SeqInit
+    Dim e$
+    sqFile$ = exeDir$ + "QBCap_seq.txt"
+    sqEnd = 1: sqCool = 0: sqSel = 1
+    If _FileExists(sqFile$) Then
+        e$ = SeqLoad$(sqFile$)
+        If e$ <> "" Then LogLine "  sequence file: " + e$
+    End If
+    If sqN = 0 Then SeqAddRow
+End Sub
+
+' a new row: a copy of the selected one, or the camera's current settings
+Sub SeqAddRow
+    Dim i As Long
+    If sqN >= SEQMAX Then statusMsg$ = "Sequence is full (" + I2S$(SEQMAX) + " rows).": Exit Sub
+    sqN = sqN + 1
+    If sqN > 1 And sqSel >= 1 And sqSel < sqN Then
+        For i = sqN To sqSel + 2 Step -1: SeqCopyRow i - 1, i: Next
+        SeqCopyRow sqSel, sqSel + 1
+        sqSel = sqSel + 1
+    Else
+        sqTgt$(sqN) = ObjTag$: sqGoto(sqN) = 0
+        If fwSlot > 0 Then sqFilt$(sqN) = filtName$(fwSlot) Else sqFilt$(sqN) = ""
+        sqExp(sqN) = expMs: sqGain(sqN) = gainV: sqCount(sqN) = 10: sqBin(sqN) = binIdx
+        sqSel = sqN
+    End If
+    sqDirty = -1
+End Sub
+
+Sub SeqCopyRow (a As Long, b As Long)
+    sqTgt$(b) = sqTgt$(a): sqGoto(b) = sqGoto(a): sqFilt$(b) = sqFilt$(a)
+    sqExp(b) = sqExp(a): sqGain(b) = sqGain(a): sqCount(b) = sqCount(a): sqBin(b) = sqBin(a)
+End Sub
+
+Sub SeqSwapRows (a As Long, b As Long)
+    Dim t$, f$, g As Long, e As Long, ga As Long, n As Long, bn As Long
+    If a < 1 Or b < 1 Or a > sqN Or b > sqN Then Exit Sub
+    t$ = sqTgt$(a): g = sqGoto(a): f$ = sqFilt$(a): e = sqExp(a): ga = sqGain(a): n = sqCount(a): bn = sqBin(a)
+    SeqCopyRow b, a
+    sqTgt$(b) = t$: sqGoto(b) = g: sqFilt$(b) = f$: sqExp(b) = e: sqGain(b) = ga: sqCount(b) = n: sqBin(b) = bn
+    sqDirty = -1
+End Sub
+
+Sub SeqDeleteRow
+    Dim i As Long
+    If sqN <= 1 Then statusMsg$ = "A sequence needs at least one row.": Exit Sub
+    For i = sqSel To sqN - 1: SeqCopyRow i + 1, i: Next
+    sqN = sqN - 1
+    If sqSel > sqN Then sqSel = sqN
+    sqDirty = -1
+End Sub
+
+' exposure as written in the file and the commands: 2min, 30s, 500ms
+Function SqExpTxt$ (ms As Long)
+    If ms >= 60000 And ms Mod 60000 = 0 Then
+        SqExpTxt$ = I2S$(ms \ 60000) + "min"
+    ElseIf ms >= 1000 And ms Mod 1000 = 0 Then
+        SqExpTxt$ = I2S$(ms \ 1000) + "s"
+    Else
+        SqExpTxt$ = I2S$(ms) + "ms"
+    End If
+End Function
+
+Function SeqRowText$ (i As Long)
+    Dim f$, t$
+    f$ = sqFilt$(i): If f$ = "" Then f$ = "-"
+    t$ = Right$(" " + I2S$(i), 2) + " " + Left$(sqTgt$(i) + Space$(9), 9) + " " + Left$(f$ + Space$(6), 6) + " " + Left$(SqExpTxt$(sqExp(i)) + Space$(5), 5) + " x" + Left$(I2S$(sqCount(i)) + Space$(3), 3)
+    If sqGoto(i) Then t$ = t$ + " G"
+    SeqRowText$ = t$
+End Function
+
+' seconds of exposure from row r to the end (what is left of the row in progress counts too)
+Function SeqSecs# (r As Long)
+    Dim i As Long, t As Double, n As Long
+    For i = r To sqN
+        n = sqCount(i)
+        If sqRun And i = sqRow Then n = n - sqDone(i) + (recOn <> 0) * recWritten
+        If n < 0 Then n = 0
+        t = t + n * sqExp(i) / 1000#
+    Next
+    SeqSecs# = t
+End Function
+
+'------------------------------------------------------------------
+'  file
+'------------------------------------------------------------------
+Function SeqLoad$ (f$)
+    Dim ff As Long, l$, k As Long, key$, v$, n As Long, p As Long, fld$(1 To 7), j As Long, e As Long
+    Dim ldT$(1 To SEQMAX), ldG(1 To SEQMAX) As Long, ldF$(1 To SEQMAX), ldE(1 To SEQMAX) As Long
+    Dim ldGa(1 To SEQMAX) As Long, ldC(1 To SEQMAX) As Long, ldB(1 To SEQMAX) As Long, cl As Long, en As Long
+    If _FileExists(f$) = 0 Then SeqLoad$ = "file not found: " + f$: Exit Function
+    cl = 0: en = 1
+    ff = FreeFile
+    Open f$ For Input As #ff
+    Do While Not EOF(ff)
+        Line Input #ff, l$
+        k = InStr(l$, Chr$(13)): If k Then l$ = Left$(l$, k - 1)
+        l$ = _Trim$(l$)
+        k = InStr(l$, "=")
+        If k > 0 And Left$(l$, 1) <> "#" Then
+            key$ = LCase$(_Trim$(Left$(l$, k - 1))): v$ = _Trim$(Mid$(l$, k + 1))
+            Select Case key$
+                Case "cooler": cl = (LCase$(v$) = "on")
+                Case "end"
+                    Select Case LCase$(v$)
+                        Case "leave": en = 2
+                        Case "quit": en = 3
+                        Case Else: en = 1
+                    End Select
+                Case "row"
+                    If n < SEQMAX Then
+                        For j = 1 To 7
+                            p = InStr(v$, "|")
+                            If p = 0 Then fld$(j) = _Trim$(v$): v$ = "" Else fld$(j) = _Trim$(Left$(v$, p - 1)): v$ = Mid$(v$, p + 1)
+                        Next
+                        n = n + 1
+                        ldT$(n) = Left$(fld$(1), 24): If ldT$(n) = "" Then ldT$(n) = "Object"
+                        ldG(n) = (LCase$(fld$(2)) = "goto")
+                        ldF$(n) = fld$(3): If ldF$(n) = "-" Then ldF$(n) = ""
+                        e = RmMs&(fld$(4), 1): If e < 1 Or e > EXP_MAX_MS Then e = 1000
+                        ldE(n) = e
+                        ldGa(n) = _Clamp(CLng(Val(fld$(5))), 0, 600)
+                        ldC(n) = _Clamp(CLng(Val(fld$(6))), 1, 9999)
+                        ldB(n) = _Clamp(CLng(Val(fld$(7))), 1, 4)
+                    End If
+            End Select
+        End If
+    Loop
+    Close #ff
+    If n = 0 Then SeqLoad$ = "no 'row =' lines in " + f$: Exit Function
+    sqN = n
+    For j = 1 To n
+        sqTgt$(j) = ldT$(j): sqGoto(j) = ldG(j): sqFilt$(j) = ldF$(j): sqExp(j) = ldE(j)
+        sqGain(j) = ldGa(j): sqCount(j) = ldC(j): sqBin(j) = ldB(j)
+    Next
+    sqCool = cl: sqEnd = en: sqSel = 1: sqDirty = 0
+    SeqLoad$ = ""
+End Function
+
+Sub SeqSave (f$)
+    Dim ff As Long, i As Long, g$, fl$
+    ff = FreeFile
+    Open f$ For Output As #ff
+    Print #ff, "# QBCap sequence - edit in the Sequencer panel or by hand"
+    Print #ff, "# row = target | goto or - | filter name or - | exposure (2min, 30s, 500ms) | gain | frames | bin"
+    Print #ff, "cooler = " + ItemOf$("off|on", 1 - (sqCool <> 0))
+    Print #ff, "end = " + ItemOf$("stop|leave|quit", sqEnd)
+    For i = 1 To sqN
+        If sqGoto(i) Then g$ = "goto" Else g$ = "-"
+        fl$ = sqFilt$(i): If fl$ = "" Then fl$ = "-"
+        Print #ff, "row = " + sqTgt$(i) + " | " + g$ + " | " + fl$ + " | " + SqExpTxt$(sqExp(i)) + " | " + I2S$(sqGain(i)) + " | " + I2S$(sqCount(i)) + " | " + I2S$(sqBin(i))
+    Next
+    Close #ff
+    sqDirty = 0
+End Sub
+
+'------------------------------------------------------------------
+'  start / stop
+'------------------------------------------------------------------
+' "" = ready, else what is wrong
+Function SeqCheck$ (localStart As Long)
+    Dim i As Long, k As Long, j As Long, keep As Long, m$
+    If camConn = 0 Then SeqCheck$ = "connect the camera first": Exit Function
+    If recOn Then SeqCheck$ = "a capture is running - stop it first": Exit Function
+    For i = 1 To sqN
+        If sqExp(i) > expMaxMs Then SeqCheck$ = "row " + I2S$(i) + ": " + ExpStr$(sqExp(i)) + " is longer than this camera's " + ExpStr$(expMaxMs): Exit Function
+        If sqFilt$(i) <> "" Then
+            If efwOpen Then k = efwSlots Else k = manualSlots
+            If k > NFILT Then k = NFILT
+            m$ = ""
+            For j = 1 To k
+                If UCase$(filtName$(j)) = UCase$(sqFilt$(i)) Then m$ = "ok"
+            Next
+            If m$ = "" Then SeqCheck$ = "row " + I2S$(i) + ": no filter called '" + sqFilt$(i) + "' in this wheel": Exit Function
+        End If
+        If sqGoto(i) Then
+            If mntOpen = 0 Then SeqCheck$ = "row " + I2S$(i) + " has GoTo - connect the mount first": Exit Function
+            If syncOk = 0 Then SeqCheck$ = "row " + I2S$(i) + " has GoTo - Solve & Sync the mount first": Exit Function
+            If localStart = 0 And rmMount = 0 Then SeqCheck$ = "row " + I2S$(i) + " has GoTo - 'Allow remote mount moves' is off": Exit Function
+            keep = tgtIdx
+            FindTarget sqTgt$(i)
+            If InStr(statusMsg$, "Nothing called") Then tgtIdx = keep: SeqCheck$ = "row " + I2S$(i) + ": '" + sqTgt$(i) + "' is not in the GoTo list": Exit Function
+            tgtIdx = keep
+        End If
+    Next
+    SeqCheck$ = ""
+End Function
+
+Sub SeqStart (localStart As Long)
+    Dim e$, n As Long, i As Long
+    If sqRun Then statusMsg$ = "The sequence is already running.": Exit Sub
+    If localStart And (rmQN > 0 Or rmWait$ <> "") Then statusMsg$ = "Remote commands are still queued - clear the queue (Remote panel) first.": sqMsg$ = statusMsg$: Exit Sub
+    e$ = SeqCheck$(localStart)
+    If e$ <> "" Then statusMsg$ = "Sequence not started: " + e$: sqMsg$ = statusMsg$: Exit Sub
+    SeqSave sqFile$
+    ReDim L$(1 To 20 + sqN * 16)
+    n = 0
+    n = n + 1: L$(n) = "SEQBEGIN"
+    n = n + 1: L$(n) = "SAVEAS FITS"
+    n = n + 1: L$(n) = "LIVE ON"
+    If sqCool And camCooled Then
+        n = n + 1: L$(n) = "COOLTEMP " + I2S$(coolTarget)
+        n = n + 1: L$(n) = "COOLER ON"
+        n = n + 1: L$(n) = "WAIT COOL"
+    End If
+    For i = 1 To sqN
+        n = n + 1: L$(n) = "SEQROW " + I2S$(i)
+        If sqGoto(i) Then
+            n = n + 1: L$(n) = "GOTO " + sqTgt$(i)
+            n = n + 1: L$(n) = "WAIT GOTO"
+        End If
+        n = n + 1: L$(n) = "OBJECT " + sqTgt$(i)
+        n = n + 1: L$(n) = "BIN " + I2S$(sqBin(i))
+        n = n + 1: L$(n) = "GAIN " + I2S$(sqGain(i))
+        n = n + 1: L$(n) = "EXP " + SqExpTxt$(sqExp(i))
+        If sqFilt$(i) <> "" Then
+            n = n + 1: L$(n) = "FILTER " + sqFilt$(i)
+            n = n + 1: L$(n) = "WAIT FILTER"
+        End If
+        n = n + 1: L$(n) = "FRESH"
+        n = n + 1: L$(n) = "CAPTURE " + I2S$(sqCount(i))
+        n = n + 1: L$(n) = "WAIT CAPTURE"
+    Next
+    n = n + 1: L$(n) = "SEQEND"
+    For i = 1 To sqN: sqDone(i) = 0: Next
+    sqRun = -1: sqLocal = localStart: sqRow = 0: sqStartT = RmClock#: sqMsg$ = ""
+    rmPaused = 0
+    RemoteAddLines L$(), n, -1
+    LogLine "SEQUENCE started (" + I2S$(sqN) + " rows, about " + HMS$(CSng(SeqSecs#(1))) + " of exposure) from " + ItemOf$("remote|the panel", 1 - (localStart <> 0))
+    statusMsg$ = "Sequence started - " + I2S$(sqN) + " rows, about " + HMS$(CSng(SeqSecs#(1))) + " of exposure."
+End Sub
+
+' the sequence stopped by itself (error, ABORT, CLEAR)
+Sub SeqStopped (why$)
+    If sqRun = 0 Then Exit Sub
+    sqRun = 0
+    sqMsg$ = "Stopped at row " + I2S$(sqRow) + ": " + RmText$(why$)
+    LogLine "SEQUENCE " + sqMsg$
+End Sub
+
+Sub SeqAbort
+    Dim r$
+    If sqRun = 0 Then Exit Sub
+    r$ = RemoteDo$("ABORT")
+    RemoteReply "(Sequencer) ABORT", r$
+    sqRun = 0
+    sqMsg$ = "Aborted at row " + I2S$(sqRow) + " - frames already saved are kept."
+    LogLine "SEQUENCE " + sqMsg$
+    statusMsg$ = "Sequence aborted - frames already saved are kept."
+End Sub
+
+' end this row now (frames saved so far are kept) and go on with the next
+Function SeqSkip$
+    Dim i As Long, k As Long
+    If sqRun = 0 Then SeqSkip$ = "ERR no sequence running": Exit Function
+    If gotoState <> 0 Or mntGoWait <> 0 Then SeqSkip$ = "ERR a GoTo is running - wait for it to finish (or Abort)": Exit Function
+    If recOn Then
+        qcRecordStop: recOn = 0
+        sqDone(sqRow) = sqDone(sqRow) + recWritten
+    End If
+    rmWait$ = ""
+    ' drop the rest of this row: everything up to the next SEQROW / SEQEND
+    k = 0
+    For i = 1 To rmQN
+        If Left$(UCase$(rmQ$(i)), 6) = "SEQROW" Or Left$(UCase$(rmQ$(i)), 6) = "SEQEND" Then k = i: Exit For
+    Next
+    If k = 0 Then
+        rmQN = 0
+    Else
+        For i = k To rmQN: rmQ$(i - k + 1) = rmQ$(i): Next
+        rmQN = rmQN - k + 1
+    End If
+    LogLine "SEQUENCE row " + I2S$(sqRow) + " skipped (" + I2S$(sqDone(sqRow)) + " frames saved)"
+    SeqSkip$ = "OK row " + I2S$(sqRow) + " skipped (" + I2S$(sqDone(sqRow)) + " frames saved)"
+End Function
+
+' internal commands, called from RemoteDo$
+Function SeqCommand$ (w$, c$)
+    Dim a$, r$, e$, v As Long
+    a$ = UCase$(RmWord$(c$, 2))
+    Select Case w$
+        Case "SEQBEGIN"
+            SeqCommand$ = "OK sequence begins"
+        Case "SEQROW"
+            sqRow = Val(a$): sqRowT = RmClock#
+            If sqRow >= 1 And sqRow <= sqN Then
+                statusMsg$ = "Sequence row " + I2S$(sqRow) + " of " + I2S$(sqN) + ": " + _Trim$(SeqRowText$(sqRow))
+                SeqCommand$ = "OK row " + I2S$(sqRow) + ": " + _Trim$(SeqRowText$(sqRow))
+            Else
+                SeqCommand$ = "ERR bad row number"
+            End If
+        Case "SEQEND"
+            sqRun = 0
+            r$ = "OK sequence finished in " + HMS$(CSng(RmClock# - sqStartT))
+            Select Case sqEnd
+                Case 1
+                    If mntOpen Then v = MountStopRetry&: mntTrack = 0: r$ = r$ + " - tracking stopped"
+                Case 3
+                    quitFlag = -1: r$ = r$ + " - shutting QBCap down"
+            End Select
+            sqMsg$ = "Finished " + Time$ + " (" + HMS$(CSng(RmClock# - sqStartT)) + ")"
+            LogLine "SEQUENCE " + sqMsg$
+            statusMsg$ = "Sequence finished."
+            SeqCommand$ = r$
+        Case "SEQ"
+            Select Case a$
+                Case "START"
+                    If sqRun Then SeqCommand$ = "ERR a sequence is already running": Exit Function
+                    If RmWord$(c$, 3) <> "" Then
+                        e$ = RmWord$(c$, 3)
+                        If Left$(e$, 1) <> "/" Then e$ = exeDir$ + e$
+                        r$ = SeqLoad$(e$)
+                        If r$ <> "" Then SeqCommand$ = "ERR " + r$: Exit Function
+                    End If
+                    SeqStart 0
+                    If sqRun Then SeqCommand$ = "OK " + statusMsg$ Else SeqCommand$ = "ERR " + statusMsg$
+                Case "STOP", "ABORT"
+                    If sqRun = 0 Then SeqCommand$ = "OK no sequence running": Exit Function
+                    SeqAbort
+                    SeqCommand$ = "OK sequence aborted"
+                Case "SKIP"
+                    SeqCommand$ = SeqSkip$
+                Case "PAUSE"
+                    rmPaused = -1: SeqCommand$ = "OK paused - the step in progress finishes first"
+                Case "RESUME"
+                    rmPaused = 0: SeqCommand$ = "OK resumed"
+                Case "LOAD"
+                    e$ = RmWord$(c$, 3)
+                    If e$ = "" Then e$ = "QBCap_seq.txt"
+                    If Left$(e$, 1) <> "/" Then e$ = exeDir$ + e$
+                    r$ = SeqLoad$(e$)
+                    sqDirty = -1: SeqSave sqFile$ ' the loaded list is now the one in the panel
+                    If r$ <> "" Then SeqCommand$ = "ERR " + r$ Else SeqCommand$ = "OK " + I2S$(sqN) + " rows loaded, about " + HMS$(CSng(SeqSecs#(1)))
+                Case Else
+                    SeqCommand$ = "ERR SEQ START [file] | STOP | SKIP | PAUSE | RESUME | LOAD [file]"
+            End Select
+        Case "FRESH"
+            ' throw away the frame in progress: restart the camera
+            If camConn = 0 Then SeqCommand$ = "ERR no camera connected": Exit Function
+            If recOn Then SeqCommand$ = "ERR recording": Exit Function
+            If liveOn Then qcStop: liveOn = 0
+            If qcStartVideo& = 0 Then liveOn = -1
+            If liveOn Then SeqCommand$ = "OK new exposure started" Else SeqCommand$ = "ERR " + statusMsg$
+    End Select
+End Function
+
+' a WAIT CAPTURE finished: count the frames for the row
+Sub SeqCaptureDone
+    If sqRun And sqRow >= 1 And sqRow <= sqN Then sqDone(sqRow) = sqDone(sqRow) + recWritten
+End Sub
+
+'------------------------------------------------------------------
+'  status file lines
+'------------------------------------------------------------------
+Sub SeqStatus (ff As Long)
+    If sqRun Then
+        Print #ff, "sequence = running  row " + I2S$(sqRow) + " of " + I2S$(sqN) + ItemOf$("|  PAUSED", 1 - (rmPaused <> 0))
+        If sqRow >= 1 And sqRow <= sqN Then
+            Print #ff, "sequence_row = " + _Trim$(SeqRowText$(sqRow)) + "  saved " + I2S$(sqDone(sqRow) + -(recOn <> 0) * recWritten) + " of " + I2S$(sqCount(sqRow))
+        End If
+        Print #ff, "sequence_left = about " + HMS$(CSng(SeqSecs#(_Max(sqRow, 1)))) + " of exposure  (running " + HMS$(CSng(RmClock# - sqStartT)) + ")"
+    Else
+        Print #ff, "sequence = idle  (" + I2S$(sqN) + " rows, about " + HMS$(CSng(SeqSecs#(1))) + ")  " + RmText$(sqMsg$)
+    End If
+End Sub
+
+'------------------------------------------------------------------
+'  panel (group 16)
+'------------------------------------------------------------------
+' a row of << < value > >> ; returns -2, -1, 0, 1, 2
+Function SeqStep% (y As Long, label$, v$)
+    Dim r As Long, x As Long
+    r = 0
+    Color C_DIM: _PrintString (10, y + 3), label$
+    x = PANEL_W - 20 - 4 * 26 - 96
+    If Btn%(x, y, 24, 20, "<<", 0) Then r = -2
+    If Btn%(x + 26, y, 24, 20, "<", 0) Then r = -1
+    Line (x + 52, y)-(x + 52 + 92, y + 19), C_BOX, BF
+    Color C_TXT: _PrintString (x + 52 + (92 - Len(v$) * 8) \ 2, y + 2), v$
+    If Btn%(x + 148, y, 24, 20, ">", 0) Then r = 1
+    If Btn%(x + 174, y, 24, 20, ">>", 0) Then r = 2
+    y = y + 26
+    SeqStep% = r
+End Function
+
+Function SeqExpStep& (v As Long, d As Long)
+    Dim n As Long, i As Long, st As Long, k As Long, r As Long
+    n = ItemCount&(EXP_STEPS)
+    r = v
+    For k = 1 To Abs(d) * Abs(d) ' << / >> jump 4 steps
+        If d > 0 Then
+            For i = 1 To n
+                st = Val(ItemOf$(EXP_STEPS, i))
+                If st > r Then r = st: Exit For
+            Next
+        Else
+            For i = n To 1 Step -1
+                st = Val(ItemOf$(EXP_STEPS, i))
+                If st < r Then r = st: Exit For
+            Next
+        End If
+    Next
+    SeqExpStep& = r
+End Function
+
+Sub SeqPanel (y As Long)
+    Dim i As Long, v As Long, bw As Long, c As _Unsigned Long, s$, lst$, k As Long, n As Long, f$, r$
+    ' ---- running ----
+    If sqRun Then
+        s$ = "RUNNING  row " + I2S$(sqRow) + " of " + I2S$(sqN)
+        If rmPaused Then s$ = s$ + "  PAUSED"
+        PInfoC y, s$, C_REC ' running = red, finished = green
+        If sqRow >= 1 And sqRow <= sqN Then
+            PInfoC y, _Trim$(SeqRowText$(sqRow)), C_REC
+            PInfo y, "Saved " + I2S$(sqDone(sqRow) + -(recOn <> 0) * recWritten) + " of " + I2S$(sqCount(sqRow)) + " frames"
+        End If
+        If rmWait$ <> "" Then PInfoWrap y, "Now: " + rmWaitCmd$ + " (" + I2S$(CLng(RmClock# - rmWaitStart)) + " s)", C_DIM
+        PInfo y, "Left: about " + HMS$(CSng(SeqSecs#(_Max(sqRow, 1)))) + "   running " + HMS$(CSng(RmClock# - sqStartT))
+        bw = (PANEL_W - 38) \ 3
+        If rmPaused Then
+            If Btn%(10, y, bw, 24, "Resume", -1) Then rmPaused = 0: statusMsg$ = "Sequence resumed"
+        Else
+            If Btn%(10, y, bw, 24, "Pause", 0) Then rmPaused = -1: statusMsg$ = "Sequence paused - the step in progress finishes first"
+        End If
+        If Btn%(14 + bw, y, bw, 24, "Skip row", 0) Then
+            r$ = SeqSkip$: RemoteReply "(Sequencer) SKIP", r$: statusMsg$ = RmText$(r$)
+        End If
+        If Btn%(18 + 2 * bw, y, bw, 24, "Abort", 2) Then SeqAbort
+        y = y + 30
+        For i = 1 To sqN
+            If i = sqRow Then c = C_REC Else If i < sqRow Then c = C_DIM Else c = C_TXT
+            s$ = SeqRowText$(i)
+            If i < sqRow Or (i = sqRow And sqDone(i) > 0) Then s$ = Left$(s$ + Space$(34), 34) + I2S$(sqDone(i))
+            PInfoC y, s$, c
+        Next
+        y = y + 6
+        Exit Sub
+    End If
+
+    ' ---- editing ----
+    For i = 1 To sqN
+        If InRect%(6, y - 1, PANEL_W - 26, 19) And mClick Then sqSel = i: mClick = 0: sqEditOn = 0
+        If i = sqSel Then Line (6, y - 1)-(PANEL_W - 21, y + 17), C_BTNON, BF
+        Color C_TXT: _PrintString (10, y), SeqRowText$(i)
+        y = y + 19
+    Next
+    y = y + 6
+    bw = (PANEL_W - 42) \ 4
+    If Btn%(10, y, bw, 22, "Add", 0) Then SeqAddRow
+    If Btn%(14 + bw, y, bw, 22, "Delete", 0) Then SeqDeleteRow
+    If Btn%(18 + 2 * bw, y, bw, 22, "Up", 0) Then
+        If sqSel > 1 Then SeqSwapRows sqSel, sqSel - 1: sqSel = sqSel - 1
+    End If
+    If Btn%(22 + 3 * bw, y, bw, 22, "Down", 0) Then
+        If sqSel < sqN Then SeqSwapRows sqSel, sqSel + 1: sqSel = sqSel + 1
+    End If
+    y = y + 30
+
+    ' selected row
+    i = sqSel
+    If i < 1 Or i > sqN Then i = 1: sqSel = 1
+    Color C_ACC: _PrintString (10, y), "Row " + I2S$(i): y = y + 20
+    If sqEditOn Then
+        Line (10, y)-(PANEL_W - 21, y + 21), C_BOX, BF
+        Line (10, y)-(PANEL_W - 21, y + 21), C_ACC, B
+        s$ = "Target: " + sqBuf$
+        If (Int(Timer * 2) Mod 2) = 0 Then s$ = s$ + "_"
+        Color C_TXT: _PrintString (16, y + 3), s$
+        y = y + 26
+        PInfo y, "Type the name, then Enter (Esc = cancel)"
+    ElseIf PButton%(y, "Target: " + sqTgt$(i) + "  (change...)", 0) Then
+        sqEditOn = -1: sqBuf$ = ""
+        statusMsg$ = "Type the target name (M57, NGC 7635...), then Enter - Esc keeps " + sqTgt$(i)
+    End If
+    v = PCheck&(y, "GoTo + centre it first", sqGoto(i))
+    If v <> sqGoto(i) Then sqGoto(i) = v: sqDirty = -1
+    ' filter: (none) + this wheel's names
+    If efwOpen Then n = efwSlots Else n = manualSlots
+    If n > NFILT Then n = NFILT
+    lst$ = "(none)": k = 1
+    For v = 1 To n
+        lst$ = lst$ + "|" + filtName$(v)
+        If UCase$(filtName$(v)) = UCase$(sqFilt$(i)) Then k = v + 1
+    Next
+    v = PCycler&(y, "Filter", lst$, k)
+    If v <> k Then
+        If v = 1 Then sqFilt$(i) = "" Else sqFilt$(i) = filtName$(v - 1)
+        sqDirty = -1
+    End If
+    v = SeqStep%(y, "Exposure", ExpStr$(sqExp(i)))
+    If v Then sqExp(i) = _Clamp(SeqExpStep&(sqExp(i), v), 1, EXP_MAX_MS): sqDirty = -1
+    v = SeqStep%(y, "Gain", I2S$(sqGain(i)))
+    If v Then sqGain(i) = _Clamp(sqGain(i) + Sgn(v) * (1 + 9 * -(Abs(v) = 2)), 0, 600): sqDirty = -1
+    v = SeqStep%(y, "Frames", I2S$(sqCount(i)))
+    If v Then sqCount(i) = _Clamp(sqCount(i) + Sgn(v) * (1 + 9 * -(Abs(v) = 2)), 1, 9999): sqDirty = -1
+    v = PCycler&(y, "Binning", "1x1|2x2|3x3|4x4", sqBin(i))
+    If v <> sqBin(i) Then sqBin(i) = v: sqDirty = -1
+    PInfo y, "Row: " + HMS$(CSng(sqCount(i) * sqExp(i) / 1000)) + " of exposure"
+
+    ' whole sequence
+    y = y + 4
+    Color C_ACC: _PrintString (10, y), "Sequence": y = y + 20
+    v = PCheck&(y, "Cool to " + I2S$(coolTarget) + " C first (Thermal panel)", sqCool)
+    If v <> sqCool Then sqCool = v: sqDirty = -1
+    v = PCycler&(y, "At the end", "Stop tracking|Leave mount|Shut down", sqEnd)
+    If v <> sqEnd Then sqEnd = v: sqDirty = -1
+    n = 0
+    For v = 1 To sqN: n = n + sqCount(v): Next
+    PInfo y, "Total " + HMS$(CSng(SeqSecs#(1))) + "  (" + I2S$(n) + " frames, FITS)"
+    If PButton%(y, "START SEQUENCE", 0) Then sqEditOn = 0: SeqStart -1
+    bw = (PANEL_W - 34) \ 2
+    If Btn%(10, y, bw, 24, "Save as...", 0) Then
+        f$ = _SaveFileDialog$("Save sequence", exeDir$ + "sequence.txt", "*.txt", "Sequence files")
+        If f$ <> "" Then SeqSave f$: SeqSave sqFile$: statusMsg$ = "Sequence saved: " + f$
+    End If
+    If Btn%(14 + bw, y, bw, 24, "Load...", 0) Then
+        f$ = _OpenFileDialog$("Load sequence", exeDir$, "*.txt", "Sequence files")
+        If f$ <> "" Then
+            r$ = SeqLoad$(f$)
+            If r$ = "" Then statusMsg$ = "Sequence loaded: " + f$: sqDirty = -1 Else statusMsg$ = "Load: " + r$
+        End If
+    End If
+    y = y + 30
+    If sqMsg$ <> "" Then
+        ' finished = green; stopped / aborted / not started = amber
+        If Left$(sqMsg$, 8) = "Finished" Then c = C_OK Else c = _RGB32(255, 200, 80)
+        PInfoWrap y, sqMsg$, c
+    End If
+    y = y + 6
+    ' remember the list (QBCap_seq.txt)
+    If sqDirty Then SeqSave sqFile$
+End Sub
+
+Sub SeqKey (k$)
+    Select Case k$
+        Case ""
+        Case Chr$(13)
+            sqEditOn = 0
+            If Len(_Trim$(sqBuf$)) > 0 And sqSel >= 1 And sqSel <= sqN Then
+                sqTgt$(sqSel) = Left$(_Trim$(sqBuf$), 24): sqDirty = -1
+                statusMsg$ = "Row " + I2S$(sqSel) + " target: " + sqTgt$(sqSel)
+            End If
+        Case Chr$(27)
+            sqEditOn = 0: statusMsg$ = "Target unchanged"
+        Case Chr$(8)
+            If Len(sqBuf$) > 0 Then sqBuf$ = Left$(sqBuf$, Len(sqBuf$) - 1)
+        Case Else
+            If Len(k$) = 1 And Asc(k$) >= 32 And Asc(k$) < 127 And k$ <> "|" And Len(sqBuf$) < 24 Then sqBuf$ = sqBuf$ + k$
+    End Select
+End Sub

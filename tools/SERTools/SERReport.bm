@@ -1,0 +1,301 @@
+' ============================================================================
+' SERReport.bm  -  Big-font, native-resolution output screens
+'
+' WHY THIS EXISTS
+'   Result/report screens used small buffers sized off the image, then let
+'   _FullScreen _SquarePixels scale them up to the display. On a 1360x768 panel
+'   that scale factor is fractional (~1.4x), so the fixed 8x16 font gets its
+'   glyph stems dropped/doubled unevenly -> "garbled" text.
+'
+'   Fix: build these screens at the ACTUAL desktop size (scale = x1, no upscale,
+'   nothing to garble) and draw text with a genuinely larger loaded font. A
+'   margin keeps content off a TV's overscan border.
+'
+'   These helpers are for BUTTON-FREE screens only. Button% still centres with
+'   the built-in 8x16 metrics, so the menus/Viewer keep the built-in font. Each
+'   helper restores _Font 16 before it hands control back, so nothing leaks.
+'
+'   Include with the other .bm modules at the BOTTOM of the program:
+'       '$INCLUDE:'SERReport.bm'
+'   and call InitReportFont ONCE at startup (after the first Screen).
+'
+'   Requires from the host program: gHub (Dim Shared Long), Sub GoFull,
+'   and a Dim Shared gRptFont As Long. Tune RPT_FONT_PX / RPT_MARGIN below.
+' ============================================================================
+
+Const RPT_FONT_PX = 22 ' report/title point size; bump to taste (24, 26...)
+Const RPT_MARGIN = 28 ' inset from every edge -> clears TV overscan
+
+' ---------------------------------------------------------------------------
+' Load a monospace TTF once. Falls back through the usual Windows faces, then
+' silently to the built-in font (gRptFont stays 0 and every helper guards it).
+' ---------------------------------------------------------------------------
+Sub InitReportFont
+    gRptFont = 0
+    Dim p As String
+    p = "C:\Windows\Fonts\consola.ttf" ' Consolas
+    If _FileExists(p) Then gRptFont = _LoadFont(p, RPT_FONT_PX, "MONOSPACE")
+    If gRptFont <= 0 Then
+        p = "C:\Windows\Fonts\lucon.ttf" ' Lucida Console
+        If _FileExists(p) Then gRptFont = _LoadFont(p, RPT_FONT_PX, "MONOSPACE")
+    End If
+    If gRptFont <= 0 Then
+        p = "C:\Windows\Fonts\cour.ttf" ' Courier New
+        If _FileExists(p) Then gRptFont = _LoadFont(p, RPT_FONT_PX, "MONOSPACE")
+    End If
+    ' Linux (Mint / Ubuntu) monospace fonts
+    If gRptFont <= 0 Then
+        p = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+        If _FileExists(p) Then gRptFont = _LoadFont(p, RPT_FONT_PX, "MONOSPACE")
+    End If
+    If gRptFont <= 0 Then
+        p = "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf"
+        If _FileExists(p) Then gRptFont = _LoadFont(p, RPT_FONT_PX, "MONOSPACE")
+    End If
+    If gRptFont <= 0 Then
+        p = "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf"
+        If _FileExists(p) Then gRptFont = _LoadFont(p, RPT_FONT_PX, "MONOSPACE")
+    End If
+End Sub
+
+' Select the big report font (no-op if it failed to load; you keep 8x16).
+Sub UseRpt
+    If gRptFont > 0 Then _Font gRptFont
+End Sub
+
+' Back to the built-in 8x16 (handle 16). ALWAYS call before drawing buttons.
+Sub UseSmall
+    _Font 16
+End Sub
+
+' ---------------------------------------------------------------------------
+' Centred letterbox: fit srcW x srcH inside a box, preserving aspect. Returns
+' the destination rect (ox,oy,ow,oh). Never upscales past the box.
+' ---------------------------------------------------------------------------
+Sub FitInBox (srcW As Long, srcH As Long, boxX As Long, boxY As Long, boxW As Long, boxH As Long, ox As Long, oy As Long, ow As Long, oh As Long)
+    Dim sc As Double: sc = 1#
+    If boxW / srcW < sc Then sc = boxW / srcW
+    If boxH / srcH < sc Then sc = boxH / srcH
+    ow = Int(srcW * sc): If ow < 1 Then ow = 1
+    oh = Int(srcH * sc): If oh < 1 Then oh = 1
+    ox = boxX + (boxW - ow) \ 2
+    oy = boxY + (boxH - oh) \ 2
+End Sub
+
+' ---------------------------------------------------------------------------
+' Draw one word-wrapped string into a column. Advances yy (by ref) past every
+' line it drew. Stops if it would run below maxY. Assumes the big font is
+' already selected so _PrintWidth / _FontHeight report its metrics.
+' ---------------------------------------------------------------------------
+Sub WrapDraw (s As String, x As Long, yy As Long, maxChars As Long, lead As Long, maxY As Long)
+    Dim rest As String: rest = s
+    If rest = "" Then
+        yy = yy + lead ' blank line = paragraph gap
+        Exit Sub
+    End If
+    Do While Len(rest) > 0 And yy < maxY
+        Dim take As Long: take = Len(rest)
+        If take > maxChars Then
+            take = maxChars
+            Dim sp As Long: sp = _InStrRev(Left$(rest, maxChars + 1), " ")
+            If sp > 1 Then take = sp - 1
+        End If
+        _PrintString (x, yy), Left$(rest, take)
+        yy = yy + lead
+        rest = _Trim$(Mid$(rest, take + 1))
+    Loop
+End Sub
+
+' ---------------------------------------------------------------------------
+' Full-screen single image result: title strip on top, image letterboxed
+' below, "any key to close". Replaces the four near-identical result blocks
+' (Debayer / Stacker / StackSet / Process). Caller owns/frees the image.
+' ---------------------------------------------------------------------------
+Sub ShowImageResult (img As Long, srcW As Long, srcH As Long, titl As String)
+    Dim W As Long, H As Long, M As Long
+    W = _DesktopWidth: H = _DesktopHeight: M = RPT_MARGIN
+
+    Dim rscr As Long: rscr = _NewImage(W, H, 32)
+    Screen rscr
+    GoFull
+    _ScreenMove _Middle
+    _Title titl
+    Cls , _RGB32(16, 18, 24)
+
+    ' title
+    UseRpt
+    Color _RGB32(230, 235, 245)
+    _PrintString (M, M), titl
+    Dim topY As Long: topY = M + _FontHeight + 12
+
+    ' footer (measure with big font, then draw)
+    Color _RGB32(150, 160, 180)
+    Dim footY As Long: footY = H - M - _FontHeight
+    _PrintString (M, footY), "any key to close"
+    UseSmall
+
+    ' image between title and footer, letterboxed
+    Dim ox As Long, oy As Long, ow As Long, oh As Long
+    FitInBox srcW, srcH, M, topY, W - 2 * M, footY - topY - 12, ox, oy, ow, oh
+    _PutImage (ox, oy)-(ox + ow - 1, oy + oh - 1), img
+
+    _Display
+    Do: _Limit 30: Loop Until _KeyHit <> 0 Or _Exit
+
+    Screen gHub
+    GoFull
+    _FreeImage rscr
+    _Title "SER PPIP Toolkit"
+End Sub
+
+' ---------------------------------------------------------------------------
+' Split result: marked-up image on the LEFT half, report text on the RIGHT.
+' This is the shape the Diagnose tool wants -- call it with the overlay image
+' and the report() array RunDiagnostics fills.
+'
+'   img          : already-built display image (e.g. the overlaid frame)
+'   srcW, srcH   : that image's pixel size
+'   rpt() / n    : report lines, indices 1..n (adjust the For if 0-based)
+'   titl         : window title
+' ---------------------------------------------------------------------------
+Sub ShowSplitReport (img As Long, srcW As Long, srcH As Long, rpt() As String, n As Long, titl As String)
+    Dim W As Long, H As Long, M As Long, gap As Long
+    W = _DesktopWidth: H = _DesktopHeight: M = RPT_MARGIN: gap = 28
+
+    Dim rscr As Long: rscr = _NewImage(W, H, 32)
+    Screen rscr
+    GoFull
+    _ScreenMove _Middle
+    _Title titl
+    Cls , _RGB32(16, 18, 24)
+
+    Dim halfW As Long: halfW = (W - 2 * M - gap) \ 2
+
+    ' left: image letterboxed into its half
+    Dim ox As Long, oy As Long, ow As Long, oh As Long
+    FitInBox srcW, srcH, M, M, halfW, H - 2 * M, ox, oy, ow, oh
+    _PutImage (ox, oy)-(ox + ow - 1, oy + oh - 1), img
+    Line (ox - 1, oy - 1)-(ox + ow, oy + oh), _RGB32(60, 66, 80), B
+
+    ' right: severity-coded report text, big font, word-wrapped to the column
+    UseRpt
+    Dim lead As Long: lead = _FontHeight + 6
+    Dim cw As Long: cw = _PrintWidth("M"): If cw < 1 Then cw = 8
+
+    Dim tx As Long: tx = M + halfW + gap ' left edge of the report column
+    Dim gutter As Long: gutter = cw + 8 ' room for the severity chip
+    Dim textX0 As Long: textX0 = tx + gutter ' where body text starts
+    Dim rightX As Long: rightX = W - M ' text right boundary
+
+    ' reserve the bottom row for a colour legend + close hint
+    Dim footY As Long: footY = H - M - _FontHeight
+    Dim bodyMaxY As Long: bodyMaxY = footY - lead
+
+    Dim yy As Long: yy = M
+    Dim i As Long
+    For i = 1 To n
+        Dim clr As _Unsigned Long, xo As Long, sv As Long, rl As Long, kd As Long
+        RptClassify rpt(i), clr, xo, sv, rl, kd
+        If yy >= bodyMaxY Then Exit For
+
+        ' faint separator rule above each new verdict section
+        If rl <> 0 And yy > M Then Line (textX0, yy - 5)-(rightX, yy - 5), _RGB32(50, 56, 70)
+
+        If kd = 1 Then
+            ' banner: centred in the column, with an underline
+            Color clr
+            Dim bt As String: bt = _Trim$(rpt(i))
+            Dim bx As Long: bx = tx + ((rightX - tx) - _PrintWidth(bt)) \ 2
+            If bx < tx Then bx = tx
+            _PrintString (bx, yy), bt
+            Line (tx, yy + _FontHeight + 2)-(rightX, yy + _FontHeight + 2), _RGB32(70, 78, 96)
+            yy = yy + lead + 6
+        Else
+            ' severity chip in the gutter for verdict headers
+            If sv <> 0 Then
+                Dim chip As _Unsigned Long
+                Select Case sv
+                    Case 1: chip = _RGB32(96, 220, 112)
+                    Case 2: chip = _RGB32(240, 202, 74)
+                    Case Else: chip = _RGB32(246, 104, 88)
+                End Select
+                Dim cs As Long: cs = _FontHeight \ 2
+                Line (tx, yy + (_FontHeight - cs) \ 2)-(tx + cs - 1, yy + (_FontHeight + cs) \ 2 - 1), chip, BF
+            End If
+            Color clr
+            Dim lineX As Long: lineX = textX0 + xo
+            Dim mc As Long: mc = (rightX - lineX) \ cw: If mc < 1 Then mc = 1
+            WrapDraw _Trim$(rpt(i)), lineX, yy, mc, lead, bodyMaxY
+        End If
+    Next i
+
+    ' footer: colour legend (what the chips mean) + close hint
+    Dim cs2 As Long: cs2 = _FontHeight \ 2
+    Dim lx As Long: lx = tx
+    Line (lx, footY + (_FontHeight - cs2) \ 2)-(lx + cs2 - 1, footY + (_FontHeight + cs2) \ 2 - 1), _RGB32(96, 220, 112), BF
+    Color _RGB32(150, 160, 180): _PrintString (lx + cs2 + 6, footY), "OK"
+    lx = lx + cs2 + 6 + _PrintWidth("OK") + 22
+    Line (lx, footY + (_FontHeight - cs2) \ 2)-(lx + cs2 - 1, footY + (_FontHeight + cs2) \ 2 - 1), _RGB32(240, 202, 74), BF
+    _PrintString (lx + cs2 + 6, footY), "software fix"
+    lx = lx + cs2 + 6 + _PrintWidth("software fix") + 22
+    Line (lx, footY + (_FontHeight - cs2) \ 2)-(lx + cs2 - 1, footY + (_FontHeight + cs2) \ 2 - 1), _RGB32(246, 104, 88), BF
+    _PrintString (lx + cs2 + 6, footY), "check hardware"
+
+    Dim ck As String: ck = "any key to close"
+    Color _RGB32(120, 128, 146): _PrintString (rightX - _PrintWidth(ck), footY), ck
+    UseSmall
+
+    _Display
+    Do: _Limit 30: Loop Until _KeyHit <> 0 Or _Exit
+
+    Screen gHub
+    GoFull
+    _FreeImage rscr
+    _Title "SER PPIP Toolkit"
+End Sub
+
+' ---------------------------------------------------------------------------
+' Classify a report line for styling. Everything is inferred from the line's
+' OWN text, so the SERDiag report() contract is untouched -- new verdict lines
+' colour themselves automatically as long as they keep the "STARS:/BACKGROUND:/
+' HOT PIXELS:" prefixes and the "  Likely/Check/Fix" two-space indent.
+'   colr - text colour        xOff - extra pixel indent (hangs through wraps)
+'   sev  - 0 none / 1 ok / 2 software-fixable / 3 hardware  (drives the chip)
+'   rule - <>0 => draw a faint separator above this line (a section start)
+'   kind - 0 body / 1 banner / 2 verdict / 3 detail / 4 footnote / 5 stat
+' ---------------------------------------------------------------------------
+Sub RptClassify (s As String, colr As _Unsigned Long, xOff As Long, sev As Long, rule As Long, kind As Long)
+    Dim t As String: t = _Trim$(s)
+    colr = _RGB32(214, 220, 232): xOff = 0: sev = 0: rule = 0: kind = 0
+    If t = "" Then Exit Sub
+    If Left$(t, 3) = "===" Then
+        colr = _RGB32(150, 200, 255): kind = 1
+    ElseIf Left$(t, 6) = "STARS:" Or Left$(t, 11) = "BACKGROUND:" Or Left$(t, 11) = "HOT PIXELS:" Then
+        sev = RptSeverity&(t): rule = -1: kind = 2
+        Select Case sev
+            Case 1: colr = _RGB32(96, 220, 112)
+            Case 2: colr = _RGB32(240, 202, 74)
+            Case Else: colr = _RGB32(246, 104, 88)
+        End Select
+    ElseIf Left$(t, 3) = "---" Then
+        colr = _RGB32(132, 140, 158): kind = 4
+    ElseIf Left$(s, 2) = "  " Then
+        colr = _RGB32(188, 196, 212): xOff = 22: kind = 3
+    Else
+        colr = _RGB32(184, 192, 208): kind = 5
+    End If
+End Sub
+
+' Severity of a verdict header, read from its wording:
+'   1 = fine (no action)   2 = fixable in software   3 = hardware / needs a fix
+' Point of the colours: red says "go turn a screw on the scope", amber says
+' "fix it in post", green says "leave it alone".
+Function RptSeverity& (t As String)
+    If InStr(t, "round.") > 0 Or InStr(t, "reasonably even") > 0 Or InStr(t, "HOT PIXELS: few") > 0 Then
+        RptSeverity& = 1
+    ElseIf InStr(t, "gradient") > 0 Or InStr(t, "vignetting") > 0 Or InStr(t, "darker") > 0 Or InStr(t, "isolated outliers") > 0 Or InStr(t, "too few") > 0 Or InStr(t, "mixed") > 0 Or InStr(t, "unclear") > 0 Then
+        RptSeverity& = 2
+    Else
+        RptSeverity& = 3
+    End If
+End Function

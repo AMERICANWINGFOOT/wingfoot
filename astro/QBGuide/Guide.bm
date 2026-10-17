@@ -1,0 +1,587 @@
+'=====================================================================
+' Guide.bm - QBGuide guiding helper (code part)
+'=====================================================================
+
+Sub GuideDefaults
+    GP.raAggr = 0.7
+    GP.raHyst = 0.1
+    GP.raMinMove = 0.2
+    GP.decAggr = 1.0
+    GP.decMinMove = 0.2
+    GP.decMode = DEC_AUTO
+    GP.maxRaMs = 2500
+    GP.maxDecMs = 2500
+    GP.calDistance = 25
+    GP.searchR = 15
+    GP.minHFD = 1.5
+    GP.maxHFD = 10
+    GP.decNow = 0
+End Sub
+
+Function SignOf& (v As Double)
+    If v > 0 Then
+        SignOf& = 1
+    ElseIf v < 0 Then
+        SignOf& = -1
+    Else
+        SignOf& = 0
+    End If
+End Function
+
+Function NormAngle# (a As Double)
+    Dim r As Double
+    r = a
+    Do While r > 3.14159265358979: r = r - 6.28318530717959: Loop
+    Do While r <= -3.14159265358979: r = r + 6.28318530717959: Loop
+    NormAngle# = r
+End Function
+
+' arc-seconds per (binned) pixel
+Function ImageScale# (focalMm As Double)
+    Dim fl As Double
+    fl = focalMm
+    If fl < 1 Then fl = 1
+    ImageScale# = 206.265 * Cam.pixelUm * Cam.bin / fl
+End Function
+
+' PHD2's calibration step: move "distance" pixels in "nSteps" pulses.
+Function CalcCalStepMs& (focalMm As Double, guideRate As Double, decDeg As Double, distance As Long, nSteps As Long)
+    Dim gs As Double, scl As Double, dd As Double, total As Double, ms As Long
+    dd = Abs(decDeg)
+    If dd > 60 Then dd = 60
+    gs = guideRate * 15.0417 * Cos(dd * 3.14159265358979 / 180#)
+    If gs < 0.1 Then gs = 0.1
+    scl = ImageScale#(focalMm)
+    total = distance * scl / gs
+    ms = Int(total / nSteps * 1000# + 0.5)
+    If ms < 50 Then ms = 50
+    If ms > 10000 Then ms = 10000
+    CalcCalStepMs& = ms
+End Function
+
+'---------------------------------------------------------------------
+' Star centroid - port of PHD2 Star::Find (centroid mode)
+' Searches a box of +/- searchR around (bx,by). Returns status.
+'---------------------------------------------------------------------
+Function StarFind& (bx As Double, by As Double, searchR As Long, st As StarT)
+    Dim w As Long, h As Long, minx As Long, miny As Long, maxx As Long, maxy As Long
+    Dim sx As Long, ex As Long, sy As Long, ey As Long, x As Long, y As Long
+    Dim cx0 As Long, cy0 As Long, px As Long, py As Long
+    Dim p As Long, vv As Long, peakV As Long, m0 As Long, m1 As Long, m2 As Long, tt As Long
+    Dim A As Long, B As Long, A2 As Long, B2 As Long, iter As Long
+    Dim dx As Long, dy As Long, r2 As Long, nbg As Long
+    Dim sum As Double, ra As Double, q As Double, a0 As Double, k As Double, dval As Double
+    Dim meanBg As Double, prevMean As Double, sig2 As Double, sig As Double
+    Dim thresh As Long, cx As Double, cy As Double, mass As Double, n As Long
+    Dim hsum As Double, snr As Double, mx As Long, d As Double, result As Long
+    Dim nx As Double, ny As Double
+
+    w = Cam.frameW: h = Cam.frameH
+    minx = 0: miny = 0: maxx = w - 1: maxy = h - 1
+    st.status = STAR_ERROR
+    st.snr = 0: st.hfd = 0: st.mass = 0
+    cx0 = Int(bx + 0.5): cy0 = Int(by + 0.5)
+    sx = cx0 - searchR: If sx < minx Then sx = minx
+    ex = cx0 + searchR: If ex > maxx Then ex = maxx
+    sy = cy0 - searchR: If sy < miny Then sy = miny
+    ey = cy0 + searchR: If ey > maxy Then ey = maxy
+    If ex - sx < 3 Or ey - sy < 3 Then StarFind& = STAR_ERROR: Exit Function
+
+    ' smoothed peak search, and top three raw values for saturation test
+    peakV = 0: px = sx + 1: py = sy + 1
+    m0 = 0: m1 = 0: m2 = 0
+    For y = sy + 1 To ey - 1
+        For x = sx + 1 To ex - 1
+            p = Frame(y * w + x)
+            vv = 4 * p + Frame((y - 1) * w + x - 1) + Frame((y - 1) * w + x + 1) + Frame((y + 1) * w + x - 1) + Frame((y + 1) * w + x + 1)
+            vv = vv + 2 * (Frame((y - 1) * w + x) + Frame(y * w + x - 1) + Frame(y * w + x + 1) + Frame((y + 1) * w + x))
+            If vv > peakV Then peakV = vv: px = x: py = y
+            If p > m0 Then tt = m0: m0 = p: p = tt
+            If p > m1 Then tt = m1: m1 = p: p = tt
+            If p > m2 Then m2 = p
+        Next
+    Next
+    peakV = peakV \ 16
+
+    ' background from an annulus 7..12 px around the peak, sigma-clipped
+    A = 7: B = 12: A2 = A * A: B2 = B * B
+    sx = px - B: If sx < minx Then sx = minx
+    ex = px + B: If ex > maxx Then ex = maxx
+    sy = py - B: If sy < miny Then sy = miny
+    ey = py + B: If ey > maxy Then ey = maxy
+    meanBg = 0: sig = 0: sig2 = 0
+    For iter = 0 To 8
+        sum = 0: ra = 0: q = 0: nbg = 0
+        For y = sy To ey
+            dy = y - py
+            For x = sx To ex
+                dx = x - px
+                r2 = dx * dx + dy * dy
+                If r2 > A2 And r2 <= B2 Then
+                    dval = Frame(y * w + x)
+                    If iter = 0 Or (dval >= meanBg - 2 * sig And dval <= meanBg + 2 * sig) Then
+                        sum = sum + dval
+                        nbg = nbg + 1
+                        k = nbg
+                        a0 = ra
+                        ra = ra + (dval - ra) / k
+                        q = q + (dval - a0) * (dval - ra)
+                    End If
+                End If
+            Next
+        Next
+        If nbg < 10 Then Exit For
+        prevMean = meanBg
+        meanBg = sum / nbg
+        sig2 = q / (nbg - 1)
+        sig = Sqr(sig2)
+        If iter > 0 And Abs(meanBg - prevMean) < 0.5 Then Exit For
+    Next
+
+    ' centroid of pixels over threshold inside radius A
+    thresh = Int(meanBg + 3 * sig + 0.5)
+    sx = px - A: If sx < minx Then sx = minx
+    ex = px + A: If ex > maxx Then ex = maxx
+    sy = py - A: If sy < miny Then sy = miny
+    ey = py + A: If ey > maxy Then ey = maxy
+    cx = 0: cy = 0: mass = 0: n = 0: hsum = 0
+    For y = sy To ey
+        dy = y - py
+        For x = sx To ex
+            dx = x - px
+            If dx * dx + dy * dy <= A2 Then
+                p = Frame(y * w + x)
+                If p >= thresh Then
+                    d = p - meanBg
+                    cx = cx + dx * d
+                    cy = cy + dy * d
+                    mass = mass + d
+                    n = n + 1
+                End If
+            End If
+        Next
+    Next
+
+    st.mass = mass
+    st.bg = meanBg
+    st.peak = m0
+    If n > 0 And mass > 0 Then
+        snr = mass / Sqr(mass / 0.5 + sig2 * n * (1 + 1 / (nbg + 1)))
+    Else
+        snr = 0
+    End If
+    If peakV <= thresh And snr >= 3 Then snr = 2.9
+    st.snr = snr
+
+    If mass < 10 Then st.status = STAR_LOWMASS: StarFind& = STAR_LOWMASS: Exit Function
+    If snr < 3 Then st.status = STAR_LOWSNR: StarFind& = STAR_LOWSNR: Exit Function
+
+    nx = px + cx / mass
+    ny = py + cy / mass
+
+    ' half flux diameter (mass-weighted mean radius, x2)
+    For y = sy To ey
+        For x = sx To ex
+            p = Frame(y * w + x)
+            If p >= thresh Then
+                If (x - px) * (x - px) + (y - py) * (y - py) <= A2 Then
+                    hsum = hsum + (p - meanBg) * Sqr((x - nx) * (x - nx) + (y - ny) * (y - ny))
+                End If
+            End If
+        Next
+    Next
+    st.hfd = 2 * hsum / mass
+
+    result = STAR_OK
+    If st.hfd < GP.minHFD Then result = STAR_LOWHFD
+    If st.hfd > GP.maxHFD Then result = STAR_HIHFD
+    If result = STAR_OK Then
+        ' flat-top saturation test (16-bit data) plus a hard limit
+        mx = m0
+        If m0 >= 64000 Then
+            result = STAR_SATURATED
+        ElseIf (m0 - m2) * 65535# < 32# * mx Then
+            result = STAR_SATURATED
+        End If
+    End If
+    If result = STAR_OK Or result = STAR_SATURATED Then
+        st.x = nx
+        st.y = ny
+    End If
+    st.status = result
+    StarFind& = result
+End Function
+
+Function StarWasFound& (status As Long)
+    StarWasFound& = (status = STAR_OK Or status = STAR_SATURATED)
+End Function
+
+' Median and noise of the frame from a sample of pixels.
+Sub FrameStats (med As Double, noise As Double)
+    Dim hist(0 To 4095) As Long, i As Long, stp As Long, n As Long, c As Long
+    Dim total As Long, p50 As Long, p84 As Long
+    total = Cam.frameW * Cam.frameH
+    stp = total \ 20000
+    If stp < 1 Then stp = 1
+    n = 0
+    For i = 0 To total - 1 Step stp
+        hist(Frame(i) \ 16) = hist(Frame(i) \ 16) + 1
+        n = n + 1
+    Next
+    c = 0: p50 = -1: p84 = -1
+    For i = 0 To 4095
+        c = c + hist(i)
+        If p50 < 0 And c >= n * 0.5 Then p50 = i
+        If p84 < 0 And c >= n * 0.8413 Then p84 = i: Exit For
+    Next
+    If p50 < 0 Then p50 = 0
+    If p84 < p50 Then p84 = p50
+    med = p50 * 16 + 8
+    noise = (p84 - p50) * 16
+    If noise < 4 Then noise = 4
+End Sub
+
+' Pick the best guide star in the frame (like PHD2 Auto-select).
+' Skips hot pixels, saturated stars, stars near the edge and stars
+' with a close neighbour. Returns -1 when one was found.
+Function StarAutoFind& (st As StarT)
+    Dim w As Long, h As Long, x As Long, y As Long, edge As Long, i As Long, j As Long
+    Dim med As Double, noise As Double, hi As Long, lo As Long, p As Long, nb As Long
+    Dim nc As Long, best As Long, bestScore As Double, s As StarT, r As Long, ok As Long
+    Dim cxs(1 To 400) As Long, cys(1 To 400) As Long, cpk(1 To 400) As Long
+    w = Cam.frameW: h = Cam.frameH
+    FrameStats med, noise
+    hi = med + 8 * noise
+    lo = med + 3 * noise
+    edge = GP.searchR + 14
+    nc = 0
+    For y = edge To h - 1 - edge
+        For x = edge To w - 1 - edge
+            p = Frame(y * w + x)
+            If p > hi Then
+                ' local maximum of raw pixels
+                If p >= Frame(y * w + x - 1) And p >= Frame(y * w + x + 1) And p >= Frame((y - 1) * w + x) And p > Frame((y + 1) * w + x) Then
+                    ' real stars light their neighbours; hot pixels do not
+                    nb = 0
+                    If Frame(y * w + x - 1) > lo Then nb = nb + 1
+                    If Frame(y * w + x + 1) > lo Then nb = nb + 1
+                    If Frame((y - 1) * w + x) > lo Then nb = nb + 1
+                    If Frame((y + 1) * w + x) > lo Then nb = nb + 1
+                    If nb >= 3 And nc < 400 Then
+                        nc = nc + 1
+                        cxs(nc) = x: cys(nc) = y: cpk(nc) = p
+                    End If
+                End If
+            End If
+        Next
+    Next
+    best = 0: bestScore = 0
+    For i = 1 To nc
+        ' reject a star with another candidate inside its search box
+        ok = -1
+        For j = 1 To nc
+            If j <> i Then
+                If Abs(cxs(j) - cxs(i)) <= GP.searchR + 3 And Abs(cys(j) - cys(i)) <= GP.searchR + 3 Then
+                    If cpk(j) > med + (cpk(i) - med) * 0.1 Then ok = 0: Exit For
+                End If
+            End If
+        Next
+        If ok Then
+            r = StarFind(CDbl(cxs(i)), CDbl(cys(i)), 4, s)
+            If r = STAR_OK Then
+                If s.snr > bestScore Then bestScore = s.snr: best = i: st = s
+            End If
+        End If
+    Next
+    StarAutoFind& = (best > 0)
+End Function
+
+'---------------------------------------------------------------------
+' Camera -> mount coordinates.
+' The calibration West vector (xAngle) and North vector (yAngle) need
+' not be exactly 90 degrees apart, so solve dx,dy = a*W + b*N.
+' raErr  > 0 : star is displaced the way a West pulse moves it.
+' decErr > 0 : star is displaced the way a North pulse moves it.
+'---------------------------------------------------------------------
+Sub CamToMount (dx As Double, dy As Double, raErr As Double, decErr As Double)
+    Dim det As Double, ya As Double
+    If Cal.decValid Then ya = Cal.yAngle Else ya = Cal.xAngle + 1.5707963267949
+    det = Sin(ya - Cal.xAngle)
+    If Abs(det) < 0.2 Then
+        If det < 0 Then det = -0.2 Else det = 0.2
+    End If
+    raErr = (dx * Sin(ya) - dy * Cos(ya)) / det
+    decErr = (dy * Cos(Cal.xAngle) - dx * Sin(Cal.xAngle)) / det
+End Sub
+
+'---------------------------------------------------------------------
+' Calibration - port of PHD2 Scope::UpdateCalibrationState
+' West, East back, clear Dec backlash, North, South back.
+' The search box follows the star every frame.
+'---------------------------------------------------------------------
+Sub CalBegin (x As Double, y As Double, stepMs As Long, useDec As Long)
+    CalRun.state = CS_WEST
+    CalRun.steps = 0
+    CalRun.startX = x: CalRun.startY = y
+    CalRun.stepMs = stepMs
+    CalRun.distance = GP.calDistance
+    CalRun.useDec = useDec
+    Cal.valid = 0
+    Cal.decValid = 0
+    CalMsg = "Calibration: West"
+End Sub
+
+Function CalStep& (x As Double, y As Double)
+    Dim dx As Double, dy As Double, dist As Double, r As Long
+    Dim blDelta As Double, blCum As Double
+    Const MAXSTEPS = 60
+    dx = x - CalRun.startX: dy = y - CalRun.startY
+    dist = Sqr(dx * dx + dy * dy)
+
+    Select Case CalRun.state
+        Case CS_WEST
+            If dist < CalRun.distance Then
+                If CalRun.steps >= MAXSTEPS Then
+                    CalMsg = "RA calibration failed: star did not move enough"
+                    CalStep& = CAL_FAIL: Exit Function
+                End If
+                CalRun.steps = CalRun.steps + 1
+                CalMsg = "West step" + Str$(CalRun.steps) + "  dist" + Str$(Int(dist * 10) / 10)
+                r = CamPulse(DIR_WEST, CalRun.stepMs, DIR_NONE, 0)
+                CalStep& = CAL_CONTINUE: Exit Function
+            End If
+            Cal.xAngle = _Atan2(dy, dx)
+            Cal.xRate = dist / (CalRun.steps * CalRun.stepMs)
+            Cal.raSteps = CalRun.steps
+            CalRun.remaining = CalRun.steps
+            CalRun.state = CS_EAST
+            ' fall into East this frame
+            dist = 0
+    End Select
+
+    Select Case CalRun.state
+        Case CS_EAST
+            If CalRun.remaining > 0 Then
+                CalMsg = "East step" + Str$(CalRun.remaining)
+                CalRun.remaining = CalRun.remaining - 1
+                r = CamPulse(DIR_EAST, CalRun.stepMs, DIR_NONE, 0)
+                CalStep& = CAL_CONTINUE: Exit Function
+            End If
+            If CalRun.useDec = 0 Then
+                Cal.yAngle = NormAngle#(Cal.xAngle + 1.5707963267949)
+                Cal.yRate = Cal.xRate
+                Cal.decValid = 0
+                Cal.valid = -1
+                Cal.stepMs = CalRun.stepMs
+                CalMsg = "Calibration done (RA only)"
+                CalStep& = CAL_DONE: Exit Function
+            End If
+            ' set up Dec backlash clearing
+            CalRun.state = CS_BACKLASH
+            CalRun.steps = 0
+            CalRun.startX = x: CalRun.startY = y
+            CalRun.blMarkX = x: CalRun.blMarkY = y
+            CalRun.blExpected = Cal.xRate * CalRun.stepMs * 0.6
+            CalRun.blMax = 60000 \ CalRun.stepMs
+            If CalRun.blMax < 8 Then CalRun.blMax = 8
+            CalRun.blLastCum = 0
+            CalRun.blAccepted = 0
+            dx = 0: dy = 0: dist = 0
+    End Select
+
+    Select Case CalRun.state
+        Case CS_BACKLASH
+            blDelta = Sqr((x - CalRun.blMarkX) ^ 2 + (y - CalRun.blMarkY) ^ 2)
+            blCum = dist
+            If CalRun.steps = 0 Then
+                CalRun.steps = 1
+                CalMsg = "Clearing Dec backlash step 1"
+                r = CamPulse(DIR_NONE, 0, DIR_NORTH, CalRun.stepMs)
+                CalStep& = CAL_CONTINUE: Exit Function
+            End If
+            ' want 3 north moves in a row of the expected size, no reversals
+            If blDelta >= CalRun.blExpected Then
+                If CalRun.blAccepted = 0 Or blCum > CalRun.blLastCum Then
+                    CalRun.blAccepted = CalRun.blAccepted + 1
+                Else
+                    CalRun.blAccepted = 0
+                End If
+            Else
+                If blCum < CalRun.blLastCum Then CalRun.blAccepted = 0
+            End If
+            If CalRun.blAccepted < 3 Then
+                If CalRun.steps < CalRun.blMax And blCum < CalRun.distance Then
+                    CalRun.steps = CalRun.steps + 1
+                    CalRun.blMarkX = x: CalRun.blMarkY = y
+                    CalRun.blLastCum = blCum
+                    CalMsg = "Clearing Dec backlash step" + Str$(CalRun.steps)
+                    r = CamPulse(DIR_NONE, 0, DIR_NORTH, CalRun.stepMs)
+                    CalStep& = CAL_CONTINUE: Exit Function
+                End If
+                If blCum >= 3 Then
+                    ' out of tries but it did move - carry on like PHD2
+                    CalRun.steps = 0
+                    CalRun.startX = x: CalRun.startY = y
+                    dx = 0: dy = 0: dist = 0
+                Else
+                    CalMsg = "Backlash clearing failed: star did not move North"
+                    CalStep& = CAL_FAIL: Exit Function
+                End If
+            Else
+                ' the last clearing move counts as the first North step
+                CalRun.steps = 1
+                CalRun.startX = CalRun.blMarkX: CalRun.startY = CalRun.blMarkY
+                dx = x - CalRun.startX: dy = y - CalRun.startY
+                dist = Sqr(dx * dx + dy * dy)
+            End If
+            CalRun.state = CS_NORTH
+    End Select
+
+    Select Case CalRun.state
+        Case CS_NORTH
+            If dist < CalRun.distance Then
+                If CalRun.steps >= MAXSTEPS Then
+                    CalMsg = "Dec calibration failed: star did not move enough"
+                    CalStep& = CAL_FAIL: Exit Function
+                End If
+                CalRun.steps = CalRun.steps + 1
+                CalMsg = "North step" + Str$(CalRun.steps) + "  dist" + Str$(Int(dist * 10) / 10)
+                r = CamPulse(DIR_NONE, 0, DIR_NORTH, CalRun.stepMs)
+                CalStep& = CAL_CONTINUE: Exit Function
+            End If
+            Cal.yAngle = _Atan2(dy, dx)
+            Cal.yRate = dist / (CalRun.steps * CalRun.stepMs)
+            Cal.decSteps = CalRun.steps
+            CalRun.remaining = CalRun.steps
+            CalRun.state = CS_SOUTH
+    End Select
+
+    Select Case CalRun.state
+        Case CS_SOUTH
+            If CalRun.remaining > 0 Then
+                CalMsg = "South step" + Str$(CalRun.remaining)
+                CalRun.remaining = CalRun.remaining - 1
+                r = CamPulse(DIR_NONE, 0, DIR_SOUTH, CalRun.stepMs)
+                CalStep& = CAL_CONTINUE: Exit Function
+            End If
+            Cal.decValid = -1
+            Cal.valid = -1
+            Cal.stepMs = CalRun.stepMs
+            CalMsg = "Calibration done"
+            CalStep& = CAL_DONE: Exit Function
+    End Select
+    CalStep& = CAL_FAIL
+End Function
+
+' Orthogonality error of the calibration in degrees (0 = perfect).
+Function CalOrthoErr# ()
+    Dim a As Double
+    If Cal.decValid = 0 Then CalOrthoErr# = 0: Exit Function
+    a = Abs(NormAngle#(Cal.yAngle - Cal.xAngle))
+    CalOrthoErr# = Abs(a - 1.5707963267949) * 180# / 3.14159265358979
+End Function
+
+'---------------------------------------------------------------------
+' Guide algorithms
+'---------------------------------------------------------------------
+Sub GuideReset
+    Dim i As Long
+    RaLastMove = 0
+    For i = 0 To 9: DecHist(i) = 0: Next
+    DecSide = 0
+End Sub
+
+' PHD2 Hysteresis (default RA algorithm)
+Function AlgoHysteresis# (ev As Double)
+    Dim rr As Double
+    rr = (1 - GP.raHyst) * ev + GP.raHyst * RaLastMove
+    rr = rr * GP.raAggr
+    If Abs(ev) < GP.raMinMove Then rr = 0
+    RaLastMove = rr
+    AlgoHysteresis# = rr
+End Function
+
+' PHD2 Resist Switch (default Dec algorithm)
+Function AlgoResistSwitch# (ev As Double)
+    Dim i As Long, decH As Long, oldest As Double, newest As Double, thr As Double
+    For i = 0 To 8: DecHist(i) = DecHist(i + 1): Next
+    DecHist(9) = ev
+    AlgoResistSwitch# = 0
+    If Abs(ev) < GP.decMinMove Then Exit Function
+    ' fast switch on a large excursion the other way
+    thr = 3 * GP.decMinMove
+    If SignOf(ev) <> DecSide And Abs(ev) > thr Then
+        DecSide = 0
+        For i = 0 To 6: DecHist(i) = 0: Next
+        For i = 7 To 9: DecHist(i) = ev: Next
+    End If
+    decH = 0
+    For i = 0 To 9
+        If Abs(DecHist(i)) > GP.decMinMove Then decH = decH + SignOf(DecHist(i))
+    Next
+    If DecSide = 0 Or SignOf(CDbl(DecSide)) = -SignOf(CDbl(decH)) Then
+        If Abs(decH) < 3 Then Exit Function
+        oldest = 0: newest = 0
+        For i = 0 To 2
+            oldest = oldest + DecHist(i)
+            newest = newest + DecHist(9 - i)
+        Next
+        If Abs(newest) <= Abs(oldest) Then Exit Function
+        DecSide = SignOf(CDbl(decH))
+    End If
+    If DecSide <> SignOf(ev) Then Exit Function
+    AlgoResistSwitch# = ev * GP.decAggr
+End Function
+
+' One guide step: star offset (dx,dy) from the lock position in pixels.
+' Works out and sends the pulses; fills GStep.
+Sub GuideStep (dx As Double, dy As Double)
+    Dim raE As Double, deE As Double, mv As Double, xr As Double, yr As Double
+    Dim binK As Double, cn As Double, cc As Double, ms As Long, r As Long
+    GStep.dx = dx: GStep.dy = dy
+    CamToMount dx, dy, raE, deE
+    GStep.raErr = raE: GStep.decErr = deE
+    GStep.raDir = DIR_NONE: GStep.raMs = 0
+    GStep.decDir = DIR_NONE: GStep.decMs = 0
+
+    ' rates for the current binning and declination
+    binK = Cal.calBin / Cam.bin
+    If binK <= 0 Then binK = 1
+    cc = Cos(_Clamp(Cal.calDec, -85, 85) * 3.14159265358979 / 180#)
+    cn = Cos(_Clamp(GP.decNow, -85, 85) * 3.14159265358979 / 180#)
+    xr = Cal.xRate * binK * cn / cc
+    yr = Cal.yRate * binK
+    If xr < 0.00001 Then xr = 0.00001
+    If yr < 0.00001 Then yr = 0.00001
+
+    ' RA
+    mv = AlgoHysteresis#(raE)
+    If mv <> 0 Then
+        ms = Int(Abs(mv) / xr + 0.5)
+        If ms > GP.maxRaMs Then ms = GP.maxRaMs
+        If ms >= 5 Then
+            GStep.raMs = ms
+            If mv > 0 Then GStep.raDir = DIR_EAST Else GStep.raDir = DIR_WEST
+        End If
+    End If
+
+    ' Dec
+    If GP.decMode <> DEC_OFF And Cal.decValid Then
+        mv = AlgoResistSwitch#(deE)
+        If mv <> 0 Then
+            ms = Int(Abs(mv) / yr + 0.5)
+            If ms > GP.maxDecMs Then ms = GP.maxDecMs
+            If ms >= 5 Then
+                If mv > 0 Then GStep.decDir = DIR_SOUTH Else GStep.decDir = DIR_NORTH
+                GStep.decMs = ms
+                If GP.decMode = DEC_NORTH And GStep.decDir <> DIR_NORTH Then GStep.decMs = 0
+                If GP.decMode = DEC_SOUTH And GStep.decDir <> DIR_SOUTH Then GStep.decMs = 0
+                If GStep.decMs = 0 Then GStep.decDir = DIR_NONE
+            End If
+        End If
+    End If
+
+    If GStep.raMs > 0 Or GStep.decMs > 0 Then
+        r = CamPulse(GStep.raDir, GStep.raMs, GStep.decDir, GStep.decMs)
+    End If
+End Sub

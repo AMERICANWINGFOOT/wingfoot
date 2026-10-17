@@ -1,0 +1,435 @@
+// g3d_draw.comp - GPU3D Vulkan compute shader: one thread per screen pixel.
+// The same shape math as g3d_math.h, written in GLSL. If you change one, change both.
+//
+// Rebuild the embedded copy (g3d_draw_spv.h) after editing:
+//   glslangValidator -V --target-env vulkan1.0 --vn g3d_draw_spv -o g3d_draw_spv.h g3d_draw.comp
+#version 450
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+struct Obj {
+    float r[9];
+    float cx, cy, cz;
+    float hx, hy, hz;
+    float x0, y0, x1, y1;
+    uint color;
+    int tex, type, flags;
+};
+
+layout(std430, binding = 0) readonly buffer Objs { Obj objs[]; };
+layout(std430, binding = 1) readonly buffer Texs { uint tex[]; };
+layout(std430, binding = 2) writeonly buffer Outs { uint outp[]; };
+
+layout(push_constant) uniform PC {
+    int W, H;
+    float f, vx, vy;
+    float Lx, Ly, Lz;
+    float amb, lw;
+    int aa, fill;
+    uint bg;
+    float fogNear, fogFar;
+    uint fogColor;
+    int y0, rows, nobj;
+} pc;
+
+const int SH_BOX = 0, SH_SPHERE = 1, SH_CYL = 2, SH_CONE = 3, SH_PYRAMID = 4, SH_DIAMOND = 5;
+const int F_WIRE = 1, F_OUTLINE = 2, F_SHINY = 4, F_FLAT = 8, F_HIDDEN = 16;
+const int TEXN = 128;
+const int MAXTEX = 64;
+const float PI = 3.14159265;
+const int CHUNK = 128;
+const int MAXAA = 16;
+
+shared Obj sh[CHUNK];
+
+vec3 vnorm(vec3 a)
+{
+    float l = length(a);
+    return (l > 1e-20) ? a / l : vec3(0.0, 0.0, -1.0);
+}
+
+float clamp01(float v) { return clamp(v, 0.0, 1.0); }
+
+bool is_poly(int type) { return type == SH_BOX || type == SH_PYRAMID || type == SH_DIAMOND; }
+
+bool poly_planes(int type, int k, out vec3 n, out float d)
+{
+    n = vec3(0.0); d = 0.0;
+    if (type == SH_BOX) {
+        if (k >= 6) return false;
+        float s = ((k & 1) != 0) ? -1.0 : 1.0;
+        int a = k >> 1;
+        n = vec3(a == 0 ? s : 0.0, a == 1 ? s : 0.0, a == 2 ? s : 0.0);
+        d = 1.0;
+        return true;
+    }
+    if (type == SH_PYRAMID) {
+        if (k >= 5) return false;
+        d = (k == 0) ? 1.0 : 0.5;
+        if (k == 0) n = vec3(0.0, 1.0, 0.0);
+        else if (k == 1) n = vec3(1.0, -0.5, 0.0);
+        else if (k == 2) n = vec3(-1.0, -0.5, 0.0);
+        else if (k == 3) n = vec3(0.0, -0.5, 1.0);
+        else n = vec3(0.0, -0.5, -1.0);
+        return true;
+    }
+    if (type == SH_DIAMOND) {
+        if (k >= 8) return false;
+        n = vec3(((k & 1) != 0) ? -1.0 : 1.0, ((k & 2) != 0) ? -1.0 : 1.0, ((k & 4) != 0) ? -1.0 : 1.0);
+        d = 1.0;
+        return true;
+    }
+    return false;
+}
+
+bool clip_planes(int type, vec3 o, vec3 dd, out float t0, out float t1, out vec3 n0, out vec3 n1)
+{
+    vec3 n;
+    float d;
+    t0 = -1e30; t1 = 1e30;
+    n0 = vec3(0.0, 0.0, -1.0); n1 = vec3(0.0, 0.0, 1.0);
+    for (int k = 0; poly_planes(type, k, n, d); k++) {
+        float dn = dot(n, dd), num = d - dot(n, o);
+        if (abs(dn) < 1e-12) {
+            if (num < 0.0) return false;
+            continue;
+        }
+        float t = num / dn;
+        if (dn < 0.0) { if (t > t0) { t0 = t; n0 = n; } }
+        else          { if (t < t1) { t1 = t; n1 = n; } }
+        if (t0 > t1) return false;
+    }
+    return true;
+}
+
+vec3 quad_normal(int type, vec3 u)
+{
+    if (type == SH_SPHERE) return u;
+    if (type == SH_CYL) return vec3(u.x, 0.0, u.z);
+    return vec3(u.x, -(u.y + 1.0) * 0.25, u.z);
+}
+
+bool isect_unit(int type, vec3 o, vec3 d, out float t0, out float t1, out vec3 n0, out vec3 n1)
+{
+    t0 = 0.0; t1 = 0.0; n0 = vec3(0.0); n1 = vec3(0.0);
+    if (is_poly(type)) return clip_planes(type, o, d, t0, t1, n0, n1);
+
+    float s0 = -1e30, s1 = 1e30;
+    vec3 sn0 = vec3(0.0, -1.0, 0.0), sn1 = vec3(0.0, 1.0, 0.0);
+    if (type != SH_SPHERE) {
+        if (abs(d.y) < 1e-12) {
+            if (abs(o.y) > 1.0) return false;
+        } else {
+            float ta = (-1.0 - o.y) / d.y, tb = (1.0 - o.y) / d.y;
+            if (ta < tb) { s0 = ta; s1 = tb; sn0 = vec3(0.0, -1.0, 0.0); sn1 = vec3(0.0, 1.0, 0.0); }
+            else         { s0 = tb; s1 = ta; sn0 = vec3(0.0, 1.0, 0.0); sn1 = vec3(0.0, -1.0, 0.0); }
+        }
+    }
+
+    float a, b, c;
+    if (type == SH_SPHERE) {
+        a = dot(d, d); b = dot(o, d); c = dot(o, o) - 1.0;
+    } else if (type == SH_CYL) {
+        a = d.x * d.x + d.z * d.z; b = o.x * d.x + o.z * d.z; c = o.x * o.x + o.z * o.z - 1.0;
+    } else {
+        float w = o.y + 1.0;
+        a = d.x * d.x + d.z * d.z - 0.25 * d.y * d.y;
+        b = o.x * d.x + o.z * d.z - 0.25 * w * d.y;
+        c = o.x * o.x + o.z * o.z - 0.25 * w * w;
+    }
+
+    float pa[2], pb[2];
+    pa[1] = 0.0; pb[1] = 0.0;
+    int np = 0;
+    if (abs(a) < 1e-12) {
+        if (abs(b) < 1e-12) {
+            if (c > 0.0) return false;
+            pa[0] = -1e30; pb[0] = 1e30; np = 1;
+        } else {
+            float r = -c / (2.0 * b);
+            if (b > 0.0) { pa[0] = -1e30; pb[0] = r; }
+            else         { pa[0] = r; pb[0] = 1e30; }
+            np = 1;
+        }
+    } else {
+        float disc = b * b - a * c;
+        if (a > 0.0) {
+            if (disc < 0.0) return false;
+            float sq = sqrt(disc);
+            pa[0] = (-b - sq) / a; pb[0] = (-b + sq) / a; np = 1;
+        } else {
+            if (disc < 0.0) { pa[0] = -1e30; pb[0] = 1e30; np = 1; }
+            else {
+                float sq = sqrt(disc);
+                float r1 = (-b - sq) / a, r2 = (-b + sq) / a;
+                if (r1 > r2) { float tmp = r1; r1 = r2; r2 = tmp; }
+                pa[0] = -1e30; pb[0] = r1;
+                pa[1] = r2; pb[1] = 1e30;
+                np = 2;
+            }
+        }
+    }
+
+    for (int k = 0; k < np; k++) {
+        float lo = pa[k], hi = pb[k];
+        vec3 nlo, nhi;
+        if (s0 > lo) { lo = s0; nlo = sn0; } else nlo = quad_normal(type, o + d * lo);
+        if (s1 < hi) { hi = s1; nhi = sn1; } else nhi = quad_normal(type, o + d * hi);
+        if (lo <= hi && hi > -1e29 && lo < 1e29) {
+            if (type == SH_CONE && o.y + d.y * 0.5 * (lo + hi) < -1.0) continue;
+            t0 = lo; t1 = hi; n0 = nlo; n1 = nhi;
+            return true;
+        }
+    }
+    return false;
+}
+
+void make_ray(float sx, float sy, out vec3 O, out vec3 D)
+{
+    if (pc.f > 0.0) { O = vec3(pc.vx, pc.vy, -pc.f); D = vec3(sx - pc.vx, sy - pc.vy, pc.f); }
+    else            { O = vec3(sx, sy, 0.0); D = vec3(0.0, 0.0, 1.0); }
+}
+
+float near_t() { return (pc.f > 0.0) ? 0.02 : -1e7; }
+
+float pix_scale(float t) { return (pc.f > 0.0) ? 1.0 / max(t, 1e-4) : 1.0; }
+
+void to_unit(Obj o, vec3 O, vec3 D, out vec3 ou, out vec3 du)
+{
+    vec3 q = O - vec3(o.cx, o.cy, o.cz);
+    ou = vec3((o.r[0] * q.x + o.r[3] * q.y + o.r[6] * q.z) / o.hx,
+              (o.r[1] * q.x + o.r[4] * q.y + o.r[7] * q.z) / o.hy,
+              (o.r[2] * q.x + o.r[5] * q.y + o.r[8] * q.z) / o.hz);
+    du = vec3((o.r[0] * D.x + o.r[3] * D.y + o.r[6] * D.z) / o.hx,
+              (o.r[1] * D.x + o.r[4] * D.y + o.r[7] * D.z) / o.hy,
+              (o.r[2] * D.x + o.r[5] * D.y + o.r[8] * D.z) / o.hz);
+}
+
+vec3 to_world_normal(Obj o, vec3 n)
+{
+    vec3 m = vec3(n.x / o.hx, n.y / o.hy, n.z / o.hz);
+    return vnorm(vec3(o.r[0] * m.x + o.r[1] * m.y + o.r[2] * m.z,
+                      o.r[3] * m.x + o.r[4] * m.y + o.r[5] * m.z,
+                      o.r[6] * m.x + o.r[7] * m.y + o.r[8] * m.z));
+}
+
+float angle_gap(float a, float step, float rr)
+{
+    float k = floor(a / step + 0.5);
+    return abs(a - k * step) * rr;
+}
+
+bool on_edge(Obj o, vec3 u, float scale, float lw)
+{
+    float lim = lw / scale;
+    int type = o.type;
+    if (is_poly(type)) {
+        vec3 n;
+        float d;
+        int close = 0;
+        for (int k = 0; poly_planes(type, k, n, d); k++) {
+            vec3 nl = vec3(n.x / o.hx, n.y / o.hy, n.z / o.hz);
+            float dist = (d - dot(n, u)) / length(nl);
+            if (dist < lim) close++;
+        }
+        return close >= 2;
+    }
+    float hr = 0.5 * (o.hx + o.hz);
+    if (type == SH_SPHERE) {
+        float rr = (o.hx + o.hy + o.hz) * (1.0 / 3.0);
+        float lat = asin(clamp(u.y, -1.0, 1.0));
+        float step = PI / 6.0;
+        float k = floor(lat / step + 0.5);
+        if (abs(k) < 2.5 && abs(lat - k * step) * rr < lim) return true;
+        float cl = cos(lat);
+        if (cl > 0.12 && angle_gap(atan(u.z, u.x), step, rr * cl) < lim) return true;
+        return false;
+    }
+    float rad = sqrt(u.x * u.x + u.z * u.z);
+    float rim = (type == SH_CYL) ? 1.0 : 0.5 * (u.y + 1.0);
+    float dSide = (rim - rad) * hr;
+    float dCap = (type == SH_CYL) ? (1.0 - abs(u.y)) * o.hy : (1.0 - u.y) * o.hy;
+    if (dCap < lim && dSide < lim) return true;
+    if (dSide < lim && rad > 1e-3) {
+        if (angle_gap(atan(u.z, u.x), PI / 4.0, rad * hr) < lim) return true;
+    }
+    return false;
+}
+
+bool obj_hit(Obj o, vec3 O, vec3 D, out float t, out int side)
+{
+    vec3 ou, du, n0, n1;
+    float t0, t1, tmin = near_t();
+    t = 0.0; side = 0;
+    to_unit(o, O, D, ou, du);
+    if (!isect_unit(o.type, ou, du, t0, t1, n0, n1)) return false;
+    if ((o.flags & F_WIRE) != 0) {
+        if (t0 > tmin && on_edge(o, ou + du * t0, pix_scale(t0), pc.lw)) { t = t0; side = 0; return true; }
+        if ((o.flags & F_HIDDEN) == 0 && t1 > tmin && on_edge(o, ou + du * t1, pix_scale(t1), pc.lw)) { t = t1; side = 1; return true; }
+        return false;
+    }
+    if (t0 > tmin) { t = t0; side = 0; return true; }
+    if (t1 > tmin) { t = t1; side = 1; return true; }
+    return false;
+}
+
+vec3 unpack_c(uint c)
+{
+    return vec3(float((c >> 16) & 255u), float((c >> 8) & 255u), float(c & 255u)) * (1.0 / 255.0);
+}
+
+vec3 tex_sample(int id, float U, float V)
+{
+    int baseI = id * TEXN * TEXN;
+    float fx = U * float(TEXN) - 0.5, fy = V * float(TEXN) - 0.5;
+    float x0f = floor(fx), y0f = floor(fy);
+    float ax = fx - x0f, ay = fy - y0f;
+    int x0 = int(x0f) & (TEXN - 1), y0 = int(y0f) & (TEXN - 1);
+    int x1 = (x0 + 1) & (TEXN - 1), y1 = (y0 + 1) & (TEXN - 1);
+    vec3 a = unpack_c(tex[baseI + y0 * TEXN + x0]), b = unpack_c(tex[baseI + y0 * TEXN + x1]);
+    vec3 c = unpack_c(tex[baseI + y1 * TEXN + x0]), d = unpack_c(tex[baseI + y1 * TEXN + x1]);
+    return mix(mix(a, b, ax), mix(c, d, ax), ay);
+}
+
+void shape_uv(int type, vec3 u, vec3 n, out float U, out float V)
+{
+    float anx = abs(n.x), any = abs(n.y), anz = abs(n.z);
+    if (is_poly(type)) {
+        if (anx >= any && anx >= anz) { U = u.z; V = u.y; }
+        else if (any >= anz)          { U = u.x; V = u.z; }
+        else                          { U = u.x; V = u.y; }
+        U = (U + 1.0) * 0.5; V = (V + 1.0) * 0.5;
+        return;
+    }
+    if (type == SH_SPHERE) {
+        U = atan(u.z, u.x) * (0.5 / PI) + 0.5;
+        V = acos(clamp(-u.y, -1.0, 1.0)) * (1.0 / PI);
+        return;
+    }
+    if (any > 0.9 * length(n) && abs(abs(u.y) - 1.0) < 1e-3) {
+        U = (u.x + 1.0) * 0.5; V = (u.z + 1.0) * 0.5;
+    } else {
+        U = atan(u.z, u.x) * (0.5 / PI) + 0.5; V = (u.y + 1.0) * 0.5;
+    }
+}
+
+vec3 shade_hit(Obj o, vec3 O, vec3 D, float t, int side)
+{
+    vec3 ou, du, n0, n1;
+    float t0, t1;
+    to_unit(o, O, D, ou, du);
+    isect_unit(o.type, ou, du, t0, t1, n0, n1);
+    vec3 u = ou + du * t;
+    vec3 nu = (side != 0) ? n1 : n0;
+    vec3 base = unpack_c(o.color), col;
+
+    if ((o.flags & F_WIRE) != 0) {
+        col = (side != 0) ? base * 0.45 : base;
+    } else {
+        if (o.tex > 0 && o.tex < MAXTEX) {
+            float U, V;
+            shape_uv(o.type, u, nu, U, V);
+            base *= tex_sample(o.tex, U, V);
+        }
+        vec3 n = to_world_normal(o, nu);
+        if (dot(n, D) > 0.0) n = -n;
+        if ((o.flags & F_FLAT) != 0) {
+            col = base;
+        } else {
+            vec3 L = vec3(pc.Lx, pc.Ly, pc.Lz);
+            float k = pc.amb + (1.0 - pc.amb) * max(dot(n, L), 0.0);
+            col = base * k;
+            if ((o.flags & F_SHINY) != 0) {
+                vec3 hv = vnorm(L + vnorm(-D));
+                float s = is_poly(o.type) ? pow(max(dot(n, hv), 0.0), 90.0) * 0.35
+                                          : pow(max(dot(n, hv), 0.0), 40.0) * 0.7;
+                col += vec3(s);
+            }
+        }
+        if ((o.flags & F_OUTLINE) != 0 && on_edge(o, u, pix_scale(t), pc.lw)) col *= 0.25;
+    }
+
+    if (pc.fogFar > pc.fogNear) {
+        float z = O.z + t * D.z;
+        float ff = clamp01((z - pc.fogNear) / (pc.fogFar - pc.fogNear));
+        col = mix(col, unpack_c(pc.fogColor), ff);
+    }
+    return clamp(col, 0.0, 1.0);
+}
+
+void aa_offset(int aa, int s, out float ox, out float oy)
+{
+    if (aa == 4) {
+        const float tx[4] = float[4](0.375, 0.875, 0.125, 0.625);
+        const float ty[4] = float[4](0.125, 0.375, 0.625, 0.875);
+        ox = tx[s]; oy = ty[s];
+        return;
+    }
+    int g = (aa >= 16) ? 4 : (aa >= 9) ? 3 : 1;
+    ox = (float(s % g) + 0.5) / float(g);
+    oy = (float(s / g) + 0.5) / float(g);
+}
+
+uint pack_c(vec3 c, float alpha)
+{
+    return (uint(clamp01(alpha) * 255.0 + 0.5) << 24) | (uint(c.x * 255.0 + 0.5) << 16)
+         | (uint(c.y * 255.0 + 0.5) << 8) | uint(c.z * 255.0 + 0.5);
+}
+
+void main()
+{
+    int lid = int(gl_LocalInvocationIndex);
+    int nthr = int(gl_WorkGroupSize.x * gl_WorkGroupSize.y);
+    int x = int(gl_GlobalInvocationID.x);
+    int yy = int(gl_GlobalInvocationID.y);
+    bool live = (x < pc.W && yy < pc.rows);
+    float px = float(x), py = float(pc.y0 + yy);
+    int ns = pc.aa;
+
+    float bt[MAXAA];
+    int bi[MAXAA], bs[MAXAA];
+    for (int s = 0; s < MAXAA; s++) { bt[s] = 1e30; bi[s] = -1; bs[s] = 0; }
+
+    for (int baseI = 0; baseI < pc.nobj; baseI += CHUNK) {
+        int cnt = min(CHUNK, pc.nobj - baseI);
+        barrier();
+        for (int i = lid; i < cnt; i += nthr) sh[i] = objs[baseI + i];
+        barrier();
+        if (!live) continue;
+        for (int k = 0; k < cnt; k++) {
+            if (px + 1.0 < sh[k].x0 || px > sh[k].x1 || py + 1.0 < sh[k].y0 || py > sh[k].y1) continue;
+            Obj o = sh[k];
+            for (int s = 0; s < ns; s++) {
+                float ox, oy, t;
+                int side;
+                vec3 O, D;
+                aa_offset(ns, s, ox, oy);
+                make_ray(px + ox, py + oy, O, D);
+                if (obj_hit(o, O, D, t, side) && t < bt[s]) { bt[s] = t; bi[s] = baseI + k; bs[s] = side; }
+            }
+        }
+    }
+    if (!live) return;
+
+    vec3 acc = vec3(0.0);
+    int hits = 0;
+    for (int s = 0; s < ns; s++) {
+        if (bi[s] < 0) continue;
+        float ox, oy;
+        vec3 O, D;
+        aa_offset(ns, s, ox, oy);
+        make_ray(px + ox, py + oy, O, D);
+        acc += shade_hit(objs[bi[s]], O, D, bt[s], bs[s]);
+        hits++;
+    }
+    uint res;
+    if (pc.fill != 0) {
+        float cov = float(hits) / float(ns);
+        res = pack_c(acc / float(ns) + unpack_c(pc.bg) * (1.0 - cov), 1.0);
+    } else if (hits > 0) {
+        res = pack_c(acc / float(hits), float(hits) / float(ns));
+    } else {
+        res = 0u;
+    }
+    outp[yy * pc.W + x] = res;
+}

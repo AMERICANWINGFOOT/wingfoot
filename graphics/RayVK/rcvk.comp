@@ -1,0 +1,163 @@
+// rcvk.comp -- RayVK ray caster compute shader (Vulkan / GLSL 450)
+// One invocation per screen pixel. Each pixel re-runs its column's DDA,
+// which is cheap on a GPU and keeps the shader simple:
+//   walls    : grid DDA, textured, side shading
+//   floor/ceiling : per-pixel floor casting, textured per map cell
+//   sprites  : billboards, depth-tested against the column's wall distance,
+//              alpha 0 texels are transparent
+//   fog      : linear blend toward fogColor by distance
+// Pixel format everywhere is 0xAARRGGBB, which is QB64's 32-bit image layout.
+//
+// Build: glslangValidator -V rcvk.comp -o rcvk.spv   (build.sh does this)
+
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const int TEX = 64;          // texture size (TEX x TEX)
+const int TEXPIX = TEX * TEX;
+
+layout(std430, binding = 0) writeonly buffer OutBuf { uint px[]; };
+// one uint per cell: wall | floor << 8 | ceiling << 16   (texture ids, 0 = none)
+layout(std430, binding = 1) readonly buffer MapBuf { uint cells[]; };
+// texture id N (1..) occupies tex[(N-1)*TEXPIX ...]
+layout(std430, binding = 2) readonly buffer TexBuf { uint tex[]; };
+// sprite: x, y, texture id, scale (world height, 1.0 = one wall tall)
+layout(std430, binding = 3) readonly buffer SprBuf { vec4 spr[]; };
+
+layout(push_constant) uniform PC {
+    vec2  pos;
+    vec2  dir;
+    vec2  plane;
+    int   w;
+    int   h;
+    int   mw;
+    int   mh;
+    float fogDist;     // <= 0 turns fog off
+    uint  fogColor;
+    int   shadeSides;
+    int   nSpr;
+    int   nTex;
+} pc;
+
+vec3 unpackRGB(uint c) {
+    return vec3(float((c >> 16) & 255u), float((c >> 8) & 255u), float(c & 255u));
+}
+
+uint packRGB(vec3 c) {
+    uvec3 u = uvec3(clamp(c, 0.0, 255.0) + 0.5);
+    return 0xFF000000u | (u.r << 16) | (u.g << 8) | u.b;
+}
+
+uint texel(uint id, int tx, int ty) {
+    if (id == 0u || int(id) > pc.nTex) return 0xFF202020u;
+    tx = clamp(tx, 0, TEX - 1);
+    ty = clamp(ty, 0, TEX - 1);
+    return tex[(int(id) - 1) * TEXPIX + ty * TEX + tx];
+}
+
+uint cellAt(int cx, int cy) {
+    if (cx < 0 || cy < 0 || cx >= pc.mw || cy >= pc.mh) return 1u;  // outside = solid
+    return cells[cy * pc.mw + cx];
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x);
+    int y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.w || y >= pc.h) return;
+
+    float W = float(pc.w), H = float(pc.h);
+    float camX = 2.0 * (float(x) + 0.5) / W - 1.0;
+    vec2 rd = pc.dir + pc.plane * camX;
+
+    // ---------- wall DDA for this column ----------
+    ivec2 mp = ivec2(floor(pc.pos));
+    vec2 dd = vec2(rd.x == 0.0 ? 1e30 : abs(1.0 / rd.x),
+                   rd.y == 0.0 ? 1e30 : abs(1.0 / rd.y));
+    ivec2 stp;
+    vec2 sd;
+    if (rd.x < 0.0) { stp.x = -1; sd.x = (pc.pos.x - float(mp.x)) * dd.x; }
+    else            { stp.x =  1; sd.x = (float(mp.x) + 1.0 - pc.pos.x) * dd.x; }
+    if (rd.y < 0.0) { stp.y = -1; sd.y = (pc.pos.y - float(mp.y)) * dd.y; }
+    else            { stp.y =  1; sd.y = (float(mp.y) + 1.0 - pc.pos.y) * dd.y; }
+
+    int side = 0;
+    uint wallId = 0u;
+    for (int i = 0; i < 512; i++) {
+        if (sd.x < sd.y) { sd.x += dd.x; mp.x += stp.x; side = 0; }
+        else             { sd.y += dd.y; mp.y += stp.y; side = 1; }
+        wallId = cellAt(mp.x, mp.y) & 255u;
+        if (wallId != 0u) break;
+    }
+    float perp = (side == 0) ? (sd.x - dd.x) : (sd.y - dd.y);
+    perp = max(perp, 1e-4);
+
+    float lineH = H / perp;
+    float top = H * 0.5 - lineH * 0.5;
+    float fy = float(y) + 0.5;
+
+    vec3 col;
+    float dist;
+
+    if (fy >= top && fy < top + lineH) {
+        // ---------- wall ----------
+        float wallX = (side == 0) ? pc.pos.y + perp * rd.y : pc.pos.x + perp * rd.x;
+        wallX -= floor(wallX);
+        int tx = int(wallX * float(TEX));
+        if (side == 0 && rd.x > 0.0) tx = TEX - 1 - tx;
+        if (side == 1 && rd.y < 0.0) tx = TEX - 1 - tx;
+        int ty = int((fy - top) / lineH * float(TEX));
+        col = unpackRGB(texel(wallId, tx, ty));
+        if (pc.shadeSides != 0 && side == 1) col *= 0.72;
+        dist = perp;
+    } else {
+        // ---------- floor / ceiling ----------
+        bool isFloor = fy >= H * 0.5;
+        float p = isFloor ? (fy - H * 0.5) : (H * 0.5 - fy);
+        float rowDist = (0.5 * H) / max(p, 1e-3);
+        vec2 wp = pc.pos + rowDist * rd;
+        ivec2 c = ivec2(floor(wp));
+        uint cell = cellAt(c.x, c.y);
+        uint id = isFloor ? ((cell >> 8) & 255u) : ((cell >> 16) & 255u);
+        vec2 f = wp - floor(wp);
+        col = unpackRGB(texel(id, int(f.x * float(TEX)), int(f.y * float(TEX))));
+        if (!isFloor) col *= 0.85;
+        dist = rowDist;
+    }
+
+    // ---------- sprites (nearest opaque texel wins, must be nearer than the wall) ----------
+    if (pc.nSpr > 0) {
+        float invDet = 1.0 / (pc.plane.x * pc.dir.y - pc.dir.x * pc.plane.y);
+        float best = perp;
+        uint sc = 0u;
+        bool got = false;
+        for (int i = 0; i < pc.nSpr; i++) {
+            vec4 s = spr[i];
+            vec2 rel = s.xy - pc.pos;
+            float tX = invDet * (pc.dir.y * rel.x - pc.dir.x * rel.y);
+            float tY = invDet * (-pc.plane.y * rel.x + pc.plane.x * rel.y);
+            if (tY <= 0.05 || tY >= best) continue;
+            float sx = W * 0.5 * (1.0 + tX / tY);
+            float unit = H / tY;                 // one wall height at this depth
+            float sh = unit * s.w;
+            float bottom = H * 0.5 + unit * 0.5; // sprite stands on the floor
+            float stop = bottom - sh;
+            float left = sx - sh * 0.5;
+            float fx = float(x) + 0.5;
+            if (fx < left || fx >= left + sh || fy < stop || fy >= bottom) continue;
+            uint t = texel(uint(s.z), int((fx - left) / sh * float(TEX)), int((fy - stop) / sh * float(TEX)));
+            if ((t >> 24) == 0u) continue;       // transparent
+            best = tY;
+            sc = t;
+            got = true;
+        }
+        if (got) { col = unpackRGB(sc); dist = best; }
+    }
+
+    // ---------- fog ----------
+    if (pc.fogDist > 0.0) {
+        float k = clamp(dist / pc.fogDist, 0.0, 1.0);
+        col = mix(col, unpackRGB(pc.fogColor), k * k * (3.0 - 2.0 * k));
+    }
+
+    px[y * pc.w + x] = packRGB(col);
+}

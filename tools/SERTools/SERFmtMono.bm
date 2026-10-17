@@ -1,0 +1,83 @@
+' ============================================================================
+' SERFmtMono.bm  -  Brightness handling for 1-sample formats
+'                   Covers MONO8, MONO16, RAW8, RAW16 (Bayer is centroided on
+'                   the raw mosaic -- you don't need colour to find the blob).
+'
+' Include at the BOTTOM of SERCenter.bas:
+'     '$INCLUDE:'SERFmtMono.bm'
+'
+' This is the ONLY format-specific code in the centering pipeline. Everything
+' else (shift, crop, write) is byte-agnostic and lives in the core. Add a
+' matching SERFmtRGB.bm to teach the pipeline RGB24/RGB48.
+' ============================================================================
+
+' ---------------------------------------------------------------------------
+' Quick mean of the frame, subsampled (every 4th pixel) for speed. Used to
+' auto-pick a threshold: on a planetary frame the background sits near this
+' mean, so thr = mean * THRESH_MULT rejects it and keeps the bright disc.
+' ---------------------------------------------------------------------------
+Function MeanMono# (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long)
+    Dim x As Long, y As Long, idx As Long, v As Long
+    Dim lo As _UNSIGNED _BYTE, hi As _UNSIGNED _BYTE
+    Dim sumv As Double, cnt As Double
+    Const STEP4 = 4
+    sumv = 0: cnt = 0
+    For y = 0 To h - 1 Step STEP4
+        For x = 0 To w - 1 Step STEP4
+            idx = y * w + x
+            If sampleBytes = 1 Then
+                v = _MemGet(m, m.OFFSET + idx, _UNSIGNED _BYTE)
+            Else
+                lo = _MemGet(m, m.OFFSET + idx * 2 + 0, _UNSIGNED _BYTE)
+                hi = _MemGet(m, m.OFFSET + idx * 2 + 1, _UNSIGNED _BYTE)
+                If le <> 0 Then v = lo + hi * 256 Else v = hi + lo * 256
+            End If
+            sumv = sumv + v
+            cnt = cnt + 1
+        Next x
+    Next y
+    If cnt < 1 Then cnt = 1
+    MeanMono# = sumv / cnt
+End Function
+
+' ---------------------------------------------------------------------------
+' Brightness-weighted centroid over the whole frame, after subtracting the
+' threshold (pixels at/below thr contribute nothing). 16-bit uses the FULL
+' sample value, not the display byte -- precision matters for the centre.
+' Returns cx, cy in pixel coords and 'total' weight (0 => nothing found).
+' ---------------------------------------------------------------------------
+Sub CentroidMono (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, thr As Long, cx As Double, cy As Double, total As Double)
+    Dim x As Long, y As Long, v As Long, wt As Long
+    Dim lo As _UNSIGNED _BYTE, hi As _UNSIGNED _BYTE
+    Dim sumX As Double, sumY As Double, sumW As Double
+    Dim ooff As _Offset
+    sumX = 0: sumY = 0: sumW = 0
+    ooff = m.OFFSET
+    For y = 0 To h - 1
+        For x = 0 To w - 1
+            If sampleBytes = 1 Then
+                v = _MemGet(m, ooff, _UNSIGNED _BYTE)
+                ooff = ooff + 1
+            Else
+                lo = _MemGet(m, ooff + 0, _UNSIGNED _BYTE)
+                hi = _MemGet(m, ooff + 1, _UNSIGNED _BYTE)
+                If le <> 0 Then v = lo + hi * 256 Else v = hi + lo * 256
+                ooff = ooff + 2
+            End If
+            wt = v - thr
+            If wt > 0 Then
+                sumW = sumW + wt
+                sumX = sumX + wt * x
+                sumY = sumY + wt * y
+            End If
+        Next x
+    Next y
+    total = sumW
+    If sumW > 0 Then
+        cx = sumX / sumW
+        cy = sumY / sumW
+    Else
+        cx = (w - 1) / 2.0
+        cy = (h - 1) / 2.0
+    End If
+End Sub

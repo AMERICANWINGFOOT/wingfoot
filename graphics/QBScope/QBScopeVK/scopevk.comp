@@ -1,0 +1,212 @@
+// scopevk.comp -- QBScopeVK compute shader
+//
+// One shader, five jobs, picked by the push constant "mode":
+//   0 SEED     place n particles in a small cloud around the start point
+//   1 STEP     advance every particle `steps` times (Euler or RK4) and
+//              splat each little segment of its path into the phosphor
+//   2 TONEMAP  phosphor energy -> colour (with bloom) -> output pixels
+//   3 DECAY    phosphor energy *= decay  (the CRT persistence)
+//   4 CLEAR    phosphor energy = 0
+//
+// The phosphor is two uint buffers (atomicAdd needs integers):
+//   accI = beam energy deposited on each pixel
+//   accH = the part of it laid down by a fast-moving beam (speed colour)
+//
+// Energy per step is spread along the segment the step drew, so a fast
+// beam is dimmer per pixel than a slow one -- just like a real CRT.
+//
+// Build: glslangValidator -V scopevk.comp -o scopevk.spv   (build.sh does it)
+
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Parts { vec4 part[]; };
+layout(std430, binding = 1) buffer AccI  { uint accI[]; };
+layout(std430, binding = 2) buffer AccH  { uint accH[]; };
+layout(std430, binding = 3) buffer OutP  { uint pix[]; };
+layout(std430, binding = 4) buffer Stats { uint runaways; uint s1; uint s2; uint s3; };
+
+// 128 bytes -- must match the PushC struct in scopevk.c exactly
+layout(push_constant) uniform PC {
+    int   mode;   int   att;    int   n;      int   steps;
+    float a;      float b;      float c;      float dt;
+    float x0;     float y0;     float z0;     float spread;
+    float vcx;    float vcy;    float vhx;    float vhy;
+    int   chH;    int   chV;    int   w;      int   h;
+    int   border; int   rk4;    uint  frame;  uint  seed;
+    float decay;  float gain;   float bloom;  int   colorMode;
+    uint  splat;  float norm;   int   pad0;   int   pad1;
+} P;
+
+// ---------------------------------------------------------------- random
+uint pcg(uint v) {
+    uint s = v * 747796405u + 2891336453u;
+    uint t = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (t >> 22u) ^ t;
+}
+float rnd(inout uint s) {
+    s = pcg(s);
+    return float(s) * (1.0 / 4294967296.0);
+}
+
+// ---------------------------------------------------------------- systems
+// Same equations and knob order as QBScope.bas (a, b, c = parm 1..3).
+vec3 deriv(vec3 s) {
+    float x = s.x, y = s.y, z = s.z;
+    switch (P.att) {
+    case 1: // Arneodo
+        return vec3(y, z, P.a * x - P.c * x * x * x - P.b * y - z);
+    case 2: // Lorenz: a sigma, b rho, c beta
+        return vec3(P.a * (y - x), x * (P.b - z) - y, x * y - P.c * z);
+    case 3: // Rossler
+        return vec3(-y - z, x + P.a * y, P.b + z * (x - P.c));
+    case 4: { // Chua: a alpha, b beta, c m0 (m1 = -0.714)
+        float fx = -0.714 * x + 0.5 * (P.c + 0.714) * (abs(x + 1.0) - abs(x - 1.0));
+        return vec3(P.a * (y - x - fx), x - y + z, -P.b * y);
+    }
+    case 5: // Thomas
+        return vec3(sin(y) - P.a * x, sin(z) - P.a * y, sin(x) - P.a * z);
+    default: // 6 Halvorsen
+        return vec3(-P.a * x - 4.0 * y - 4.0 * z - y * y,
+                    -P.a * y - 4.0 * z - 4.0 * x - z * z,
+                    -P.a * z - 4.0 * x - 4.0 * y - x * x);
+    }
+}
+
+vec3 stepOnce(vec3 s, float hstep) {
+    vec3 k1 = deriv(s);
+    if (P.rk4 == 0) return s + hstep * k1;
+    vec3 k2 = deriv(s + 0.5 * hstep * k1);
+    vec3 k3 = deriv(s + 0.5 * hstep * k2);
+    vec3 k4 = deriv(s + hstep * k3);
+    return s + hstep / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
+}
+
+vec3 spawnAt(uint hs) {
+    float r1 = rnd(hs), r2 = rnd(hs), r3 = rnd(hs);
+    return vec3(P.x0, P.y0, P.z0) + (vec3(r1, r2, r3) * 2.0 - 1.0) * P.spread;
+}
+
+bool runaway(vec3 s) {
+    // NaN fails every comparison, so "not under the limit" catches it too
+    return !(abs(s.x) < 1.0e6 && abs(s.y) < 1.0e6 && abs(s.z) < 1.0e6);
+}
+
+// ---------------------------------------------------------------- beam
+float pick(vec3 s, int ch) { return ch == 1 ? s.x : (ch == 2 ? s.y : s.z); }
+
+vec2 toScr(vec3 s) {
+    float hw = float(P.w) * 0.5, hh = float(P.h) * 0.5;
+    return vec2(hw + (pick(s, P.chH) - P.vcx) / P.vhx * (hw - float(P.border)),
+                hh - (pick(s, P.chV) - P.vcy) / P.vhy * (hh - float(P.border)));
+}
+
+// Lay one segment of beam path into the phosphor (start pixel excluded:
+// it was the previous segment's end pixel).
+void plotSeg(vec2 p0, vec2 p1) {
+    vec2 d = p1 - p0;
+    float len = max(abs(d.x), abs(d.y));
+    if (!(len < 64.0)) return;          // a jump (or NaN): don't draw it
+    int ns = max(1, int(ceil(len)));
+    uint wgt = max(1u, P.splat / uint(ns));
+    uint hot = uint(float(wgt) * clamp(len / 6.0, 0.0, 1.0));
+    for (int i = 1; i <= ns; i++) {
+        vec2 q = p0 + d * (float(i) / float(ns));
+        int ix = int(floor(q.x)), iy = int(floor(q.y));
+        if (ix >= 0 && iy >= 0 && ix < P.w && iy < P.h) {
+            uint idx = uint(iy * P.w + ix);
+            atomicAdd(accI[idx], wgt);
+            if (hot > 0u) atomicAdd(accH[idx], hot);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- main
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+
+    if (P.mode == 0) {                                  // SEED
+        if (i >= uint(P.n)) return;
+        part[i] = vec4(spawnAt(pcg(i * 9781u + P.seed)), 0.0);
+        return;
+    }
+
+    if (P.mode == 1) {                                  // STEP + SPLAT
+        if (i >= uint(P.n)) return;
+        vec3 s = part[i].xyz;
+        vec2 a0 = toScr(s);
+        for (int k = 0; k < P.steps; k++) {
+            s = stepOnce(s, P.dt);
+            if (runaway(s)) {
+                atomicAdd(runaways, 1u);
+                s = spawnAt(pcg(i * 9781u + P.frame * 7919u + uint(k) + P.seed));
+                a0 = toScr(s);
+                continue;
+            }
+            vec2 a1 = toScr(s);
+            plotSeg(a0, a1);
+            a0 = a1;
+        }
+        part[i] = vec4(s, 0.0);
+        return;
+    }
+
+    uint npix = uint(P.w * P.h);
+    if (i >= npix) return;
+
+    if (P.mode == 2) {                                  // TONEMAP
+        int x = int(i % uint(P.w)), y = int(i / uint(P.w));
+        float I = float(accI[i]);
+        float H = float(accH[i]);
+
+        // bloom: sparse 7x7 taps, 2 px apart, gaussian weighted
+        float halo = 0.0;
+        if (P.bloom > 0.0) {
+            float bsum = 0.0, wsum = 0.0;
+            for (int dy = -3; dy <= 3; dy++) {
+                for (int dx = -3; dx <= 3; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    int xx = x + dx * 2, yy = y + dy * 2;
+                    if (xx < 0 || yy < 0 || xx >= P.w || yy >= P.h) continue;
+                    float g = exp(-float(dx * dx + dy * dy) * 0.35);
+                    bsum += g * float(accI[yy * P.w + xx]);
+                    wsum += g;
+                }
+            }
+            halo = 1.0 - exp(-bsum / max(wsum, 1.0) * P.norm * P.gain * P.bloom);
+        }
+
+        float core = 1.0 - exp(-I * P.norm * P.gain);
+
+        vec3 tint;
+        if (P.colorMode == 1) {
+            float r = clamp(H / max(I, 1.0), 0.0, 1.0);
+            tint = mix(vec3(0.25, 0.55, 1.0), vec3(1.0, 0.55, 0.12), r);
+        } else {
+            tint = vec3(0.30, 1.0, 0.35);               // P31 green
+        }
+        vec3 col = tint * core + vec3(0.85, 1.0, 0.85) * pow(core, 5.0) * 0.6
+                 + tint * halo * 0.8;
+        col = clamp(col, 0.0, 1.0);
+
+        uint r8 = uint(col.r * 255.0 + 0.5);
+        uint g8 = uint(col.g * 255.0 + 0.5);
+        uint b8 = uint(col.b * 255.0 + 0.5);
+        // QB64 32-bit pixel = &HAARRGGBB
+        pix[i] = 0xFF000000u | (r8 << 16) | (g8 << 8) | b8;
+        return;
+    }
+
+    if (P.mode == 3) {                                  // DECAY
+        // capped at 2^31 so one more frame of deposits can never wrap the
+        // uint (a beam parked on a fixed point pours everything into 1 px)
+        accI[i] = uint(min(float(accI[i]) * P.decay, 2147483648.0));
+        accH[i] = uint(min(float(accH[i]) * P.decay, 2147483648.0));
+        return;
+    }
+
+    if (P.mode == 4) {                                  // CLEAR
+        accI[i] = 0u;
+        accH[i] = 0u;
+    }
+}

@@ -1,0 +1,145 @@
+' ============================================================================
+' SERFmtRGB.bm  -  Brightness + stacking for 3-sample formats
+'                  Covers RGB24, RGB48, BGR24, BGR48.
+'
+' Include at the BOTTOM of any program that already includes SERFmtMono.bm:
+'     '$INCLUDE:'SERFmtRGB.bm'
+'
+' The colour twin of SERFmtMono.bm (+ the RGB half of SERStackLib.bm). It's the
+' second branch of the two format dispatchers in the core (FrameMean#,
+' FrameCentroid) and of the stacker's quality/accumulate/finalize.
+'
+' Design notes:
+'   * Analysis (mean / centroid / quality) uses AVERAGE brightness, so it works
+'     for RGB and BGR identically -- channel ORDER doesn't matter when all you
+'     want is to find and rank the blob. One shift is derived and applied to all
+'     three channels, so colour stays registered.
+'   * Stacking preserves channel order (read channel c -> accum c -> write c),
+'     so RGB stays RGB and BGR stays BGR with no special-casing.
+'   * Deliberate R/B-vs-G alignment (atmospheric dispersion) is NOT done here --
+'     that's a finishing step on the stacked image (a future RGB-Align tool).
+' ============================================================================
+
+' --- One channel sample, full precision, endian-aware ---
+Function SampleRGB& (m As _MEM, sampleIdx As Long, sampleBytes As Long, le As Long)
+    Dim lo As _Unsigned _Byte, hi As _Unsigned _Byte
+    If sampleBytes = 1 Then
+        SampleRGB& = _MemGet(m, m.OFFSET + sampleIdx, _Unsigned _Byte)
+    Else
+        lo = _MemGet(m, m.OFFSET + sampleIdx * 2 + 0, _Unsigned _Byte)
+        hi = _MemGet(m, m.OFFSET + sampleIdx * 2 + 1, _Unsigned _Byte)
+        If le <> 0 Then SampleRGB& = lo + hi * 256 Else SampleRGB& = hi + lo * 256
+    End If
+End Function
+
+' --- Per-pixel average brightness (order-independent: RGB or BGR alike) ---
+Function LumaRGB& (m As _MEM, pix As Long, sampleBytes As Long, le As Long)
+    Dim a As Long, b As Long, c As Long
+    a = SampleRGB&(m, pix * 3 + 0, sampleBytes, le)
+    b = SampleRGB&(m, pix * 3 + 1, sampleBytes, le)
+    c = SampleRGB&(m, pix * 3 + 2, sampleBytes, le)
+    LumaRGB& = (a + b + c) \ 3
+End Function
+
+' --- Mean brightness, subsampled (auto-threshold source) ---
+Function MeanRGB# (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long)
+    Dim x As Long, y As Long, pix As Long
+    Dim sumv As Double, cnt As Double
+    Const STEP4 = 4
+    sumv = 0: cnt = 0
+    For y = 0 To h - 1 Step STEP4
+        For x = 0 To w - 1 Step STEP4
+            pix = y * w + x
+            sumv = sumv + LumaRGB&(m, pix, sampleBytes, le)
+            cnt = cnt + 1
+        Next x
+    Next y
+    If cnt < 1 Then cnt = 1
+    MeanRGB# = sumv / cnt
+End Function
+
+' --- Brightness-weighted centroid on luma -> ONE shift for all channels ---
+Sub CentroidRGB (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, thr As Long, cx As Double, cy As Double, total As Double)
+    Dim x As Long, y As Long, pix As Long, v As Long, wt As Long
+    Dim sumX As Double, sumY As Double, sumW As Double
+    sumX = 0: sumY = 0: sumW = 0
+    For y = 0 To h - 1
+        For x = 0 To w - 1
+            pix = y * w + x
+            v = LumaRGB&(m, pix, sampleBytes, le)
+            wt = v - thr
+            If wt > 0 Then
+                sumW = sumW + wt
+                sumX = sumX + wt * x
+                sumY = sumY + wt * y
+            End If
+        Next x
+    Next y
+    total = sumW
+    If sumW > 0 Then
+        cx = sumX / sumW
+        cy = sumY / sumW
+    Else
+        cx = (w - 1) / 2.0
+        cy = (h - 1) / 2.0
+    End If
+End Sub
+
+' --- Sharpness on luma (frame quality ranking) ---
+Function QualityRGB# (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long)
+    Dim x As Long, y As Long, v As Long, vr As Long, vd As Long
+    Dim gx As Double, gy As Double, s As Double
+    Const ST = 2
+    s = 0
+    For y = 0 To h - 1 - ST Step ST
+        For x = 0 To w - 1 - ST Step ST
+            v = LumaRGB&(m, y * w + x, sampleBytes, le)
+            vr = LumaRGB&(m, y * w + (x + ST), sampleBytes, le)
+            vd = LumaRGB&(m, (y + ST) * w + x, sampleBytes, le)
+            gx = vr - v
+            gy = vd - v
+            s = s + gx * gx + gy * gy
+        Next x
+    Next y
+    QualityRGB# = s
+End Function
+
+' --- Accumulate all three channels into the Double sum buffer (order kept) ---
+Sub AccumRGB (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, accum() As Double)
+    Dim p As Long, n As Long, c As Long, v As Long
+    n = w * h
+    For p = 0 To n - 1
+        For c = 0 To 2
+            v = SampleRGB&(m, p * 3 + c, sampleBytes, le)
+            accum(p * 3 + c) = accum(p * 3 + c) + v
+        Next c
+    Next p
+End Sub
+
+' --- Average the accumulator back to frame bytes, same format/endianness ---
+Sub FinalizeRGB (accum() As Double, cnt As Long, w As Long, h As Long, sampleBytes As Long, le As Long, outM As _MEM)
+    Dim p As Long, n As Long, c As Long, avg As Long
+    Dim ooff As _Offset
+    n = w * h
+    ooff = outM.OFFSET
+    For p = 0 To n - 1
+        For c = 0 To 2
+            avg = Int(accum(p * 3 + c) / cnt + 0.5)
+            If sampleBytes = 1 Then
+                If avg > 255 Then avg = 255
+                _MemPut outM, ooff, avg As _Unsigned _Byte
+                ooff = ooff + 1
+            Else
+                If avg > 65535 Then avg = 65535
+                If le <> 0 Then
+                    _MemPut outM, ooff + 0, (avg And 255) As _Unsigned _Byte
+                    _MemPut outM, ooff + 1, ((avg \ 256) And 255) As _Unsigned _Byte
+                Else
+                    _MemPut outM, ooff + 0, ((avg \ 256) And 255) As _Unsigned _Byte
+                    _MemPut outM, ooff + 1, (avg And 255) As _Unsigned _Byte
+                End If
+                ooff = ooff + 2
+            End If
+        Next c
+    Next p
+End Sub

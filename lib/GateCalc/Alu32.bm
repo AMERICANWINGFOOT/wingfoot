@@ -1,0 +1,193 @@
+' ============================================================
+' Alu32.bm - 32-bit signed arithmetic built only from gates
+' (implementation). Needs Gate.bm and Adder.bm.
+' ============================================================
+
+Function Alu32IsZero% (v As Long)
+    Dim i As Integer, anyBit As Integer, r As Integer
+    anyBit = 0
+    For i = 0 To 31
+        anyBit = GateEval%(GATE_OR, anyBit, AddBit%(v, i))
+    Next
+    r = GateEval%(GATE_NOT, anyBit, 0)
+    Alu32IsZero% = r
+End Function
+
+Function Alu32Mag& (v As Long)
+    Dim r As Long
+    If AddBit%(v, 31) Then
+        r = AddNegate&(v, 32)
+    Else
+        r = v
+    End If
+    Alu32Mag& = r
+End Function
+
+' Shift-and-add into a 64-bit result held as two 32-bit words.
+' For each set bit i of b, a shifted left i is split across the
+' two words: the low word gets a << i, the high word gets the
+' i bits that fell off the top (a >> (32 - i), masked to i bits).
+' The low adder's carry out feeds the high adder's carry in -
+' the same way two 32-bit adder chips would be cascaded.
+Sub Alu32MulU (a As Long, b As Long, hiOut As Long, loOut As Long)
+    Dim i As Integer, cy As Integer, cy2 As Integer, ov As Integer
+    Dim hw As Long, lw As Long, sl As Long, shh As Long, t As Long
+    Dim msk As _Integer64
+    hw = 0
+    lw = 0
+    For i = 0 To 31
+        If AddBit%(b, i) Then
+            sl = _ShL(a, i)
+            If i = 0 Then
+                shh = 0
+            Else
+                msk = _ShL(1&&, i) - 1
+                shh = _ShR(a, 32 - i) And msk
+            End If
+            AddRipple lw, sl, 0, 32, t, cy, ov
+            lw = t
+            AddRipple hw, shh, cy, 32, t, cy2, ov
+            hw = t
+        End If
+    Next
+    hiOut = hw
+    loOut = lw
+End Sub
+
+' Restoring division, one quotient bit per step: shift the next
+' dividend bit into the partial remainder, trial-subtract d, keep
+' the result if there was no borrow.
+'
+' The partial remainder can reach 2*d - 1, one bit wider than a
+' Long. Instead of a 33rd bit we remember the bit shifted out of
+' the top (topOut). When it is set the true remainder is at least
+' 2^32, which is always bigger than d, so the subtract must be
+' kept even though the 32-bit subtractor reports a borrow - and
+' its 32-bit result is exactly right.
+Sub Alu32DivU (n As Long, d As Long, qOut As Long, rOut As Long)
+    Dim i As Integer, bo As Integer, ov As Integer, topOut As Integer, keep As Integer
+    Dim rmd As Long, t As Long, q As Long
+    rmd = 0
+    q = 0
+    For i = 31 To 0 Step -1
+        topOut = AddBit%(rmd, 31)
+        rmd = _ShL(rmd, 1)
+        If AddBit%(n, i) Then rmd = rmd Or 1
+        AddSubtract rmd, d, 32, t, bo, ov
+        keep = GateEval%(GATE_OR, topOut, GateEval%(GATE_NOT, bo, 0))
+        If keep Then
+            rmd = t
+            q = q Or _ShL(1&, i)
+        End If
+    Next
+    qOut = q
+    rOut = rmd
+End Sub
+
+Sub Alu32MulS (a As Long, b As Long, resOut As Long, ovfOut As Integer)
+    Dim sa As Integer, sb As Integer, ng As Integer
+    Dim hiNz As Integer, nz As Integer, sgnBad As Integer
+    Dim ma As Long, mb As Long, hw As Long, lw As Long, r As Long
+    sa = AddBit%(a, 31)
+    sb = AddBit%(b, 31)
+    ma = Alu32Mag&(a)
+    mb = Alu32Mag&(b)
+    Alu32MulU ma, mb, hw, lw
+    ng = GateEval%(GATE_XOR, sa, sb)
+    hiNz = GateEval%(GATE_NOT, Alu32IsZero%(hw), 0)
+    If ng Then
+        r = AddNegate&(lw, 32)
+    Else
+        r = lw
+    End If
+    nz = GateEval%(GATE_NOT, Alu32IsZero%(r), 0)
+    sgnBad = GateEval%(GATE_AND, nz, GateEval%(GATE_XOR, AddBit%(r, 31), ng))
+    resOut = r
+    ovfOut = GateEval%(GATE_OR, hiNz, sgnBad)
+End Sub
+
+Sub Alu32DivS (a As Long, b As Long, qOut As Long, rOut As Long, divZero As Integer, ovfOut As Integer)
+    Dim sa As Integer, sb As Integer, qs As Integer, nz As Integer
+    Dim ma As Long, mb As Long, q As Long, rr As Long
+    divZero = Alu32IsZero%(b)
+    qOut = 0
+    rOut = 0
+    ovfOut = 0
+    If divZero Then Exit Sub
+    sa = AddBit%(a, 31)
+    sb = AddBit%(b, 31)
+    ma = Alu32Mag&(a)
+    mb = Alu32Mag&(b)
+    Alu32DivU ma, mb, q, rr
+    qs = GateEval%(GATE_XOR, sa, sb)
+    If qs Then q = AddNegate&(q, 32)
+    If sa Then rr = AddNegate&(rr, 32)
+    nz = GateEval%(GATE_NOT, Alu32IsZero%(q), 0)
+    ovfOut = GateEval%(GATE_AND, nz, GateEval%(GATE_XOR, AddBit%(q, 31), qs))
+    qOut = q
+    rOut = rr
+End Sub
+
+' Double dabble into ten BCD digits (enough for 2147483648).
+' The digits live in an array of nibbles rather than one packed
+' word, since 40 bits of BCD will not fit in a Long. For each
+' input bit from the top: add 3 to any digit that is 5 or more,
+' then shift every digit left one place, passing each digit's
+' bit 3 up into the next digit's bit 0, and bring the input bit
+' in at the bottom.
+Function Alu32Fmt$ (v As Long)
+    Dim dg(0 To 9) As Long
+    Dim mag As Long, nib As Long, tmp As Long, three As Long
+    Dim i As Integer, k As Integer, cy As Integer, ov As Integer, ge5 As Integer
+    Dim b3 As Integer, b2 As Integer, b1 As Integer, b0 As Integer
+    Dim s As String, started As Integer
+    three = 3
+    mag = Alu32Mag&(v)
+    For i = 31 To 0 Step -1
+        For k = 0 To 9
+            nib = dg(k)
+            b3 = AddBit%(nib, 3)
+            b2 = AddBit%(nib, 2)
+            b1 = AddBit%(nib, 1)
+            b0 = AddBit%(nib, 0)
+            ge5 = GateEval%(GATE_OR, b3, GateEval%(GATE_AND, b2, GateEval%(GATE_OR, b1, b0)))
+            If ge5 Then
+                AddRipple nib, three, 0, 4, tmp, cy, ov
+                dg(k) = tmp
+            End If
+        Next
+        For k = 9 To 1 Step -1
+            dg(k) = (_ShL(dg(k), 1) And 15) Or (_ShR(dg(k - 1), 3) And 1)
+        Next
+        dg(0) = _ShL(dg(0), 1) And 15
+        If AddBit%(mag, i) Then dg(0) = dg(0) Or 1
+    Next
+    s = ""
+    started = 0
+    For k = 9 To 0 Step -1
+        If dg(k) <> 0 Or started <> 0 Or k = 0 Then
+            s = s + Mid$("0123456789", dg(k) + 1, 1)
+            started = -1
+        End If
+    Next
+    If AddBit%(v, 31) Then s = "-" + s
+    Alu32Fmt$ = s
+End Function
+
+' v * 10 + digit: the 64-bit gate multiply by ten, then the digit
+' is added to the low word with its carry rippled into the high
+' word. The result fits only if the high word is zero and bit 31
+' of the low word is clear.
+Function Alu32DigitAppend& (v As Long, digit As Integer, okOut As Integer)
+    Dim ten As Long, hw As Long, lw As Long, dd As Long, zero As Long
+    Dim s As Long, h2 As Long
+    Dim cy As Integer, cy2 As Integer, ov As Integer
+    ten = 10
+    zero = 0
+    Alu32MulU v, ten, hw, lw
+    dd = digit
+    AddRipple lw, dd, 0, 32, s, cy, ov
+    AddRipple hw, zero, cy, 32, h2, cy2, ov
+    okOut = GateEval%(GATE_AND, Alu32IsZero%(h2), GateEval%(GATE_NOT, AddBit%(s, 31), 0))
+    Alu32DigitAppend& = s
+End Function

@@ -1,0 +1,57 @@
+'=============================================================
+'  PngToIcoSettings.bm  --  Implementation
+'=============================================================
+
+'--- Index 0..5 -> icon edge length. Single source of truth for
+'    both the toggle row and the INI key names.
+Function IcoSizeAt% (idx As Integer)
+    Select Case idx
+        Case 0: IcoSizeAt% = 16
+        Case 1: IcoSizeAt% = 32
+        Case 2: IcoSizeAt% = 48
+        Case 3: IcoSizeAt% = 64
+        Case 4: IcoSizeAt% = 128
+        Case 5: IcoSizeAt% = 256
+        Case Else: IcoSizeAt% = 0
+    End Select
+End Function
+
+'--- Restore toggles and paths. Absent keys fall back to the
+'    16/32/48 default set, so a first run behaves as before.
+Sub IcoSettingsLoad (h As Long, sizeFlag() As Integer, lastIn As String, lastOut As String)
+    Dim i As Integer
+    Dim kname As String
+    Dim dflt As Long
+    Dim edge As Integer
+
+    For i = 0 To ICO_SIZECOUNT - 1
+        edge = IcoSizeAt%(i)
+        kname = "Size" + _Trim$(Str$(edge))
+        If edge = 16 Or edge = 32 Or edge = 48 Then dflt = 1 Else dflt = 0
+        sizeFlag(i) = IniGetLong&(h, "Sizes", kname, dflt)
+    Next i
+
+    lastIn = IniGet$(h, "Paths", "LastInput", "")
+    lastOut = IniGet$(h, "Paths", "LastOutput", "")
+End Sub
+
+'--- Write current state back into the buffer. Caller still has
+'    to call IniSave% to put it on disk.
+Sub IcoSettingsSave (h As Long, sizeFlag() As Integer, lastIn As String, lastOut As String)
+    Dim i As Integer
+    Dim kname As String
+    Dim edge As Integer
+
+    For i = 0 To ICO_SIZECOUNT - 1
+        edge = IcoSizeAt%(i)
+        kname = "Size" + _Trim$(Str$(edge))
+        If sizeFlag(i) Then
+            IniSetLong h, "Sizes", kname, 1
+        Else
+            IniSetLong h, "Sizes", kname, 0
+        End If
+    Next i
+
+    IniSet h, "Paths", "LastInput", lastIn
+    IniSet h, "Paths", "LastOutput", lastOut
+End Sub

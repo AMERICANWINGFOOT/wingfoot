@@ -1,0 +1,6 @@
+# Orion StarShoot Autoguider - lets QBGuide use it without sudo.
+# 1856:0011 = camera waiting for its firmware, 1856:0012 = camera running.
+# Install once:  sudo cp ~/Desktop/astro/QBGuide/99-ssag.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+# then unplug and replug the camera.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1856", ATTRS{idProduct}=="0011", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1856", ATTRS{idProduct}=="0012", MODE="0666"

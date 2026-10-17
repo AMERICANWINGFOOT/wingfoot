@@ -1,0 +1,195 @@
+' GPU3D.bm - pixel-based 3D shapes, drawn by the GPU (goes with GPU3D.bi)
+'
+'  Setup        GPUPrefer name$        pick the card by name (Vulkan build), before GPUInit
+'               GPUInit&(maxGPUs)      start on up to maxGPUs cards (0 = all), sized to _Dest
+'               GPUShutdown
+'  Each frame   GPUBegin               empty the shape list
+'               GCube, GBox, GSphere, GBall, GCylinder, GCone, GPyramid, GDiamond, GShape
+'               GPUDraw                draw the shapes over whatever is already in _Dest
+'               GPUDrawFill bg~&       fill _Dest with bg~& and draw the shapes (faster)
+'  Look         GPUStyle flags&        G3_SOLID, G3_WIRE, G3_OUTLINE, G3_SHINY, G3_FLAT, G3_HIDDEN
+'               GPUTexture id&         texture for the next shapes (0 = none)
+'               GPULoadTexture id&, img&   send any QB64 image as texture id (1..63)
+'               GPUPerspective focal!  how strong the perspective is (0 = none)
+'               GPULight lx!, ly!, lz!, ambient!
+'               GPUFog nearZ!, farZ!, clr~&   /   GPUFogOff
+'               GPUQuality samples&, lineWidth!   anti-aliasing 1, 4, 9 or 16
+'  Asking       GPUPick&(x, y)         which shape is at that pixel (-1 = none)
+'               GPULastShape&          number of the shape added last
+'               GPUCount&, GPUName$(n), GPUStats$, GPUError$
+
+' Choose the card by part of its name ("Radeon", "Arc", "GTX") - call before GPUInit.
+' Only the Vulkan build uses it; the CUDA build always uses its NVIDIA cards.
+Sub GPUPrefer (devName As String)
+    g3_prefer_device devName + Chr$(0)
+End Sub
+
+Function GPUInit& (maxGPUs As Long)
+    G3W = _Width(_Dest)
+    G3H = _Height(_Dest)
+    G3Style = G3_SOLID
+    G3Tex = 0
+    G3LastShape = -1
+    GPUInit& = g3_init(maxGPUs, G3W, G3H)
+End Function
+
+Sub GPUShutdown
+    g3_shutdown
+End Sub
+
+Function GPUCount&
+    GPUCount& = g3_device_count
+End Function
+
+Sub GPUBegin
+    g3_begin
+    G3LastShape = -1
+End Sub
+
+' Draw the shapes over the picture already in _Dest (edges blend smoothly into it)
+Sub GPUDraw
+    Dim m As _MEM
+    If _Width(_Dest) <> G3W Or _Height(_Dest) <> G3H Then
+        G3Ok = 0
+        Exit Sub
+    End If
+    m = _MemImage(_Dest)
+    G3Ok = g3_draw(m.OFFSET, 0, 0)
+    _MemFree m
+End Sub
+
+' Clear _Dest to bg~& and draw the shapes, all on the GPU
+Sub GPUDrawFill (bg As _Unsigned Long)
+    Dim m As _MEM
+    If _Width(_Dest) <> G3W Or _Height(_Dest) <> G3H Then
+        G3Ok = 0
+        Exit Sub
+    End If
+    m = _MemImage(_Dest)
+    G3Ok = g3_draw(m.OFFSET, 1, bg)
+    _MemFree m
+End Sub
+
+Sub GPUStyle (flags As Long)
+    G3Style = flags
+End Sub
+
+Sub GPUTexture (id As Long)
+    G3Tex = id
+End Sub
+
+' Any QB64 32-bit image becomes texture id (1..63); it is scaled to 128 x 128
+Sub GPULoadTexture (id As Long, img As Long)
+    Dim tmp As Long, mm As _MEM
+    If id < 1 Or id > 63 Then Exit Sub
+    tmp = _NewImage(128, 128, 32)
+    _PutImage (0, 0)-(127, 127), img, tmp
+    mm = _MemImage(tmp)
+    g3_set_texture id, mm.OFFSET
+    _MemFree mm
+    _FreeImage tmp
+End Sub
+
+' focal = perspective strength in pixels; 0 = none. The vanishing point is the screen centre.
+Sub GPUPerspective (focal As Single)
+    g3_view focal, G3W / 2, G3H / 2
+End Sub
+
+' Same, with your own vanishing point
+Sub GPUView (focal As Single, vx As Single, vy As Single)
+    g3_view focal, vx, vy
+End Sub
+
+' Direction toward the light (x right, y down, z into the screen; negative z = from the viewer)
+Sub GPULight (lx As Single, ly As Single, lz As Single, ambient As Single)
+    g3_light lx, ly, lz, ambient
+End Sub
+
+Sub GPUFog (nearZ As Single, farZ As Single, clr As _Unsigned Long)
+    g3_fog nearZ, farZ, clr
+End Sub
+
+Sub GPUFogOff
+    g3_fog 0, 0, 0
+End Sub
+
+Sub GPUQuality (samples As Long, lineWidth As Single)
+    g3_quality samples, lineWidth
+End Sub
+
+' ---- shapes: x, y, z = centre (pixels), sizes in pixels, angles in degrees
+
+Sub GShape (shape As Long, x As Single, y As Single, z As Single, w As Single, h As Single, d As Single, ax As Single, ay As Single, az As Single, clr As _Unsigned Long)
+    G3LastShape = g3_add(shape, x, y, z, w, h, d, ax, ay, az, clr, G3Tex, G3Style)
+End Sub
+
+Sub GCube (x As Single, y As Single, z As Single, size As Single, ax As Single, ay As Single, az As Single, clr As _Unsigned Long)
+    G3LastShape = g3_add(G3_BOX, x, y, z, size, size, size, ax, ay, az, clr, G3Tex, G3Style)
+End Sub
+
+Sub GBox (x As Single, y As Single, z As Single, w As Single, h As Single, d As Single, ax As Single, ay As Single, az As Single, clr As _Unsigned Long)
+    G3LastShape = g3_add(G3_BOX, x, y, z, w, h, d, ax, ay, az, clr, G3Tex, G3Style)
+End Sub
+
+Sub GSphere (x As Single, y As Single, z As Single, diam As Single, ax As Single, ay As Single, az As Single, clr As _Unsigned Long)
+    G3LastShape = g3_add(G3_SPHERE, x, y, z, diam, diam, diam, ax, ay, az, clr, G3Tex, G3Style)
+End Sub
+
+' A sphere with no rotation - the simplest call of all
+Sub GBall (x As Single, y As Single, z As Single, diam As Single, clr As _Unsigned Long)
+    G3LastShape = g3_add(G3_SPHERE, x, y, z, diam, diam, diam, 0, 0, 0, clr, G3Tex, G3Style)
+End Sub
+
+' Standing upright when the angles are 0 (its axis runs up and down the screen)
+Sub GCylinder (x As Single, y As Single, z As Single, diam As Single, height As Single, ax As Single, ay As Single, az As Single, clr As _Unsigned Long)
+    G3LastShape = g3_add(G3_CYLINDER, x, y, z, diam, height, diam, ax, ay, az, clr, G3Tex, G3Style)
+End Sub
+
+' Point up, base down when the angles are 0
+Sub GCone (x As Single, y As Single, z As Single, diam As Single, height As Single, ax As Single, ay As Single, az As Single, clr As _Unsigned Long)
+    G3LastShape = g3_add(G3_CONE, x, y, z, diam, height, diam, ax, ay, az, clr, G3Tex, G3Style)
+End Sub
+
+' Square base down, point up when the angles are 0
+Sub GPyramid (x As Single, y As Single, z As Single, baseW As Single, height As Single, ax As Single, ay As Single, az As Single, clr As _Unsigned Long)
+    G3LastShape = g3_add(G3_PYRAMID, x, y, z, baseW, height, baseW, ax, ay, az, clr, G3Tex, G3Style)
+End Sub
+
+' Eight-sided gem (two pyramids base to base)
+Sub GDiamond (x As Single, y As Single, z As Single, size As Single, ax As Single, ay As Single, az As Single, clr As _Unsigned Long)
+    G3LastShape = g3_add(G3_DIAMOND, x, y, z, size, size, size, ax, ay, az, clr, G3Tex, G3Style)
+End Sub
+
+' ---- asking
+
+' Shape at screen pixel (x, y), numbered 0, 1, 2 ... in the order they were added; -1 = none
+Function GPUPick& (x As Single, y As Single)
+    GPUPick& = g3_pick(x, y)
+End Function
+
+Function GPULastShape&
+    GPULastShape& = G3LastShape
+End Function
+
+Function GPUStats$
+    Dim gms As Single, hms As Single
+    g3_stats gms, hms
+    GPUStats$ = "GPU" + Str$(Int(gms * 100 + 0.5) / 100) + " ms   copy" + Str$(Int(hms * 100 + 0.5) / 100) + " ms"
+End Function
+
+' Name of a card in use, e.g. "Vulkan: AMD Radeon R5 430 (RADV OLAND)"
+Function GPUName$ (dev As Long)
+    Dim msg As String, p As Long
+    msg = Space$(256)
+    g3_device_name dev, msg, Len(msg)
+    p = InStr(msg, Chr$(0))
+    If p > 0 Then GPUName$ = Left$(msg, p - 1) Else GPUName$ = RTrim$(msg)
+End Function
+
+Function GPUError$
+    Dim msg As String, p As Long
+    msg = Space$(512)
+    g3_last_error msg, Len(msg)
+    p = InStr(msg, Chr$(0))
+    If p > 0 Then GPUError$ = Left$(msg, p - 1) Else GPUError$ = RTrim$(msg)
+End Function

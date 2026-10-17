@@ -1,0 +1,207 @@
+' ============================================================================
+' SERCenterCore.bm  -  The format-agnostic centering engine
+'
+' Include at the BOTTOM of SERCenter.bas (before the format helpers):
+'     '$INCLUDE:'SERCenterCore.bm'
+'
+'   ReadInHeader   - fill g_* from the input SER header
+'   IsBayer%       - is this ColorID a Bayer/RAW pattern?
+'   AutoThresh&    - mean-based auto threshold (calls the format helper)
+'   FrameCentroid  - dispatch to the right per-format centroid
+'   ShiftCropFrame - move whole samples; black-fill exposed edges (byte-level)
+'   PreviewMono    - 16/8-bit grey -> on-screen 32-bit preview
+'   OpenOutSER / CloseOutSER - stream the centered frames to a new .ser
+' ============================================================================
+
+Sub ReadInHeader
+    Dim hdr As SERHeader
+    Get #g_inNum, 1, hdr
+    If hdr.FileID <> "LUCAM-RECORDER" Then
+        Print "Not a SER file (bad FileID)."
+        Close #g_inNum
+        End
+    End If
+    g_w = hdr.ImageWidth
+    g_h = hdr.ImageHeight
+    g_colorID = hdr.ColorID
+    g_depth = hdr.PixelDepth
+    g_frameCount = hdr.FrameCount
+    g_littleEndian = hdr.LittleEndian
+    If g_colorID = SER_RGB Or g_colorID = SER_BGR Then g_planes = 3 Else g_planes = 1
+    If g_depth <= 8 Then g_sampleBytes = 1 Else g_sampleBytes = 2
+    ' The SER LittleEndian flag is unreliable: nearly all 16-bit SER (SharpCap,
+    ' ZWO, etc.) is little-endian no matter what the header claims. Honour reality.
+    If g_sampleBytes = 2 Then g_littleEndian = 1
+    g_bpp = g_planes * g_sampleBytes
+    g_frameBytes = g_w * g_h * g_bpp
+    g_dataStart = SER_HEADER_SIZE + 1
+End Sub
+
+Function IsBayer% (c As Long)
+    IsBayer% = (c >= 8 And c <= 19)
+End Function
+
+Function AutoThresh& (m As _MEM)
+    ' FrameMean# dispatches to the mono or RGB mean
+    AutoThresh& = Int(FrameMean#(m) * THRESH_MULT)
+End Function
+
+' ---------------------------------------------------------------------------
+' Format-dispatched frame mean -- the RGB seam for thresholding. Adding
+' SERFmtRGB.bm means adding one branch here (FrameMean# = MeanRGB#(...)).
+' ---------------------------------------------------------------------------
+Function FrameMean# (m As _MEM)
+    If g_planes = 3 Then
+        FrameMean# = MeanRGB#(m, g_w, g_h, g_sampleBytes, g_littleEndian)
+    Else
+        FrameMean# = MeanMono#(m, g_w, g_h, g_sampleBytes, g_littleEndian)
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+' Threshold chosen by TARGET TYPE, not by format. Planet keeps the whole disc;
+' DSO tightens up to lock a bright core and shrug off the faint halo (and much
+' of a stray satellite trail). Format-agnostic: it only calls FrameMean#.
+' ---------------------------------------------------------------------------
+Function ThreshFor& (m As _MEM, targetType As Long, baseMult As Long)
+    Dim meanv As Double
+    meanv = FrameMean#(m)
+    Select Case targetType
+        Case TGT_DSO
+            ThreshFor& = Int(meanv * baseMult * 2)
+        Case Else
+            ThreshFor& = Int(meanv * baseMult)
+    End Select
+End Function
+
+' ---------------------------------------------------------------------------
+' Dispatch to the format family's centroid. Only the 1-sample (mono/raw)
+' family exists in this build; the RGB branch is added with SERFmtRGB.bm:
+'     If g_planes = 3 Then CentroidRGB ... Else CentroidMono ...
+' ---------------------------------------------------------------------------
+Sub FrameCentroid (m As _MEM, thr As Long, cx As Double, cy As Double, total As Double)
+    If g_planes = 3 Then
+        CentroidRGB m, g_w, g_h, g_sampleBytes, g_littleEndian, thr, cx, cy, total
+    Else
+        CentroidMono m, g_w, g_h, g_sampleBytes, g_littleEndian, thr, cx, cy, total
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------
+' Copy the source frame into the crop box, offset so the centroid sits at the
+' box centre. This is pure byte plumbing -- it never inspects pixel meaning,
+' only 'bpp' bytes per pixel -- which is why it serves every format unchanged.
+'
+' The whole destination is zeroed first (black), then each output row copies
+' its valid horizontal run in one _MemCopy. Off-frame pixels simply stay black.
+' ---------------------------------------------------------------------------
+Sub ShiftCropFrame (srcM As _MEM, w As Long, h As Long, bpp As Long, shiftX As Long, shiftY As Long, dstM As _MEM, cw As Long, ch As Long)
+    _MemFill dstM, dstM.OFFSET, cw * ch * bpp, 0 AS _UNSIGNED _BYTE
+    Dim oy As Long, sy As Long, ox0 As Long, ox1 As Long, runLen As Long
+    For oy = 0 To ch - 1
+        sy = oy + shiftY
+        If sy >= 0 And sy < h Then
+            ox0 = 0
+            If -shiftX > ox0 Then ox0 = -shiftX
+            ox1 = cw - 1
+            If (w - 1 - shiftX) < ox1 Then ox1 = w - 1 - shiftX
+            If ox1 >= ox0 Then
+                runLen = (ox1 - ox0 + 1) * bpp
+                _MemCopy srcM, srcM.OFFSET + ((sy * w) + (ox0 + shiftX)) * bpp, runLen TO dstM, dstM.OFFSET + ((oy * cw) + ox0) * bpp
+            End If
+        End If
+    Next oy
+End Sub
+
+' ---------------------------------------------------------------------------
+' Grey preview of a centered mono/raw frame (high byte at 16-bit). RGB preview
+' will live in the RGB helper when that lands.
+' ---------------------------------------------------------------------------
+Sub PreviewMono (m As _MEM, cw As Long, ch As Long, sampleBytes As Long, le As Long, img As Long)
+    Dim d As _MEM, p As Long, n As Long, msb As Long
+    Dim grey As _UNSIGNED _BYTE
+    n = cw * ch
+    If sampleBytes = 2 And le <> 0 Then msb = 1 Else msb = 0
+    d = _MemImage(img)
+    For p = 0 To n - 1
+        grey = _MemGet(m, m.OFFSET + p * sampleBytes + msb, _UNSIGNED _BYTE)
+        _MemPut d, d.OFFSET + p * 4 + 0, grey AS _UNSIGNED _BYTE
+        _MemPut d, d.OFFSET + p * 4 + 1, grey AS _UNSIGNED _BYTE
+        _MemPut d, d.OFFSET + p * 4 + 2, grey AS _UNSIGNED _BYTE
+        _MemPut d, d.OFFSET + p * 4 + 3, 255 AS _UNSIGNED _BYTE
+    Next p
+    _MemFree d
+End Sub
+
+' ---------------------------------------------------------------------------
+' Colour preview of a centered RGB/BGR frame (high byte at 16-bit). Honours the
+' ColorID so BGR isn't shown with red and blue swapped.
+' ---------------------------------------------------------------------------
+Sub PreviewRGB (m As _MEM, cw As Long, ch As Long, sampleBytes As Long, le As Long, img As Long)
+    Dim d As _MEM, p As Long, n As Long, msb As Long
+    Dim c0 As _UNSIGNED _BYTE, c1 As _UNSIGNED _BYTE, c2 As _UNSIGNED _BYTE
+    Dim rr As _UNSIGNED _BYTE, gg As _UNSIGNED _BYTE, bb As _UNSIGNED _BYTE
+    n = cw * ch
+    If sampleBytes = 2 And le <> 0 Then msb = 1 Else msb = 0
+    d = _MemImage(img)
+    For p = 0 To n - 1
+        c0 = _MemGet(m, m.OFFSET + (p * 3 + 0) * sampleBytes + msb, _UNSIGNED _BYTE)
+        c1 = _MemGet(m, m.OFFSET + (p * 3 + 1) * sampleBytes + msb, _UNSIGNED _BYTE)
+        c2 = _MemGet(m, m.OFFSET + (p * 3 + 2) * sampleBytes + msb, _UNSIGNED _BYTE)
+        If g_colorID = SER_BGR Then
+            bb = c0: gg = c1: rr = c2
+        Else
+            rr = c0: gg = c1: bb = c2
+        End If
+        _MemPut d, d.OFFSET + p * 4 + 0, bb AS _UNSIGNED _BYTE
+        _MemPut d, d.OFFSET + p * 4 + 1, gg AS _UNSIGNED _BYTE
+        _MemPut d, d.OFFSET + p * 4 + 2, rr AS _UNSIGNED _BYTE
+        _MemPut d, d.OFFSET + p * 4 + 3, 255 AS _UNSIGNED _BYTE
+    Next p
+    _MemFree d
+End Sub
+
+' ---------------------------------------------------------------------------
+' Preview dispatcher: pick grey or colour by pixel format. Callers use this.
+' ---------------------------------------------------------------------------
+Sub PreviewFrame (m As _MEM, cw As Long, ch As Long, sampleBytes As Long, le As Long, img As Long)
+    If g_planes = 3 Then
+        PreviewRGB m, cw, ch, sampleBytes, le, img
+    Else
+        PreviewMono m, cw, ch, sampleBytes, le, img
+    End If
+End Sub
+
+' ---------------------------------------------------------------------------
+' Output SER: same ColorID / depth / endianness as the input, but the smaller
+' crop dimensions. FrameCount is stamped optimistically and patched on close,
+' so an early abort still leaves a valid file.
+' ---------------------------------------------------------------------------
+Sub OpenOutSER (fileName As String)
+    If _FileExists(fileName) Then Kill fileName
+    g_outNum = FreeFile
+    Open fileName For Binary As #g_outNum
+    Dim hdr As SERHeader
+    hdr.FileID = "LUCAM-RECORDER"
+    hdr.LuID = 0
+    hdr.ColorID = g_colorID
+    hdr.LittleEndian = g_littleEndian
+    hdr.ImageWidth = g_cropW
+    hdr.ImageHeight = g_cropH
+    hdr.PixelDepth = g_depth
+    hdr.FrameCount = g_frameCount
+    hdr.Observer = "QB64 SERCenter"
+    hdr.Instrument = ""
+    hdr.Telescope = ""
+    hdr.DateTime = 0
+    hdr.DateTimeUTC = 0
+    Put #g_outNum, 1, hdr
+    g_written = 0
+End Sub
+
+Sub CloseOutSER
+    ' Patch the FrameCount field (byte offset 38 -> file position 39)
+    Seek #g_outNum, 39
+    Put #g_outNum, , g_written
+    Close #g_outNum
+End Sub

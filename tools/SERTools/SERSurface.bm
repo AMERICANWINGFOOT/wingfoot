@@ -1,0 +1,71 @@
+' ============================================================================
+' SERSurface.bm  -  Template matching for lunar / planetary SURFACE tracking
+'
+' Include at the BOTTOM of a program that already includes SERStars.bm
+' (this reuses BrightAt& for format-agnostic brightness):
+'     '$INCLUDE:'SERSurface.bm'
+'
+' The zoomed-in Moon has no single blob to centroid -- the whole frame is bright
+' surface. So instead of a centroid, we track a picked FEATURE (a crater) by
+' block matching: grab a reference patch once, then in every frame slide it over
+' a small search window and take the offset with the lowest SAD (sum of absolute
+' differences). That offset IS the frame's drift. Translation only.
+'
+'   ExtractPatch  - copy a (2R+1)^2 brightness patch around a point (done once)
+'   SurfaceMatch  - find the best-match centre for that patch in a new frame
+'
+' Cost note: each frame tests (2*searchR+1)^2 offsets, each comparing the patch
+' (subsampled). Heavier than a centroid -- keep patch/search modest.
+' ============================================================================
+
+' --- Grab the reference patch (brightness values) around (cx,cy) into patch() ---
+Sub ExtractPatch (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, cx As Long, cy As Long, patchR As Long, patch() As Long)
+    Dim dx As Long, dy As Long, px As Long, py As Long, i As Long
+    i = 0
+    For dy = -patchR To patchR
+        For dx = -patchR To patchR
+            px = cx + dx: py = cy + dy
+            If px < 0 Then px = 0
+            If px > w - 1 Then px = w - 1
+            If py < 0 Then py = 0
+            If py > h - 1 Then py = h - 1
+            patch(i) = BrightAt&(m, py * w + px, sampleBytes, le)
+            i = i + 1
+        Next dx
+    Next dy
+End Sub
+
+' --- Slide the reference patch over +/-searchR around (cx0,cy0); return the
+'     centre (foundX,foundY) of the lowest-SAD match. The patch comparison is
+'     subsampled (every 2nd pixel) for speed. ---
+Sub SurfaceMatch (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, patch() As Long, patchR As Long, cx0 As Long, cy0 As Long, searchR As Long, foundX As Long, foundY As Long)
+    Dim sxx As Long, syy As Long, dx As Long, dy As Long
+    Dim px As Long, py As Long, idx As Long, span As Long
+    Dim sad As Double, best As Double, diff As Long, tv As Long
+    Const SUBS = 2
+    span = 2 * patchR + 1
+    best = -1
+    foundX = cx0: foundY = cy0
+    For syy = -searchR To searchR
+        For sxx = -searchR To searchR
+            sad = 0
+            For dy = -patchR To patchR Step SUBS
+                For dx = -patchR To patchR Step SUBS
+                    px = cx0 + sxx + dx: py = cy0 + syy + dy
+                    If px < 0 Then px = 0
+                    If px > w - 1 Then px = w - 1
+                    If py < 0 Then py = 0
+                    If py > h - 1 Then py = h - 1
+                    tv = BrightAt&(m, py * w + px, sampleBytes, le)
+                    idx = (dy + patchR) * span + (dx + patchR)
+                    diff = tv - patch(idx)
+                    If diff < 0 Then diff = -diff
+                    sad = sad + diff
+                Next dx
+            Next dy
+            If best < 0 Or sad < best Then
+                best = sad: foundX = cx0 + sxx: foundY = cy0 + syy
+            End If
+        Next sxx
+    Next syy
+End Sub

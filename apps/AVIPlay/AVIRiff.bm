@@ -1,0 +1,193 @@
+' ============================================================================
+' AVIRiff.bm  -  Reading the RIFF tree and indexing the movi list
+'
+' Include this at the BOTTOM of the main program:
+'     '$INCLUDE:'AVIRiff.bm'
+'
+' Responsibilities:
+'   ReadID$   - pull a 4-byte FourCC at the current file position
+'   ParseTop  - walk the top-level RIFF children (find hdrl + movi)
+'   ScanHdrl  - recurse the header list for video/audio parameters
+'   IndexMovi - build the frame index and decode all audio to one array
+' ============================================================================
+
+' ---------------------------------------------------------------------------
+' Read a 4-byte FourCC at the current file position
+' ---------------------------------------------------------------------------
+Function ReadID$ (fnum As Integer)
+    Dim s As String
+    s = Space$(4)
+    Get #fnum, , s
+    ReadID$ = s
+End Function
+
+' ---------------------------------------------------------------------------
+' Walk the top-level RIFF children: find the header list and the movi list
+' ---------------------------------------------------------------------------
+Sub ParseTop
+    Seek #g_fnum, 1
+    Dim riffID As String, flen As Long, atype As String
+    riffID = ReadID$(g_fnum)
+    Get #g_fnum, , flen
+    atype = ReadID$(g_fnum)
+    If riffID <> "RIFF" Or atype <> "AVI " Then
+        Print "Not a RIFF/AVI file."
+        Close #g_fnum
+        End
+    End If
+
+    Do While Seek(g_fnum) < LOF(g_fnum) - 8
+        Dim cid As String, csz As Long, dstart As Long
+        cid = ReadID$(g_fnum)
+        Get #g_fnum, , csz
+        dstart = Seek(g_fnum)
+        If cid = "LIST" Then
+            Dim ltype As String
+            ltype = ReadID$(g_fnum)
+            If ltype = "hdrl" Then
+                ScanHdrl dstart + 4, csz - 4
+            ElseIf ltype = "movi" Then
+                g_moviData = dstart + 4
+                g_moviLen = csz - 4
+            End If
+        End If
+        Dim nxt As Long
+        nxt = dstart + csz
+        If (csz And 1) Then nxt = nxt + 1
+        Seek #g_fnum, nxt
+    Loop
+End Sub
+
+' ---------------------------------------------------------------------------
+' Scan a header list (recurses into strl) for video + audio parameters.
+' Navigates strictly by chunk/list sizes, so the encoder's off-by-2 audio
+' strf size field can't desync anything.
+' ---------------------------------------------------------------------------
+Sub ScanHdrl (startPos As Long, lenBytes As Long)
+    Dim endPos As Long, p As Long
+    Dim lastStrhType As String
+    endPos = startPos + lenBytes
+    p = startPos
+    lastStrhType = ""
+
+    Do While p < endPos - 8
+        Seek #g_fnum, p
+        Dim cid As String, csz As Long, dstart As Long
+        cid = ReadID$(g_fnum)
+        Get #g_fnum, , csz
+        dstart = Seek(g_fnum)
+
+        Select Case cid
+            Case "LIST"
+                Dim ltype As String
+                ltype = ReadID$(g_fnum)
+                ScanHdrl dstart + 4, csz - 4
+            Case "avih"
+                Dim mh As AVIMainHeader
+                Get #g_fnum, dstart, mh
+                g_vidW = mh.width
+                g_vidH = mh.height
+                g_numFrames = mh.totalFrames
+                If mh.microSecPerFrame > 0 Then g_fps = 1000000.0 / mh.microSecPerFrame
+            Case "strh"
+                Dim sh As AVIStreamHeader
+                Get #g_fnum, dstart, sh
+                lastStrhType = sh.fccType
+                If sh.fccType = "auds" And sh.rate > 0 Then g_audRate = sh.rate
+            Case "strf"
+                If lastStrhType = "vids" Then
+                    Dim bi As BITMAPINFOHEADER
+                    Get #g_fnum, dstart, bi
+                    If bi.biBitCount > 0 Then g_bitCount = bi.biBitCount
+                    If bi.biWidth <> 0 Then g_vidW = bi.biWidth
+                    If bi.biHeight <> 0 Then g_vidH = Abs(bi.biHeight)
+                ElseIf lastStrhType = "auds" Then
+                    Dim wf As WAVEFORMATEX
+                    Get #g_fnum, dstart, wf
+                    If wf.nChannels > 0 Then g_audChannels = wf.nChannels
+                    If wf.wBitsPerSample > 0 Then g_audBits = wf.wBitsPerSample
+                    If wf.nSamplesPerSec > 0 Then g_audRate = wf.nSamplesPerSec
+                End If
+        End Select
+
+        Dim nxt As Long
+        nxt = dstart + csz
+        If (csz And 1) Then nxt = nxt + 1
+        p = nxt
+    Loop
+End Sub
+
+' ---------------------------------------------------------------------------
+' Two passes over the movi list: count, allocate, then fill the frame index
+' and decode all audio into one interleaved 16-bit array.
+' ---------------------------------------------------------------------------
+Sub IndexMovi
+    Dim endPos As Long, p As Long
+    Dim cid As String, csz As Long, dstart As Long, nxt As Long
+    Dim tail As String
+    endPos = g_moviData + g_moviLen
+
+    ' Pass 1: count video chunks and total audio bytes
+    Dim vCount As Long, aBytes As Long
+    vCount = 0: aBytes = 0
+    p = g_moviData
+    Do While p < endPos - 8
+        Seek #g_fnum, p
+        cid = ReadID$(g_fnum)
+        Get #g_fnum, , csz
+        dstart = Seek(g_fnum)
+        tail = Right$(cid, 2)
+        If tail = "db" Or tail = "dc" Then
+            vCount = vCount + 1
+        ElseIf tail = "wb" Then
+            aBytes = aBytes + csz
+        End If
+        nxt = dstart + csz
+        If (csz And 1) Then nxt = nxt + 1
+        p = nxt
+    Loop
+
+    g_frCount = vCount
+    If vCount < 1 Then Exit Sub
+    ReDim g_frPos(1 To vCount) As Long
+    ReDim g_frSize(1 To vCount) As Long
+    g_audCount = aBytes \ 2
+    If g_audCount < 1 Then g_audCount = 1
+    ReDim g_aud(1 To g_audCount) As Integer
+
+    ' Pass 2: fill the index and decode audio
+    Dim vi As Long, ai As Long
+    vi = 0: ai = 0
+    p = g_moviData
+    Do While p < endPos - 8
+        Seek #g_fnum, p
+        cid = ReadID$(g_fnum)
+        Get #g_fnum, , csz
+        dstart = Seek(g_fnum)
+        tail = Right$(cid, 2)
+        If tail = "db" Or tail = "dc" Then
+            vi = vi + 1
+            g_frPos(vi) = dstart
+            g_frSize(vi) = csz
+        ElseIf tail = "wb" Then
+            Dim abuf As String, ns As Long, j As Long
+            Dim lo As Integer, hi As Integer, uVal As Long
+            ns = csz \ 2
+            abuf = Space$(csz)
+            Get #g_fnum, dstart, abuf
+            For j = 1 To ns
+                ai = ai + 1
+                If ai <= g_audCount Then
+                    lo = Asc(abuf, 2 * j - 1)
+                    hi = Asc(abuf, 2 * j)
+                    uVal = lo + hi * 256
+                    If uVal >= 32768 Then uVal = uVal - 65536
+                    g_aud(ai) = uVal
+                End If
+            Next j
+        End If
+        nxt = dstart + csz
+        If (csz And 1) Then nxt = nxt + 1
+        p = nxt
+    Loop
+End Sub

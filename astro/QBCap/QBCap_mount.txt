@@ -1,0 +1,5 @@
+# QBCap mount connection
+#   WiFi (computer joined to the mount's WiFi): address = 192.168.4.1
+#   USB cable:                                 address = /dev/ttyUSB0
+#   (EQDIR cable at 9600 baud:                 address = /dev/ttyUSB0,9600)
+address = 192.168.4.1

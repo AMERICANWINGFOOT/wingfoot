@@ -1,0 +1,39 @@
+# Compiled programs and libraries
+*.exe
+*.dll
+*.so
+*.o
+*.a
+*.spv
+
+# QB64-PE build leftovers
+untitled
+*.bak
+
+# Archives
+*.zip
+*.7z
+*.tar
+*.gz
+
+# Media and captured data
+*.png
+*.jpg
+*.bmp
+*.ico
+*.mp3
+*.wav
+*.avi
+*.ser
+*.fits
+*.fit
+*.csv
+*.bin
+*.dat
+*.log
+
+# TaskMon flight recorder logs
+flight/
+
+# QBCap built-in plate solver (made by astro/QBCap/build_astrometry.sh)
+astro/QBCap/astrometry/

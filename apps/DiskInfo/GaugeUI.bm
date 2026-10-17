@@ -1,0 +1,203 @@
+'=======================================================================
+' GaugeUI.bm  -  QB64Starter Gauge & Info Display Helper (implementation)
+'
+' FUNCTION INDEX
+'   GaugeInit                                                    set default theme colors
+'   HBar   (x, y, w, h, pct)                                     horizontal progress bar
+'   VBar   (x, y, w, h, pct)                                     vertical progress bar
+'   RingGauge  (cx, cy, outerR, innerR, pct, label$)              donut-style percent gauge
+'   DialGauge  (cx, cy, radius, reading, minVal, maxVal, unit$, label$)   needle dial gauge
+'   Sparkline  (x, y, w, h, series(), cnt, minVal, maxVal, label$)  mini history line graph
+'
+' All widgets color their fill/needle by percent-of-range using the
+' shared gLowThreshold/gHighThreshold breakpoints (green/yellow/red
+' by default) via the internal ThresholdColor~& helper.
+'=======================================================================
+
+
+Sub GaugeInit
+    ' A dark, calm theme matching the green/yellow/red load convention
+    ' already used elsewhere; override any gXxxx var after calling this.
+    gTrackColor = _RGB32(50, 50, 50)
+    gLowColor = _RGB32(60, 180, 90)
+    gMidColor = _RGB32(230, 200, 60)
+    gHighColor = _RGB32(220, 70, 60)
+    gBorderColor = _RGB32(120, 120, 120)
+    gTextColor = _RGB32(200, 200, 200)
+    gTickColor = _RGB32(150, 150, 150)
+    gLowThreshold = 50
+    gHighThreshold = 80
+End Sub
+
+
+Function ThresholdColor~& (pct As Single)
+    If pct < gLowThreshold Then
+        ThresholdColor~& = gLowColor
+    ElseIf pct < gHighThreshold Then
+        ThresholdColor~& = gMidColor
+    Else
+        ThresholdColor~& = gHighColor
+    End If
+End Function
+
+
+Function GNumFmt$ (v As Single, decimals As Integer)
+    Dim s$
+    s$ = Str$(Fix(v * (10 ^ decimals) + 0.5) / (10 ^ decimals))
+    GNumFmt$ = LTrim$(s$)
+End Function
+
+
+Sub HBar (x As Integer, y As Integer, w As Integer, h As Integer, pct As Single)
+    Dim p As Single, fillW As Integer
+    p = pct
+    If p < 0 Then p = 0
+    If p > 100 Then p = 100
+    fillW = Int(w * (p / 100.0))
+
+    Line (x, y)-(x + w, y + h), gTrackColor, BF
+    If fillW > 0 Then Line (x, y)-(x + fillW, y + h), ThresholdColor~&(p), BF
+    Line (x, y)-(x + w, y + h), gBorderColor, B
+End Sub
+
+
+Sub VBar (x As Integer, y As Integer, w As Integer, h As Integer, pct As Single)
+    Dim p As Single, fillH As Integer
+    p = pct
+    If p < 0 Then p = 0
+    If p > 100 Then p = 100
+    fillH = Int(h * (p / 100.0))
+
+    Line (x, y)-(x + w, y + h), gTrackColor, BF
+    If fillH > 0 Then Line (x, y + h - fillH)-(x + w, y + h), ThresholdColor~&(p), BF
+    Line (x, y)-(x + w, y + h), gBorderColor, B
+End Sub
+
+
+' Donut-style percentage gauge. Drawn as many thin radial spokes rather
+' than a filled arc (QB64 has no filled-arc primitive) - dense enough
+' spoke count reads as a solid ring. Sweeps clockwise from 12 o'clock.
+Sub RingGauge (cx As Integer, cy As Integer, outerR As Integer, innerR As Integer, pct As Single, label$)
+    Dim p As Single
+    p = pct
+    If p < 0 Then p = 0
+    If p > 100 Then p = 100
+
+    Dim segments As Integer, i As Integer
+    Dim angleStep As Single, angle As Single, rX As Single, rY As Single
+    Dim x1 As Integer, y1 As Integer, x2 As Integer, y2 As Integer
+    Dim filledSegs As Integer, col As _Unsigned Long
+    segments = 240
+    angleStep = (2 * _Pi) / segments
+    filledSegs = Int(segments * (p / 100.0) + 0.5)
+
+    For i = 0 To segments - 1
+        angle = (_Pi / 2) - i * angleStep ' start at top, sweep clockwise
+        rX = Cos(angle)
+        rY = -Sin(angle)
+        x1 = cx + Int(innerR * rX)
+        y1 = cy + Int(innerR * rY)
+        x2 = cx + Int(outerR * rX)
+        y2 = cy + Int(outerR * rY)
+        If i < filledSegs Then
+            col = ThresholdColor~&(p)
+        Else
+            col = gTrackColor
+        End If
+        Line (x1, y1)-(x2, y2), col
+    Next i
+
+    Color gTextColor
+    Dim pctText$
+    pctText$ = GNumFmt$(p, 0) + "%"
+    _PrintString (cx - 4 * Len(pctText$), cy - 8), pctText$
+
+    If label$ <> "" Then
+        _PrintString (cx - 4 * Len(label$), cy - outerR - 18), label$
+    End If
+End Sub
+
+
+' Needle dial gauge over an arbitrary value/min/max range (not just 0-100).
+' Sweeps 270 degrees, gap at the bottom, classic speedometer layout.
+Sub DialGauge (cx As Integer, cy As Integer, radius As Integer, reading As Single, minVal As Single, maxVal As Single, unitText As String, label$)
+    Dim rangeV As Single, p As Single
+    rangeV = maxVal - minVal
+    If rangeV = 0 Then rangeV = 1
+    p = ((reading - minVal) / rangeV) * 100.0
+    If p < 0 Then p = 0
+    If p > 100 Then p = 100
+
+    Dim startDeg As Single, sweepDeg As Single, angleDeg As Single, angleRad As Single
+    startDeg = 225
+    sweepDeg = 270
+    angleDeg = startDeg - (sweepDeg * (p / 100.0))
+    angleRad = angleDeg * _Pi / 180
+
+    Circle (cx, cy), radius, gTrackColor
+
+    Dim t As Single, tAngleDeg As Single, tAngleRad As Single
+    Dim tx1 As Integer, ty1 As Integer, tx2 As Integer, ty2 As Integer
+    For t = 0 To 100 Step 25
+        tAngleDeg = startDeg - (sweepDeg * (t / 100.0))
+        tAngleRad = tAngleDeg * _Pi / 180
+        tx1 = cx + Int((radius - 8) * Cos(tAngleRad))
+        ty1 = cy - Int((radius - 8) * Sin(tAngleRad))
+        tx2 = cx + Int(radius * Cos(tAngleRad))
+        ty2 = cy - Int(radius * Sin(tAngleRad))
+        Line (tx1, ty1)-(tx2, ty2), gTickColor
+    Next t
+
+    Dim needleLen As Single, nx As Integer, ny As Integer, needleColor As _Unsigned Long
+    needleLen = radius - 10
+    nx = cx + Int(needleLen * Cos(angleRad))
+    ny = cy - Int(needleLen * Sin(angleRad))
+    needleColor = ThresholdColor~&(p)
+    Line (cx, cy)-(nx, ny), needleColor
+    Circle (cx, cy), 4, needleColor
+    Paint (cx, cy), needleColor, needleColor
+
+    Color gTextColor
+    Dim readText$
+    readText$ = GNumFmt$(reading, 1) + " " + unitText
+    _PrintString (cx - 4 * Len(readText$), cy + radius + 6), readText$
+
+    If label$ <> "" Then
+        _PrintString (cx - 4 * Len(label$), cy - radius - 18), label$
+    End If
+End Sub
+
+
+' Mini history line graph. series() holds the most recent cnt samples in
+' chronological order (oldest first); caller owns the buffer and its
+' ordering. minVal/maxVal set the vertical scale.
+Sub Sparkline (x As Integer, y As Integer, w As Integer, h As Integer, series() As Single, cnt As Integer, minVal As Single, maxVal As Single, label$)
+    Line (x, y)-(x + w, y + h), gTrackColor, B
+
+    If label$ <> "" Then
+        Color gTextColor
+        _PrintString (x, y - 16), label$
+    End If
+
+    If cnt < 2 Then Exit Sub
+
+    Dim rangeV As Single
+    rangeV = maxVal - minVal
+    If rangeV <= 0 Then rangeV = 1
+
+    Dim stepX As Single, i As Integer
+    Dim x1 As Integer, y1 As Integer, x2 As Integer, y2 As Integer
+    stepX = w / (cnt - 1)
+
+    For i = 0 To cnt - 2
+        x1 = x + Int(i * stepX)
+        y1 = y + h - Int(((series(i) - minVal) / rangeV) * h)
+        x2 = x + Int((i + 1) * stepX)
+        y2 = y + h - Int(((series(i + 1) - minVal) / rangeV) * h)
+        If y1 < y Then y1 = y
+        If y1 > y + h Then y1 = y + h
+        If y2 < y Then y2 = y
+        If y2 > y + h Then y2 = y + h
+        Line (x1, y1)-(x2, y2), gTickColor
+    Next i
+End Sub

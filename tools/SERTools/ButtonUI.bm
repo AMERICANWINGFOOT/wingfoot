@@ -1,0 +1,66 @@
+' ============================================================================
+' ButtonUI.bm  -  Tiny immediate-mode button + mouse toolkit (implementation)
+'
+' Include at the BOTTOM of the program:
+'     '$INCLUDE:'ButtonUI.bm'
+'
+'   MouseInit  - set the default theme colours (call once)
+'   PollMouse  - refresh gMouse each frame (call once per frame, before drawing)
+'   PtIn%      - point-in-rectangle test
+'   Button%    - draw a button and return -1 the frame it's clicked
+' ============================================================================
+
+Sub MouseInit
+    uiFace = _RGB32(52, 58, 72)
+    uiFaceHi = _RGB32(74, 82, 102)
+    uiText = _RGB32(234, 238, 246)
+    uiEdge = _RGB32(96, 106, 128)
+End Sub
+
+' ---------------------------------------------------------------------------
+' Drain the OS mouse queue, then work out whether a click happened. A click is
+' counted on RELEASE (held last frame, up this frame) -- the usual button feel.
+' ---------------------------------------------------------------------------
+Sub PollMouse
+    Do While _MouseInput
+    Loop
+    gMouse.prevDown = gMouse.down
+    gMouse.x = _MouseX
+    gMouse.y = _MouseY
+    If _MouseButton(1) Then gMouse.down = -1 Else gMouse.down = 0
+    If gMouse.prevDown And Not gMouse.down Then
+        gMouse.clicked = -1
+    Else
+        gMouse.clicked = 0
+    End If
+End Sub
+
+Function PtIn% (px As Long, py As Long, x As Long, y As Long, w As Long, h As Long)
+    If px >= x And px <= x + w And py >= y And py <= y + h Then
+        PtIn% = -1
+    Else
+        PtIn% = 0
+    End If
+End Function
+
+' ---------------------------------------------------------------------------
+' Draw one button and report a click. Immediate mode: call it every frame.
+' The caption is centred with the built-in 8x16 font.
+' ---------------------------------------------------------------------------
+Function Button% (x As Long, y As Long, w As Long, h As Long, caption As String)
+    Dim over As Integer, face As _Unsigned Long
+    Dim tx As Long, ty As Long
+
+    over = PtIn%(gMouse.x, gMouse.y, x, y, w, h)
+    If over Then face = uiFaceHi Else face = uiFace
+
+    Line (x, y)-(x + w, y + h), face, BF
+    Line (x, y)-(x + w, y + h), uiEdge, B
+
+    tx = x + (w - 8 * Len(caption)) \ 2
+    ty = y + (h - 16) \ 2
+    Color uiText
+    _PrintString (tx, ty), caption
+
+    If over And gMouse.clicked Then Button% = -1 Else Button% = 0
+End Function

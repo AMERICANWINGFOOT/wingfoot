@@ -1,0 +1,31 @@
+; names for QHY5II.HEX (Orion StarShoot All-in-One = QHY5LII-C), used by fx2dis.py
+; ADDR  name                         ; comment (shown above the routine)
+0C6B  main                           ; reset: C startup, then hardware init and the main loop
+0080  vendor_request                 ; USB vendor request: switch on bRequest (SETUPDAT1)
+00BB  cmd_B3_stop_capture            ; IFCONFIG back to ports mode + FIFO reset (abort a frame)
+00DF  cmd_B7_i2c_read_sensor         ; read sensor register(s): reg addr = wIndex (8 or 16-bit), wLength bytes back
+0125  cmd_B8_set_capture             ; 19-byte settings block from the PC -> XDATA 2000h; byte 0 = mode 0/1/2
+017F  cmd_B9_i2c_write_3             ; write 3 bytes from EP0BUF straight to the sensor (reg + 16-bit value)
+019D  cmd_BB_i2c_write_sensor        ; write sensor register: reg addr = wIndex, data = payload
+022C  cmd_BD_start_exposure          ; 32-bit exposure time from EP0BUF, sensor clock on, start
+026C  cmd_BF_clock_on                ; CLKOUT on (sensor master clock), then falls into C0
+027B  cmd_C0_guide_pins              ; ST-4 guide relays: IOD.4-7, wValue picks the axis, wIndex the pins
+02A8  cmd_C1_start_exposure_b        ; same as BD (32-bit exposure, start) - second variant
+0303  cmd_C2_status                  ; 10-byte status/version block back to the PC
+0346  cmd_C8_set_speed               ; EP0BUF[0] 0/1/2 -> 8051 at 12/24/48 MHz (+ timer reload)
+036D  cmd_C9_set_speed_b             ; same as C8
+03BB  cmd_CA_eeprom_read             ; read the boot EEPROM (I2C A0h): offset wIndex, wLength bytes
+03E8  cmd_CB_eeprom_write            ; WRITE the boot EEPROM (I2C 50h) - refuses offsets 0-7 (the USB ID). Do not use.
+043E  cmd_CD_bus_width_8_16          ; EP0BUF[0] = 0 -> 8-bit pixel bus, not 0 -> 16-bit (EP2FIFOCFG WORDWIDE). Works live, no reset
+1499  fifo_8bit                      ; EP2FIFOCFG = 08h: AUTOIN, WORDWIDE=0 (8-bit bus from the sensor)
+14B8  fifo_16bit                     ; EP2FIFOCFG = 09h: AUTOIN, WORDWIDE=1 (16-bit bus from the sensor)
+046D  cmd_CF_sensor_reset            ; pulse IOA.1 low = sensor RESET (the same pulse as at power-up)
+047F  cmd_unknown                    ; any other request number
+0E64  isr_timer0                     ; exposure timer: counts down, then stops CLKOUT and drops IOA.3
+1112  isr_int0_sensor                ; INT0 on PA0 - signal from the sensor
+109C  long_exposure                  ; long exposure: wait for PA0, stop the sensor clock, count the time
+1510  i2c_write                      ; I2C write (device in R7)
+140A  i2c_read                       ; I2C read (device in R7, register in R5)
+13E2  i2c_read_reg16                 ; I2C read with a 16-bit register address
+0929  keil_memcopy                   ; Keil library: copy between generic pointers
+099E  keil_ulcmp                     ; Keil library: 32-bit compare

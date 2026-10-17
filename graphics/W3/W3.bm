@@ -1,0 +1,364 @@
+'=======================================================================
+'  W3.bm  --  Implementation
+'=======================================================================
+
+Sub W3Init
+    Dim i As Integer
+    For i = 0 To W3_MAXMODELS - 1
+        w3used(i) = 0
+        w3scale(i) = 1
+    Next i
+    w3near = 0.1
+    w3far = 200
+    w3fov = 60
+    w3vw = 640: w3vh = 480
+    w3ox = 320: w3oy = 240
+    w3focal = (w3vw / 2) / Tan(_D2R(w3fov) / 2)
+    w3camX = 0: w3camY = 0: w3camZ = -5
+    w3yaw = 0: w3pitch = 0
+    w3cue = -1
+    w3cueAmt = 0.75
+    w3fog = _RGB32(24, 26, 32)
+End Sub
+
+
+Function W3New& ()
+    Dim i As Integer
+    W3New& = -1
+    For i = 0 To W3_MAXMODELS - 1
+        If w3used(i) = 0 Then
+            w3used(i) = 1
+            w3nv(i) = 0: w3ne(i) = 0
+            w3posX(i) = 0: w3posY(i) = 0: w3posZ(i) = 0
+            w3rotX(i) = 0: w3rotY(i) = 0: w3rotZ(i) = 0
+            w3scale(i) = 1
+            W3New& = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+Sub W3Free (h As Long)
+    If h < 0 Or h > W3_MAXMODELS - 1 Then Exit Sub
+    w3used(h) = 0
+    w3nv(h) = 0
+    w3ne(h) = 0
+End Sub
+
+
+Sub W3FreeAll
+    Dim i As Integer
+    For i = 0 To W3_MAXMODELS - 1
+        w3used(i) = 0
+    Next i
+End Sub
+
+
+Sub W3Clear (h As Long)
+    If h < 0 Or h > W3_MAXMODELS - 1 Then Exit Sub
+    w3nv(h) = 0
+    w3ne(h) = 0
+End Sub
+
+
+'--- Append a vertex; returns its index, or -1 if the model is full.
+Function W3AddVert% (h As Long, x As Single, y As Single, z As Single)
+    W3AddVert% = -1
+    If h < 0 Or h > W3_MAXMODELS - 1 Then Exit Function
+    If w3nv(h) >= W3_MAXVERT Then Exit Function
+    w3vx(h, w3nv(h)) = x
+    w3vy(h, w3nv(h)) = y
+    w3vz(h, w3nv(h)) = z
+    W3AddVert% = w3nv(h)
+    w3nv(h) = w3nv(h) + 1
+End Function
+
+
+Sub W3AddEdge (h As Long, a As Integer, b As Integer)
+    If h < 0 Or h > W3_MAXMODELS - 1 Then Exit Sub
+    If w3ne(h) >= W3_MAXEDGE Then Exit Sub
+    If a < 0 Or a >= w3nv(h) Then Exit Sub
+    If b < 0 Or b >= w3nv(h) Then Exit Sub
+    w3ea(h, w3ne(h)) = a
+    w3eb(h, w3ne(h)) = b
+    w3ne(h) = w3ne(h) + 1
+End Sub
+
+
+'=======================================================================
+' PRIMITIVES
+'=======================================================================
+Sub W3Cube (h As Long, sz As Single)
+    W3Box h, sz, sz, sz
+End Sub
+
+
+Sub W3Box (h As Long, sx As Single, sy As Single, sz As Single)
+    Dim ax As Single, ay As Single, az As Single
+    Dim i As Integer, dummy As Integer
+
+    W3Clear h
+    ax = sx / 2: ay = sy / 2: az = sz / 2
+
+    dummy = W3AddVert%(h, -ax, -ay, -az) '  0
+    dummy = W3AddVert%(h, ax, -ay, -az) '   1
+    dummy = W3AddVert%(h, ax, ay, -az) '    2
+    dummy = W3AddVert%(h, -ax, ay, -az) '   3
+    dummy = W3AddVert%(h, -ax, -ay, az) '   4
+    dummy = W3AddVert%(h, ax, -ay, az) '    5
+    dummy = W3AddVert%(h, ax, ay, az) '     6
+    dummy = W3AddVert%(h, -ax, ay, az) '    7
+
+    For i = 0 To 3 '                        back face
+        W3AddEdge h, i, (i + 1) Mod 4
+    Next i
+    For i = 0 To 3 '                        front face
+        W3AddEdge h, 4 + i, 4 + ((i + 1) Mod 4)
+    Next i
+    For i = 0 To 3 '                        connecting struts
+        W3AddEdge h, i, i + 4
+    Next i
+End Sub
+
+
+'--- Ground grid on the y = 0 plane, centred on the origin.
+Sub W3Grid (h As Long, halfN As Integer, stepSize As Single)
+    Dim i As Integer, a As Integer, b As Integer
+    Dim ext As Single, p As Single
+
+    W3Clear h
+    ext = halfN * stepSize
+
+    For i = -halfN To halfN
+        p = i * stepSize
+        a = W3AddVert%(h, p, 0, -ext)
+        b = W3AddVert%(h, p, 0, ext)
+        If a >= 0 And b >= 0 Then W3AddEdge h, a, b
+        a = W3AddVert%(h, -ext, 0, p)
+        b = W3AddVert%(h, ext, 0, p)
+        If a >= 0 And b >= 0 Then W3AddEdge h, a, b
+    Next i
+End Sub
+
+
+Sub W3Axes (h As Long, ln As Single)
+    Dim o As Integer, a As Integer
+
+    W3Clear h
+    o = W3AddVert%(h, 0, 0, 0)
+    a = W3AddVert%(h, ln, 0, 0): W3AddEdge h, o, a
+    a = W3AddVert%(h, 0, ln, 0): W3AddEdge h, o, a
+    a = W3AddVert%(h, 0, 0, ln): W3AddEdge h, o, a
+End Sub
+
+
+'=======================================================================
+' PLACEMENT / CAMERA / LENS
+'=======================================================================
+Sub W3SetPos (h As Long, x As Single, y As Single, z As Single)
+    If h < 0 Or h > W3_MAXMODELS - 1 Then Exit Sub
+    w3posX(h) = x: w3posY(h) = y: w3posZ(h) = z
+End Sub
+
+
+Sub W3SetRot (h As Long, rx As Single, ry As Single, rz As Single)
+    If h < 0 Or h > W3_MAXMODELS - 1 Then Exit Sub
+    w3rotX(h) = rx: w3rotY(h) = ry: w3rotZ(h) = rz
+End Sub
+
+
+Sub W3SetScale (h As Long, s As Single)
+    If h < 0 Or h > W3_MAXMODELS - 1 Then Exit Sub
+    w3scale(h) = s
+End Sub
+
+
+Sub W3SetViewport (w As Single, hh As Single)
+    w3vw = w: w3vh = hh
+    w3ox = w / 2: w3oy = hh / 2
+    w3focal = (w3vw / 2) / Tan(_D2R(w3fov) / 2)
+End Sub
+
+
+Sub W3SetLens (fovDeg As Single, nearZ As Single, farZ As Single)
+    w3fov = fovDeg
+    w3near = nearZ
+    If w3near < 0.01 Then w3near = 0.01 ' never zero - projection divides by it
+    w3far = farZ
+    w3focal = (w3vw / 2) / Tan(_D2R(w3fov) / 2)
+End Sub
+
+
+Sub W3SetCamera (x As Single, y As Single, z As Single, yw As Single, pt As Single)
+    w3camX = x: w3camY = y: w3camZ = z
+    w3yaw = yw: w3pitch = pt
+End Sub
+
+
+'--- Point the camera at a target, deriving yaw and pitch.
+Sub W3LookAt (x As Single, y As Single, z As Single, tx As Single, ty As Single, tz As Single)
+    Dim dx As Single, dy As Single, dz As Single, flat As Single
+
+    w3camX = x: w3camY = y: w3camZ = z
+    dx = tx - x: dy = ty - y: dz = tz - z
+    flat = Sqr(dx * dx + dz * dz)
+    If flat < 0.0001 And Abs(dy) < 0.0001 Then Exit Sub ' degenerate
+
+    w3yaw = _Atan2(dx, dz)
+    w3pitch = _Atan2(dy, flat)
+End Sub
+
+
+Sub W3SetDepthCue (onFlag As Integer, fogCol As _Unsigned Long)
+    w3cue = onFlag
+    w3fog = fogCol
+End Sub
+
+
+'--- How far the model's furthest edge fades toward the fog colour.
+'    0 = no fade, 1 = furthest edge reaches fog exactly. Around 0.75
+'    gives enough front-to-back contrast to kill the Necker flip.
+Sub W3SetCueAmount (amt As Single)
+    w3cueAmt = amt
+    If w3cueAmt < 0 Then w3cueAmt = 0
+    If w3cueAmt > 1 Then w3cueAmt = 1
+End Sub
+
+
+'=======================================================================
+' RENDER
+'=======================================================================
+'--- Two passes: transform every vertex once into view space, then walk
+'    the edge list by index. Transforming per-edge would do every shared
+'    vertex twice (a cube: 24 transforms instead of 8).
+Sub W3Draw (h As Long, col As _Unsigned Long)
+    Dim i As Integer, a As Integer, b As Integer
+    Dim cosX As Single, sinX As Single, cosY As Single, sinY As Single
+    Dim cosZ As Single, sinZ As Single
+    Dim m00 As Single, m01 As Single, m02 As Single
+    Dim m10 As Single, m11 As Single, m12 As Single
+    Dim m20 As Single, m21 As Single, m22 As Single
+    Dim cyaw As Single, syaw As Single, cpit As Single, spit As Single
+    Dim vx As Single, vy As Single, vz As Single
+    Dim wx As Single, wy As Single, wz As Single
+    Dim dx As Single, dy As Single, dz As Single
+    Dim ex As Single, ez As Single
+    Dim sc As Single, midZ As Single, t As Single
+    Dim zmin As Single, zmax As Single, span As Single
+    Dim edgeCol As _Unsigned Long
+
+    If h < 0 Or h > W3_MAXMODELS - 1 Then Exit Sub
+    If w3used(h) = 0 Then Exit Sub
+    If w3nv(h) = 0 Or w3ne(h) = 0 Then Exit Sub
+
+    ' --- nine rotation coefficients, once per model per frame ---
+    cosX = Cos(w3rotX(h)): sinX = Sin(w3rotX(h))
+    cosY = Cos(w3rotY(h)): sinY = Sin(w3rotY(h))
+    cosZ = Cos(w3rotZ(h)): sinZ = Sin(w3rotZ(h))
+
+    m00 = cosY * cosZ + sinY * sinX * sinZ
+    m01 = -cosY * sinZ + sinY * sinX * cosZ
+    m02 = sinY * cosX
+    m10 = cosX * sinZ
+    m11 = cosX * cosZ
+    m12 = -sinX
+    m20 = -sinY * cosZ + cosY * sinX * sinZ
+    m21 = sinY * sinZ + cosY * sinX * cosZ
+    m22 = cosY * cosX
+
+    cyaw = Cos(w3yaw): syaw = Sin(w3yaw)
+    cpit = Cos(w3pitch): spit = Sin(w3pitch)
+    sc = w3scale(h)
+
+    ' --- pass 1: model -> world -> view, cached in view space ---
+    For i = 0 To w3nv(h) - 1
+        vx = w3vx(h, i) * sc
+        vy = w3vy(h, i) * sc
+        vz = w3vz(h, i) * sc
+
+        wx = vx * m00 + vy * m01 + vz * m02 + w3posX(h)
+        wy = vx * m10 + vy * m11 + vz * m12 + w3posY(h)
+        wz = vx * m20 + vy * m21 + vz * m22 + w3posZ(h)
+
+        dx = wx - w3camX
+        dy = wy - w3camY
+        dz = wz - w3camZ
+
+        ex = dx * cyaw - dz * syaw
+        ez = dx * syaw + dz * cyaw
+
+        w3tx(i) = ex
+        w3ty(i) = dy * cpit - ez * spit
+        w3tz(i) = dy * spit + ez * cpit
+
+        If i = 0 Then
+            zmin = w3tz(i): zmax = w3tz(i)
+        Else
+            If w3tz(i) < zmin Then zmin = w3tz(i)
+            If w3tz(i) > zmax Then zmax = w3tz(i)
+        End If
+    Next i
+
+    span = zmax - zmin
+
+    ' --- pass 2: edges ---
+    For i = 0 To w3ne(h) - 1
+        a = w3ea(h, i)
+        b = w3eb(h, i)
+
+        edgeCol = col
+        If w3cue And span > 0.0001 Then
+            midZ = (w3tz(a) + w3tz(b)) / 2
+            t = (midZ - zmin) / span
+            If t < 0 Then t = 0
+            If t > 1 Then t = 1
+            edgeCol = W3Mix~&(col, w3fog, t * w3cueAmt)
+        End If
+
+        W3DrawEdge w3tx(a), w3ty(a), w3tz(a), w3tx(b), w3ty(b), w3tz(b), edgeCol
+    Next i
+End Sub
+
+
+'--- Draw one edge given both endpoints in VIEW space. Three cases:
+'    both behind the near plane (skip), both in front (draw), or
+'    straddling (shorten to the crossing, then draw).
+Sub W3DrawEdge (ax As Single, ay As Single, az As Single, bx As Single, by As Single, bz As Single, col As _Unsigned Long)
+    Dim t As Single
+    Dim px As Single, py As Single, pz As Single
+    Dim qx As Single, qy As Single, qz As Single
+
+    If az < w3near And bz < w3near Then Exit Sub
+
+    px = ax: py = ay: pz = az
+    qx = bx: qy = by: qz = bz
+
+    ' Only one endpoint can be behind here, so the denominators below
+    ' are non-zero by construction and ElseIf is correct - two separate
+    ' Ifs would clip the second end against an already-moved first end.
+    If az < w3near Then
+        t = (w3near - az) / (bz - az)
+        px = ax + (bx - ax) * t
+        py = ay + (by - ay) * t
+        pz = w3near
+    ElseIf bz < w3near Then
+        t = (w3near - bz) / (az - bz)
+        qx = bx + (ax - bx) * t
+        qy = by + (ay - by) * t
+        qz = w3near
+    End If
+
+    Line (w3ox + w3focal * px / pz, w3oy - w3focal * py / pz)-(w3ox + w3focal * qx / qz, w3oy - w3focal * qy / qz), col
+End Sub
+
+
+'--- Linear blend, t = 0 gives c1, t = 1 gives c2.
+Function W3Mix~& (c1 As _Unsigned Long, c2 As _Unsigned Long, t As Single)
+    Dim r As Integer, g As Integer, b As Integer
+
+    r = _Red32(c1) + (_Red32(c2) - _Red32(c1)) * t
+    g = _Green32(c1) + (_Green32(c2) - _Green32(c1)) * t
+    b = _Blue32(c1) + (_Blue32(c2) - _Blue32(c1)) * t
+    W3Mix~& = _RGB32(r, g, b)
+End Function

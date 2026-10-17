@@ -1,0 +1,182 @@
+' ============================================================
+' Adder.bm - adder, carry and subtract helper for QB64-PE
+' (implementation). Needs Gate.bm for the gate functions.
+' ============================================================
+
+' -1 if bit i of v is set, else 0.
+Function AddBit% (v As Long, i As Integer)
+    Dim r As Integer
+    r = ((_ShR(v, i) And 1) <> 0)
+    AddBit% = r
+End Function
+
+Function AddAnd% (x As Integer, y As Integer)
+    Dim r As Integer
+    r = GateEval%(GATE_AND, x, y)
+    AddAnd% = r
+End Function
+
+Function AddOr% (x As Integer, y As Integer)
+    Dim r As Integer
+    r = GateEval%(GATE_OR, x, y)
+    AddOr% = r
+End Function
+
+Function AddXor% (x As Integer, y As Integer)
+    Dim r As Integer
+    r = GateEval%(GATE_XOR, x, y)
+    AddXor% = r
+End Function
+
+' Binary string of the low nBits bits, most significant first.
+Function AddBin$ (v As Long, nBits As Integer)
+    Dim s As String, i As Integer
+    s = ""
+    For i = nBits - 1 To 0 Step -1
+        If AddBit%(v, i) Then
+            s = s + "1"
+        Else
+            s = s + "0"
+        End If
+    Next
+    AddBin$ = s
+End Function
+
+' ------------------------------------------------------------
+' Ripple-carry adder: a chain of full adders.
+' ------------------------------------------------------------
+Sub AddRipple (a As Long, b As Long, cin As Integer, nBits As Integer, sumOut As Long, coutOut As Integer, ovfOut As Integer)
+    Dim i As Integer, abit As Integer, bbit As Integer, sbit As Integer
+    Dim cy As Integer, cyNext As Integer, cyMsb As Integer
+    Dim r As Long
+    r = 0
+    cy = (cin <> 0)
+    cyMsb = cy
+    For i = 0 To nBits - 1
+        abit = AddBit%(a, i)
+        bbit = AddBit%(b, i)
+        cyMsb = cy
+        GateFullAdd abit, bbit, cy, sbit, cyNext
+        If sbit <> 0 Then r = r Or _ShL(1&, i)
+        cy = cyNext
+    Next
+    sumOut = r
+    coutOut = cy
+    ovfOut = GateEval%(GATE_XOR, cyMsb, cy)
+End Sub
+
+Function AddCarries& (a As Long, b As Long, cin As Integer, nBits As Integer)
+    Dim i As Integer, abit As Integer, bbit As Integer, sbit As Integer
+    Dim cy As Integer, cyNext As Integer
+    Dim r As Long
+    r = 0
+    cy = (cin <> 0)
+    For i = 0 To nBits - 1
+        abit = AddBit%(a, i)
+        bbit = AddBit%(b, i)
+        GateFullAdd abit, bbit, cy, sbit, cyNext
+        If cyNext <> 0 Then r = r Or _ShL(1&, i)
+        cy = cyNext
+    Next
+    AddCarries& = r
+End Function
+
+' ------------------------------------------------------------
+' Carry lookahead. Every carry in the group comes straight from
+' g, p and the carry in - no rippling through the stages:
+'   c1 = g0 + p0.cin
+'   c2 = g1 + p1.g0 + p1.p0.cin
+'   c3 = g2 + p2.g1 + p2.p1.g0 + p2.p1.p0.cin
+'   c4 = g3 + p3.g2 + p3.p2.g1 + p3.p2.p1.g0 + p3.p2.p1.p0.cin
+' ------------------------------------------------------------
+Sub AddCla4 (a4 As Long, b4 As Long, cin As Integer, sumOut As Long, coutOut As Integer)
+    Dim g0 As Integer, g1 As Integer, g2 As Integer, g3 As Integer
+    Dim p0 As Integer, p1 As Integer, p2 As Integer, p3 As Integer
+    Dim p1p0 As Integer, p2p1 As Integer, p2p1p0 As Integer
+    Dim p3p2 As Integer, p3p2p1 As Integer, p3p2p1p0 As Integer
+    Dim c0 As Integer, c1 As Integer, c2 As Integer, c3 As Integer, c4 As Integer
+    Dim r As Long
+
+    g0 = AddAnd%(AddBit%(a4, 0), AddBit%(b4, 0))
+    g1 = AddAnd%(AddBit%(a4, 1), AddBit%(b4, 1))
+    g2 = AddAnd%(AddBit%(a4, 2), AddBit%(b4, 2))
+    g3 = AddAnd%(AddBit%(a4, 3), AddBit%(b4, 3))
+    p0 = AddXor%(AddBit%(a4, 0), AddBit%(b4, 0))
+    p1 = AddXor%(AddBit%(a4, 1), AddBit%(b4, 1))
+    p2 = AddXor%(AddBit%(a4, 2), AddBit%(b4, 2))
+    p3 = AddXor%(AddBit%(a4, 3), AddBit%(b4, 3))
+
+    c0 = (cin <> 0)
+    p1p0 = AddAnd%(p1, p0)
+    p2p1 = AddAnd%(p2, p1)
+    p2p1p0 = AddAnd%(p2p1, p0)
+    p3p2 = AddAnd%(p3, p2)
+    p3p2p1 = AddAnd%(p3p2, p1)
+    p3p2p1p0 = AddAnd%(p3p2p1, p0)
+
+    c1 = AddOr%(g0, AddAnd%(p0, c0))
+    c2 = AddOr%(AddOr%(g1, AddAnd%(p1, g0)), AddAnd%(p1p0, c0))
+    c3 = AddOr%(AddOr%(AddOr%(g2, AddAnd%(p2, g1)), AddAnd%(p2p1, g0)), AddAnd%(p2p1p0, c0))
+    c4 = AddOr%(AddOr%(AddOr%(AddOr%(g3, AddAnd%(p3, g2)), AddAnd%(p3p2, g1)), AddAnd%(p3p2p1, g0)), AddAnd%(p3p2p1p0, c0))
+
+    r = 0
+    If AddXor%(p0, c0) <> 0 Then r = r Or 1
+    If AddXor%(p1, c1) <> 0 Then r = r Or 2
+    If AddXor%(p2, c2) <> 0 Then r = r Or 4
+    If AddXor%(p3, c3) <> 0 Then r = r Or 8
+    sumOut = r
+    coutOut = c4
+End Sub
+
+Sub AddCla (a As Long, b As Long, cin As Integer, nBits As Integer, sumOut As Long, coutOut As Integer)
+    Dim groups As Integer, k As Integer, sh As Integer
+    Dim cy As Integer, cyNext As Integer
+    Dim na As Long, nb As Long, ns As Long, r As Long
+    groups = (nBits + 3) \ 4
+    cy = (cin <> 0)
+    r = 0
+    For k = 0 To groups - 1
+        sh = k * 4
+        na = _ShR(a, sh) And 15
+        nb = _ShR(b, sh) And 15
+        AddCla4 na, nb, cy, ns, cyNext
+        r = r Or _ShL(ns, sh)
+        cy = cyNext
+    Next
+    sumOut = r
+    coutOut = cy
+End Sub
+
+' ------------------------------------------------------------
+' Subtract = add the inverted b with a carry in of 1.
+' ------------------------------------------------------------
+Sub AddSubtract (a As Long, b As Long, nBits As Integer, diffOut As Long, borrowOut As Integer, ovfOut As Integer)
+    Dim nb As Long, cy As Integer
+    nb = Not b
+    AddRipple a, nb, -1, nBits, diffOut, cy, ovfOut
+    borrowOut = GateEval%(GATE_NOT, cy, 0)
+End Sub
+
+' Two's complement negate: 0 - a.
+Function AddNegate& (a As Long, nBits As Integer)
+    Dim zero As Long, r As Long, bo As Integer, ov As Integer
+    zero = 0
+    AddSubtract zero, a, nBits, r, bo, ov
+    AddNegate& = r
+End Function
+
+' Incrementer: a chain of half adders with a carry in of 1.
+Function AddIncrement& (a As Long, nBits As Integer)
+    Dim i As Integer, abit As Integer, sbit As Integer
+    Dim cy As Integer, cyNext As Integer
+    Dim r As Long
+    r = 0
+    cy = -1
+    For i = 0 To nBits - 1
+        abit = AddBit%(a, i)
+        GateHalfAdd abit, cy, sbit, cyNext
+        If sbit <> 0 Then r = r Or _ShL(1&, i)
+        cy = cyNext
+    Next
+    AddIncrement& = r
+End Function

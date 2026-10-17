@@ -1,0 +1,175 @@
+' ============================================================================
+' SERDebayer.bm  -  Malvar-He-Cutler demosaic: RAW/Bayer mono -> RGB
+'
+' Include at the BOTTOM of a program that reads SER (needs no other helper):
+'     '$INCLUDE:'SERDebayer.bm'
+'
+' A RAW frame is a colour mosaic: each pixel carries only ONE of R/G/B, in a
+' repeating 2x2 pattern set by the ColorID (RGGB/GRBG/GBRG/BGGR). Demosaicing
+' fills in the missing two channels at every pixel by interpolating neighbours.
+'
+' This uses the Malvar-He-Cutler (2004) gradient-corrected linear filters --
+' 5x5 stencils, much sharper than plain bilinear with little colour fringing.
+' Coefficients are the standard integer forms (/8 or /16).
+'
+'   BayerColor%  - which colour (0=R 1=G 2=B) a pixel carries, from ColorID+x,y
+'   MonoAt&      - one raw sample, edge-clamped (8- or 16-bit, endian-aware)
+'   Filt*        - the four Malvar 5x5 interpolation stencils
+'   DebayerFrame - one mono mosaic frame -> packed RGB frame bytes
+' ============================================================================
+
+' --- Which colour does the pixel at (x,y) carry, per Bayer ColorID? ---
+Function BayerColor% (bayerID As Long, x As Long, y As Long)
+    Dim dx As Long, dy As Long
+    dx = x And 1: dy = y And 1
+    Select Case bayerID
+        Case 8 ' RGGB
+            If dy = 0 Then
+                If dx = 0 Then BayerColor% = 0 Else BayerColor% = 1
+            Else
+                If dx = 0 Then BayerColor% = 1 Else BayerColor% = 2
+            End If
+        Case 9 ' GRBG
+            If dy = 0 Then
+                If dx = 0 Then BayerColor% = 1 Else BayerColor% = 0
+            Else
+                If dx = 0 Then BayerColor% = 2 Else BayerColor% = 1
+            End If
+        Case 10 ' GBRG
+            If dy = 0 Then
+                If dx = 0 Then BayerColor% = 1 Else BayerColor% = 2
+            Else
+                If dx = 0 Then BayerColor% = 0 Else BayerColor% = 1
+            End If
+        Case 11 ' BGGR
+            If dy = 0 Then
+                If dx = 0 Then BayerColor% = 2 Else BayerColor% = 1
+            Else
+                If dx = 0 Then BayerColor% = 1 Else BayerColor% = 0
+            End If
+        Case Else ' fall back to RGGB
+            If dy = 0 Then
+                If dx = 0 Then BayerColor% = 0 Else BayerColor% = 1
+            Else
+                If dx = 0 Then BayerColor% = 1 Else BayerColor% = 2
+            End If
+    End Select
+End Function
+
+' --- One raw mono sample at (x,y), clamped to the frame edges ---
+Function MonoAt& (m As _MEM, x As Long, y As Long, w As Long, h As Long, sampleBytes As Long, le As Long)
+    Dim xx As Long, yy As Long, idx As Long
+    Dim lo As _Unsigned _Byte, hi As _Unsigned _Byte
+    xx = x: If xx < 0 Then xx = 0
+    If xx > w - 1 Then xx = w - 1
+    yy = y: If yy < 0 Then yy = 0
+    If yy > h - 1 Then yy = h - 1
+    idx = yy * w + xx
+    If sampleBytes = 1 Then
+        MonoAt& = _MemGet(m, m.OFFSET + idx, _Unsigned _Byte)
+    Else
+        lo = _MemGet(m, m.OFFSET + idx * 2 + 0, _Unsigned _Byte)
+        hi = _MemGet(m, m.OFFSET + idx * 2 + 1, _Unsigned _Byte)
+        If le <> 0 Then MonoAt& = lo + hi * 256 Else MonoAt& = hi + lo * 256
+    End If
+End Function
+
+' --- G at an R or B pixel: (4,2,-1)/8 plus-shape ---
+Function FiltGatRB& (m As _MEM, x As Long, y As Long, w As Long, h As Long, sb As Long, le As Long)
+    Dim c0 As Long, a1 As Long, a2 As Long
+    c0 = MonoAt&(m, x, y, w, h, sb, le)
+    a1 = MonoAt&(m, x, y - 1, w, h, sb, le) + MonoAt&(m, x, y + 1, w, h, sb, le) + MonoAt&(m, x - 1, y, w, h, sb, le) + MonoAt&(m, x + 1, y, w, h, sb, le)
+    a2 = MonoAt&(m, x, y - 2, w, h, sb, le) + MonoAt&(m, x, y + 2, w, h, sb, le) + MonoAt&(m, x - 2, y, w, h, sb, le) + MonoAt&(m, x + 2, y, w, h, sb, le)
+    FiltGatRB& = (4 * c0 + 2 * a1 - a2) \ 8
+End Function
+
+' --- Opposite-corner colour at an R or B pixel (R at B / B at R): (6,2,-3/2)/8 ---
+Function FiltRBatRB& (m As _MEM, x As Long, y As Long, w As Long, h As Long, sb As Long, le As Long)
+    Dim c0 As Long, dg As Long, ax As Long
+    c0 = MonoAt&(m, x, y, w, h, sb, le)
+    dg = MonoAt&(m, x - 1, y - 1, w, h, sb, le) + MonoAt&(m, x - 1, y + 1, w, h, sb, le) + MonoAt&(m, x + 1, y - 1, w, h, sb, le) + MonoAt&(m, x + 1, y + 1, w, h, sb, le)
+    ax = MonoAt&(m, x, y - 2, w, h, sb, le) + MonoAt&(m, x, y + 2, w, h, sb, le) + MonoAt&(m, x - 2, y, w, h, sb, le) + MonoAt&(m, x + 2, y, w, h, sb, le)
+    FiltRBatRB& = (12 * c0 + 4 * dg - 3 * ax) \ 16
+End Function
+
+' --- Horizontal-neighbour colour at a G pixel: (5,4,-1,-1,1/2)/8 ---
+Function FiltRBatGh& (m As _MEM, x As Long, y As Long, w As Long, h As Long, sb As Long, le As Long)
+    Dim c0 As Long, h1 As Long, h2 As Long, dg As Long, v2 As Long
+    c0 = MonoAt&(m, x, y, w, h, sb, le)
+    h1 = MonoAt&(m, x - 1, y, w, h, sb, le) + MonoAt&(m, x + 1, y, w, h, sb, le)
+    h2 = MonoAt&(m, x - 2, y, w, h, sb, le) + MonoAt&(m, x + 2, y, w, h, sb, le)
+    dg = MonoAt&(m, x - 1, y - 1, w, h, sb, le) + MonoAt&(m, x - 1, y + 1, w, h, sb, le) + MonoAt&(m, x + 1, y - 1, w, h, sb, le) + MonoAt&(m, x + 1, y + 1, w, h, sb, le)
+    v2 = MonoAt&(m, x, y - 2, w, h, sb, le) + MonoAt&(m, x, y + 2, w, h, sb, le)
+    FiltRBatGh& = (10 * c0 + 8 * h1 - 2 * h2 - 2 * dg + v2) \ 16
+End Function
+
+' --- Vertical-neighbour colour at a G pixel (transpose of the above) ---
+Function FiltRBatGv& (m As _MEM, x As Long, y As Long, w As Long, h As Long, sb As Long, le As Long)
+    Dim c0 As Long, v1 As Long, v2 As Long, dg As Long, h2 As Long
+    c0 = MonoAt&(m, x, y, w, h, sb, le)
+    v1 = MonoAt&(m, x, y - 1, w, h, sb, le) + MonoAt&(m, x, y + 1, w, h, sb, le)
+    v2 = MonoAt&(m, x, y - 2, w, h, sb, le) + MonoAt&(m, x, y + 2, w, h, sb, le)
+    dg = MonoAt&(m, x - 1, y - 1, w, h, sb, le) + MonoAt&(m, x - 1, y + 1, w, h, sb, le) + MonoAt&(m, x + 1, y - 1, w, h, sb, le) + MonoAt&(m, x + 1, y + 1, w, h, sb, le)
+    h2 = MonoAt&(m, x - 2, y, w, h, sb, le) + MonoAt&(m, x + 2, y, w, h, sb, le)
+    FiltRBatGv& = (10 * c0 + 8 * v1 - 2 * v2 - 2 * dg + h2) \ 16
+End Function
+
+' --- Write one output sample (R/G/B) at byte index idx; returns next idx ---
+Function EmitDeb& (m As _MEM, idx As Long, vall As Long, sampleBytes As Long, le As Long)
+    If sampleBytes = 1 Then
+        _MemPut m, m.OFFSET + idx, vall As _Unsigned _Byte
+        EmitDeb& = idx + 1
+    Else
+        If le <> 0 Then
+            _MemPut m, m.OFFSET + idx + 0, (vall And 255) As _Unsigned _Byte
+            _MemPut m, m.OFFSET + idx + 1, ((vall \ 256) And 255) As _Unsigned _Byte
+        Else
+            _MemPut m, m.OFFSET + idx + 0, ((vall \ 256) And 255) As _Unsigned _Byte
+            _MemPut m, m.OFFSET + idx + 1, (vall And 255) As _Unsigned _Byte
+        End If
+        EmitDeb& = idx + 2
+    End If
+End Function
+
+' --- Demosaic one mono mosaic frame into packed RGB (R,G,B order) ---
+Sub DebayerFrame (m As _MEM, w As Long, h As Long, sampleBytes As Long, le As Long, bayerID As Long, outM As _MEM)
+    Dim x As Long, y As Long, col As Long, hcol As Long, cen As Long, maxv As Long, idx As Long
+    Dim rr As Long, gg As Long, bb As Long
+    If sampleBytes = 1 Then maxv = 255 Else maxv = 65535
+    idx = 0
+    For y = 0 To h - 1
+        For x = 0 To w - 1
+            cen = MonoAt&(m, x, y, w, h, sampleBytes, le)
+            col = BayerColor%(bayerID, x, y)
+            Select Case col
+                Case 0 ' pixel carries R
+                    rr = cen
+                    gg = FiltGatRB&(m, x, y, w, h, sampleBytes, le)
+                    bb = FiltRBatRB&(m, x, y, w, h, sampleBytes, le)
+                Case 2 ' pixel carries B
+                    bb = cen
+                    gg = FiltGatRB&(m, x, y, w, h, sampleBytes, le)
+                    rr = FiltRBatRB&(m, x, y, w, h, sampleBytes, le)
+                Case Else ' pixel carries G
+                    gg = cen
+                    hcol = BayerColor%(bayerID, x + 1, y) ' colour of the horizontal neighbour
+                    If hcol = 0 Then ' R horizontal, B vertical
+                        rr = FiltRBatGh&(m, x, y, w, h, sampleBytes, le)
+                        bb = FiltRBatGv&(m, x, y, w, h, sampleBytes, le)
+                    Else ' B horizontal, R vertical
+                        bb = FiltRBatGh&(m, x, y, w, h, sampleBytes, le)
+                        rr = FiltRBatGv&(m, x, y, w, h, sampleBytes, le)
+                    End If
+            End Select
+            If rr < 0 Then rr = 0
+            If rr > maxv Then rr = maxv
+            If gg < 0 Then gg = 0
+            If gg > maxv Then gg = maxv
+            If bb < 0 Then bb = 0
+            If bb > maxv Then bb = maxv
+            idx = EmitDeb&(outM, idx, rr, sampleBytes, le)
+            idx = EmitDeb&(outM, idx, gg, sampleBytes, le)
+            idx = EmitDeb&(outM, idx, bb, sampleBytes, le)
+        Next x
+    Next y
+End Sub
