@@ -63,6 +63,36 @@ the next chat at this file: `astro/NOTES.md` in the wingfoot repo).
    the pulse length, then back to sidereal. Dec: guide rate for the pulse, then
    stop. Sent as 0x010 frames to the mount hub. Best over USB (WiFi timing
    jitter). Check the Atlas Pro firmware takes rate changes while moving.
+10. **Virtual hand controller + guide-camera plate solving (added Oct 19)** -
+    a QB64 on-screen SynScan hand controller, with a new option to plate
+    solve through the guide camera and hand off to autoguiding. See the
+    section below.
+
+### Virtual hand controller + plate solve with the guide camera (Oct 19)
+
+- **The app:** an on-screen SynScan-style hand controller in QB64 (ButtonUI
+  keypad: arrows, speed, menu, LCD-style display). Two ways to build it:
+  (a) front end that sends commands to the real hand controller over USB, or
+  (b) full replacement that talks to the mount's motor board directly
+  (Sky-Watcher motor controller command set, like EQMOD) and does its own
+  RA/Dec math, tracking, goto and alignment. Not decided yet.
+- **New option - plate solve using the guide camera:** goto -> grab a guide
+  frame -> `solve-field` -> correct and repeat until close -> hand off to
+  QBGuide on the same camera stream. Can also replace star alignment.
+- **Offset between cameras (Russell's idea):** plate solve BOTH the main and
+  the guide camera once to get the offset, then only solve the guide camera
+  and use that offset to put the object in the main camera's frame.
+  - Store the offset as a sky-plane angle (E/W and N/S arcmin), not raw RA/Dec;
+    RA offset = E/W offset / cos(Dec).
+  - Flip the sign after a meridian flip (track pier side).
+  - Save it in an INI; re-measure if the guide scope is bumped or the main
+    camera/focus changes. Do the first calibration on a dense star field.
+- **Speed:** give solve-field `--scale-low/--scale-high`, `--ra --dec --radius`
+  from the mount position, and downsample. Index files must suit the guide
+  scope's wider field (check the SynScan Pro set covers it).
+- **Sync:** direct-motor version just updates its own pointing math; the
+  hand-controller version needs the HC firmware to support sync.
+- GPS: VK-162 on the PC can supply location and time to the mount.
 
 ### THE BIG ONE - QBCap sequencer (next QBCap job)
 
