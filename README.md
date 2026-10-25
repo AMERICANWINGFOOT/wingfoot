@@ -82,6 +82,20 @@ source and build scripts.
 | G3 | Orion StarShoot G3 camera test app with `orion_ssg3` driver and shim |
 | SSAIO | Orion StarShoot All-in-One camera test (libssaio over the QHY SDK), plus `fx2/` QHY5-II firmware notes and disassembler |
 
+## dos/
+
+MS-DOS 6.22 programs for a real Pentium 4 DOS PC, in C (QuickC 2.5) with
+small MASM helpers. See `dos/README.md`.
+
+| Folder | What it is |
+|---|---|
+| USBXFER | USB stick file transfer with its own UHCI/EHCI driver and FAT32 code; `USBXGUI` mouse file manager |
+| USBMOUSE | USB mouse driver (INT 33h) through the UHCI controller |
+| VESA | VESA mode lister and unreal-mode 800x600 demo |
+| SYSINFO | DOS system information report |
+| NET | mTCP networking start-up files |
+| P4BOOT | AUTOEXEC.BAT and CONFIG.SYS |
+
 ## Notes
 
 - Location values in the sample `.ini` files are set to Kitt Peak, AZ.

@@ -1,0 +1,2 @@
+# DOS sources keep CRLF line endings and are copied to the DOS PC as-is
+dos/** -text
